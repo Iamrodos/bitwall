@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+"""A wall on the receiver core with a glass that shows nothing, held for a
+while: something for a sender on another host to attach to.
+
+    tests/hold-wall <name> [seconds]
+
+It is made in this host's own run directory, where a sender finds it as
+`host:<name>`, and removed when the time is up.
+"""
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from bitwall import local                                      # noqa: E402
+from bitwall.receivers import core                             # noqa: E402
+
+
+class Glass:
+    def cells(self, data): pass
+    def frame(self, z, head, data): pass
+    def clear(self, z): pass
+    def kitty(self, head, data): pass
+    def changed(self): pass
+    def stats(self): pass
+    def look(self, w, h, done): done(None)
+
+
+name = sys.argv[1]
+wall = core.Wall(local.run_dir(), name, Glass(), data=("qoi",))
+wall.start()
+wall.set_visible(1)         # as a tab in view would: the wall is watched
+print(f"{time.strftime('%H:%M:%S')} wall {wall.dir}", flush=True)
+try:
+    time.sleep(float(sys.argv[2]) if len(sys.argv) > 2 else 120)
+finally:
+    wall.remove()

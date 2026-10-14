@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""Pass a stream of clear-and-draw frames on a whole frame at a time,
+drawn over the last rather than after a blank screen.
+
+    whole curl -sN ascii.live/rick
+    whole --centre curl -sN ascii.live/rick
+
+ascii.live and parrot.live send each frame as clear-screen, home, then the
+picture. A frame bigger than a packet arrives in two reads, so the pane is
+blank, or half drawn, for as long as the rest takes to come, and a wall
+sampling the pane shows that: the picture flashes every frame. Here each
+frame is held until the next one starts, and written in one write that
+homes the cursor instead of clearing, ends every line with erase-to-end
+and the frame with erase-below. The pane only ever holds whole frames.
+
+`--centre` puts each frame in the middle of the pane, as the pane's size
+is when the frame is drawn, rather than at its top left; `--centre=0.75`
+in the middle of the top three quarters of it, clear of whatever lies
+over the rest.
+
+Colours pass through as they came. A frame is let go on its own after a
+short quiet, so a stream that stops, or never clears, is not held back.
+"""
+import os
+import re
+import select
+import signal
+import subprocess
+import sys
+
+#: What starts a frame: clear screen, and whatever scrollback clear and
+#: home come with it, in either order.
+START = re.compile(rb"\x1b\[2J(?:\x1b\[3J|\x1b\[H)*")
+#: Seconds of quiet after which what is held is drawn anyway.
+QUIET = 0.15
+#: A colour or other escape, which takes no room on the pane.
+ESCAPE = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]")
+CENTRE = None
+
+
+def draw(frame):
+    """One frame, homed, each line and then the rest of the screen erased
+    after it, in one write."""
+    if CENTRE is not None:
+        lines = frame.rstrip(b"\n").replace(b"\r\n", b"\n").split(b"\n")
+        wide = max((len(ESCAPE.sub(b"", l).decode("utf-8", "replace")) for l in lines), default=0)
+        try:
+            cols, rows = os.get_terminal_size(1)
+        except OSError:
+            cols, rows = wide, len(lines)
+        rows = max(len(lines), int(rows * CENTRE))
+        left, top = max(0, (cols - wide) // 2), max(0, (rows - len(lines)) // 2)
+        out = b"\x1b[H\x1b[J" + b"".join(
+            b"\x1b[%d;%dH" % (top + i + 1, left + 1) + line for i, line in enumerate(lines))
+    else:
+        body = frame.rstrip(b"\n").replace(b"\r\n", b"\n").replace(b"\n", b"\x1b[K\r\n")
+        out = b"\x1b[H" + body + b"\x1b[K\x1b[J"
+    view = memoryview(out)
+    while view:
+        view = view[os.write(1, view):]
+
+
+def main():
+    global CENTRE
+    if sys.argv[1:2] and sys.argv[1].startswith("--centre"):
+        _, _, share = sys.argv[1].partition("=")
+        CENTRE = float(share) if share else 1.0
+        del sys.argv[1]
+    if not sys.argv[1:]:
+        print(__doc__, file=sys.stderr)
+        return 2
+    # Run the source ourselves, so stopping this stops it too.
+    proc = subprocess.Popen(sys.argv[1:], stdout=subprocess.PIPE)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    fd = proc.stdout.fileno()
+    # What has come of the frame being received, from its start; and how
+    # much of it is already on the pane, drawn when the stream went quiet.
+    held, shown = b"", 0
+    os.write(1, b"\x1b[?25l\x1b[2J")
+    try:
+        while True:
+            ready, _, _ = select.select([fd], [], [], QUIET)
+            if not ready:
+                if len(held) > shown:
+                    draw(START.sub(b"", held, count=1))
+                    shown = len(held)
+                continue
+            data = os.read(fd, 65536)
+            if not data:
+                break
+            held += data
+            starts = list(START.finditer(held))
+            # Each frame the next has started after is whole: draw it.
+            ends = [m.start() for m in starts[1:]]
+            if starts and starts[0].start() > 0:
+                ends.insert(0, starts[0].start())
+            begin = 0
+            for end in ends:
+                draw(START.sub(b"", held[begin:end], count=1))
+                begin = end
+            if begin:
+                held, shown = held[begin:], 0
+        if len(held) > shown:
+            draw(START.sub(b"", held, count=1))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        proc.kill()
+        proc.wait()
+        os.write(1, b"\x1b[?25h")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

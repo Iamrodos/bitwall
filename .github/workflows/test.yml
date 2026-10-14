@@ -1,0 +1,55 @@
+# What can be checked with no wall, no Pi and no GPU: the Rust crates,
+# the painter's own tests against its fakes, the Python package as built,
+# and tests/bitwall-tests less the groups that need receivers running
+# (contracts), a desktop GPU (gpu) or the Windows host (windows).
+# RELEASING.md lists the full run, made on a Mac before a release.
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - bitwall/rust
+          - bitwall/receivers/core-rs
+          - bitwall/receivers/term
+          - bitwall/receivers/eink
+          - senders/games/cells/rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ matrix.crate }}
+      - run: cargo test
+        working-directory: ${{ matrix.crate }}
+
+  painter:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libpng-dev libjpeg-dev pkg-config
+      - run: tests/paint/run
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: build the package and import it from outside the repo
+        run: |
+          uv build --out-dir "$RUNNER_TEMP/dist"
+          wheel=$(ls "$RUNNER_TEMP"/dist/bitwall-*-py3-none-any.whl)
+          cd "$RUNNER_TEMP"
+          uv run --no-project --python 3.10 --with "bitwall[letters] @ file://$wheel" \
+            python -c "import bitwall, bitwall.letters as L; assert L._face_metrics(L.VT323)[0] > 10; print(bitwall.__version__)"
+      - run: tests/bitwall-tests --skip contracts --skip gpu --skip windows --skip "pi painter passes"

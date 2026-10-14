@@ -1,0 +1,204 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["pillow>=10"]
+# ///
+"""Talk to a wall without being its sender.
+
+    controllers/bitwall-ctl pi.local:1                     # what it is and can do
+    controllers/bitwall-ctl pi.local:1 stats 1 show=all    # a command, and its answer
+    controllers/bitwall-ctl pi.local font 20
+    controllers/bitwall-ctl --follow pi.local              # what the wall tells it, as it comes
+    controllers/bitwall-ctl --follow pi.local follow in    # everything, both ways, tagged
+    controllers/bitwall-ctl --follow pi.local measures 500 # its numbers, twice a second
+    controllers/bitwall-ctl pi.local:1 picture glass --png --out wall.png
+    controllers/bitwall-ctl pi.local:1 picture glass format=jpeg quality=80 --out wall.jpg
+    controllers/bitwall-ctl pi.local:1 picture sysinfo-4821 --out grid.txt
+    controllers/bitwall-ctl -f pi.local mirror glass every=500 size=480x270 --png --out 'glass-{n}.png'
+
+A controller session on the wall (PROTOCOL.md, "What a controller
+hears"): opened at the wall's door as `ctl-<pid>`, with commands on its
+own `in` and answers on its own `out`, so nothing here needs the sender
+or the machine it runs on, and the sender still hears the effects of
+what a controller asked. A font changed from here is an `area` on every
+session, and the base resizes as though it had asked.
+
+With no command, the wall's report is printed. With one, what is printed
+is its answer: the lines that carry this controller's id, with the id
+taken off, and a picture as its line and then its bytes. A command that
+causes nothing to be said, such as `blank`, prints nothing. `--follow`
+prints the report and then keeps the session open, printing every line
+the wall says to it until stopped; `follow said`, `follow in` and
+`measures <ms>` are the commands that ask it to say more. The wall's
+`ping` is answered here and never shown.
+
+A picture or a mirror frame goes to stdout as its line and then its
+bytes, unless `--out` names a file: then its bytes go there and only its
+line to stdout, and `{n}` in the name numbers a mirror's frames rather
+than each overwriting the last. `--png` turns a QOI picture into a PNG on
+the way; a JPEG goes as it came.
+
+A command's words are the shell's: quote a value with a space in it,
+`label "Back room"` or `title="Back room"`, and it goes to the wall
+percent-encoded as one word, as PROTOCOL.md has it. `meta set` is the
+exception, its value the rest of the line as typed.
+
+The exit status is 1 if the wall said `error`, and 2 if there is no wall
+there to ask, or it would not open a session.
+"""
+import argparse
+import os
+import signal
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(_HERE))                      # repo root
+
+from bitwall import Controller, protocol                        # noqa: E402
+from bitwall.receivers import pi as _pi                         # noqa: E402
+from bitwall.session import Blob, NoWall, Refused               # noqa: E402
+
+#: How long a command's answer is waited for before it is taken as all
+#: there is, and how long a quiet line after part of one means the rest
+#: is not coming.
+ANSWER = 3.0
+QUIET = 0.5
+
+
+def without_id(said):
+    """A line as the wall said it, its id taken off."""
+    text = said.raw or ""
+    id_ = said.get("id")
+    if id_ is not None and text.endswith(f" id={id_}"):
+        text = text[:-len(f" id={id_}")]
+    return text
+
+
+def as_png(data):
+    """A QOI image as a PNG."""
+    import io
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.open(io.BytesIO(data)).save(buf, "PNG")
+    return buf.getvalue()
+
+
+#: How many pictures and frames have been written to `--out`.
+_written = 0
+
+
+def emit(data):
+    """Bytes to stdout, whole. Written a piece at a time as stdout takes
+    them, since ssh, sharing the terminal or pipe, may have made it
+    non-blocking under us and a picture is bigger than a pipe."""
+    import select
+    sys.stdout.flush()
+    view = memoryview(data)
+    while view:
+        try:
+            view = view[os.write(1, view):]
+        except BlockingIOError:
+            select.select([], [1], [], 1.0)
+
+
+def show(said, keep_id=False, into=None, png=False):
+    """One thing the wall said, to stdout: a line, or a picture's line and
+    then exactly its bytes, which go to `into` instead when it is given."""
+    global _written
+    if isinstance(said, Blob):
+        head = said.said.raw if keep_id else without_id(said.said)
+        data = said.data
+        if png and "qoi" in said.said.args:
+            data = as_png(data)
+        if into:
+            path = into.replace("{n}", str(_written))
+            _written += 1
+            with open(path, "wb") as fh:
+                fh.write(data)
+            emit(head.encode() + b"\n")
+        else:
+            emit(head.encode() + b"\n" + data + b"\n")
+    else:
+        emit((said.raw if keep_id else without_id(said)).encode() + b"\n")
+
+
+def is_error(said):
+    line = said.said if isinstance(said, Blob) else said
+    return line.name == "error"
+
+
+def wire(words):
+    """The shell's words as one line for the wall: each argument and each
+    value percent-encoded, so one the shell kept whole with quotes stays
+    one word; the command's name and the keys as they are. `meta set`
+    takes the rest of its line as its value, so it goes as typed."""
+    if words[:2] == ["meta", "set"]:
+        return " ".join(words)
+    out = words[:1]
+    for each in words[1:]:
+        key, sep, value = each.partition("=")
+        if sep and protocol.TOKEN.match(key):
+            out.append(f"{key}={protocol.word(value)}")
+        else:
+            out.append(protocol.word(each))
+    return " ".join(out)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__.split("\n\n")[0],
+        epilog="With no command, prints the wall's report and exits.")
+    ap.add_argument("target", help="host, or host:N for wall N on it")
+    ap.add_argument("command", nargs="*",
+                    help="a command and its arguments, as PROTOCOL.md has them")
+    ap.add_argument("--follow", "-f", action="store_true",
+                    help="keep the session open, printing everything the wall says to it")
+    ap.add_argument("--out", "-o", help="write a picture's bytes to this file; {n} numbers them")
+    ap.add_argument("--png", action="store_true", help="a QOI picture as a PNG")
+    ap.add_argument("--user", default=_pi.USER)
+    ap.add_argument("--run", help="the wall's own directory, if not where its host keeps it")
+    # Options may come anywhere, before the host or after the command.
+    a = ap.parse_intermixed_args()
+    # Stopped by a signal is stopped as by ^C: the session is closed either way.
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
+    command = wire(a.command)
+
+    c = Controller(a.target, user=a.user, run=a.run)
+    try:
+        c.open()
+    except (NoWall, Refused) as e:
+        print(e, file=sys.stderr)
+        sys.exit(2)
+    status = 0
+    try:
+        if not command or a.follow:
+            for said in c.report:
+                show(said)
+        if command and a.follow:
+            # Sent with an id and not waited for: everything the wall says
+            # from here on is printed as it comes, the answer among it.
+            c.ask(command, timeout=0)
+        elif command:
+            for said in c.ask(command, timeout=ANSWER, quiet=QUIET):
+                if is_error(said):
+                    status = 1
+                show(said, into=a.out, png=a.png)
+        if a.follow:
+            while (said := c.read()) is not None:
+                if is_error(said):
+                    status = 1
+                show(said, keep_id=True, into=a.out, png=a.png)
+            if c.state != "closed":
+                print(f"bitwall-ctl: {a.target}: the wall has gone", file=sys.stderr)
+                status = 2
+    except KeyboardInterrupt:
+        pass
+    except BrokenPipeError:
+        pass
+    finally:
+        c.close()
+    sys.exit(status)
+
+
+if __name__ == "__main__":
+    main()

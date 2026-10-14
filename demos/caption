@@ -1,0 +1,612 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["pillow"]
+# ///
+"""A caption on a wall: a line of text over whatever it shows, changed
+while it runs.
+
+    demos/caption --text "Back in five minutes" pi.local
+    demos/caption --file /tmp/caption pi.local
+    some-script | demos/caption --style label --file - pi.local
+
+A cells layer placed at the top of the stack: a grid over the wall,
+every cell it does not draw transparent, so a film, a game or a
+dashboard carries on beneath it.
+
+The caption is a strip by default: the full width of the wall along its
+bottom or top or across its middle, about a fifth of its height, opaque black, boxed in a thin amber
+line all round, so it reads the same over anything and never
+competes with what is above it. Text before a ` | ` is bright and bold
+on its first line, the rest dimmer on a second, both centred; words
+between *stars* are bold in the accent. An empty caption takes the
+strip away, and the wall beneath is whole again.
+
+`--style label` is a smaller caption: the label is three rows, a translucent
+dark panel with its corners cut and an accent at its leading end, sized
+to the text and set against the bottom or the top of the wall. Text
+before a ` | ` is bright and bold, text after it dim, so a caption can
+be a title and what it means, and words between *stars* are in the
+accent. A new line slides the label open to its
+new width; an empty one closes it, and the wall beneath is whole again.
+
+The text is the last line given: `--text` to begin with, then each line
+read from `--file`. A file is read whenever it changes, its first line
+the caption, so any script drives it with `echo ... > file`; `-` reads
+lines from stdin as they come. With neither, the file is
+`~/.bitwall/caption`, which is how a caption a controller started is
+told what to say. A strip's file may say on its second line where the
+strip goes, `rise 0.75 6`: three quarters of the way off its edge, taken
+evenly over six seconds, so what it covered is seen; without one it is
+home.
+
+`--font` is the label's own font size, whatever the base is drawn at, so
+the caption reads the same over a film, a dense dashboard or panes.
+
+The strip's mark, an information circle at its left, is a picture where
+the wall takes one: Nerd Font's info circle drawn smooth with Pillow and
+shown on a video layer of the caption's own over the cells it takes,
+which the strip leaves blank. That layer is opened before the cells
+layer, both placed `top`, so the cells go under it and the mark lies on
+the strip. Where the wall has no video layer, or Pillow is missing, the
+mark is drawn in octants instead.
+"""
+import argparse
+import os
+import signal
+import sys
+import threading
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, ".."))
+import bitwall                                                  # noqa: E402
+
+#: The file read when nothing else is given.
+DEFAULT_FILE = os.path.expanduser("~/.bitwall/caption")
+#: The label: a dark ground at nine tenths, an accent at its leading end.
+PANEL = "11151be6"
+ACCENT = "ffb454"
+BRIGHT = "ffffff"
+DIM = "a9b4c0"
+#: The strip: opaque black, its edge in the accent, its rest dimmer.
+STRIP = "000000"
+#: The strip's share of the wall's height, and so of its rows: its box's
+#: top and bottom and the two lines between.
+SHARE = 0.22
+REST = "b8c2cc"
+#: Seconds the label takes to open to a new width or close.
+SLIDE = 0.35
+#: Cells of panel either side of the text, and rows clear of the edge.
+PAD = 2
+MARGIN = 1
+SPLIT = " | "
+#: How many of the strip's lines high the pictured mark stands.
+TALL = 2.75
+#: The mark as a picture: Nerd Font's info circle, from the font the
+#: painting receivers draw with.
+NERD_FONT = os.path.join(HERE, "..", "bitwall", "receivers", "pi",
+                         "MesloLGSNerdFontMono-Regular.ttf")
+INFO_GLYPH = "\uf05a"
+#: Where the mark goes on the strip's first inner row, in cells: its left
+#: and how many across; it is as tall as the two lines.
+MARK_X, MARK_W = 3, 4
+#: The mark at the strip's left: an information circle, eight pixels
+#: square, drawn over both its lines in octants -- four cells across, two
+#: down, each cell two pixels across and four down.
+INFO = ("..####..",
+        ".######.",
+        "###..###",
+        "########",
+        "###..###",
+        "###..###",
+        ".######.",
+        "..####..")
+
+
+def octants():
+    """Every pattern of a cell cut two across and four down, as the one
+    character that draws it: bit b is the b+1th part counted along each
+    row from the top left. Octants take the patterns no other character
+    draws, in order; the rest are blocks, halves, quadrants and bars."""
+    other = {0x00: " ", 0xff: "█", 0x55: "▌", 0xaa: "▐", 0x0f: "▀", 0xf0: "▄",
+             0x05: "▘", 0x0a: "▝", 0x50: "▖", 0xa0: "▗", 0x5f: "▛", 0xaf: "▜",
+             0xf5: "▙", 0xfa: "▟", 0x5a: "▞", 0xa5: "▚", 0xc0: "▂", 0xfc: "▆",
+             0x03: "\U0001fb82", 0x3f: "\U0001fb85", 0x14: "\U0001fbe6",
+             0x28: "\U0001fbe7", 0x01: "\U0001cea8", 0x02: "\U0001ceab",
+             0x40: "\U0001cea3", 0x80: "\U0001cea0"}
+    table, cp = {}, 0x1CD00
+    for b in range(256):
+        if b in other:
+            table[b] = other[b]
+        else:
+            table[b] = chr(cp)
+            cp += 1
+    return table
+
+
+def mark(picture):
+    """A picture of '#' and '.' as rows of characters, two pixels across
+    and four down to a cell."""
+    table = octants()
+    rows = []
+    for top in range(0, len(picture), 4):
+        row = []
+        for left in range(0, len(picture[0]), 2):
+            bits = 0
+            for r in range(4):
+                for c in range(2):
+                    if picture[top + r][left + c] == "#":
+                        bits |= 1 << (2 * r + c)
+            row.append(table[bits])
+        rows.append(row)
+    return rows
+
+
+def log(*parts):
+    print(time.strftime("%Y-%m-%d %H:%M:%S"), *parts, flush=True)
+
+
+class Subtitle:
+    """A film's subtitle, as a source: the line in white on a shade of
+    black just behind it, centred along the bottom of a box of the wall --
+    the film's -- as a film's own subtitles sit, and nothing else drawn."""
+
+    def __init__(self, box):
+        self.box = box
+        self.lock = threading.Lock()
+        self.text = ""
+
+    def say(self, text):
+        text = " ".join(text.split())
+        with self.lock:
+            if text == self.text:
+                return False
+            self.text = text
+            return True
+
+    def render(self, cols, rows):
+        clear = bitwall.cell(" ")
+        grid = [[clear] * cols for _ in range(rows)]
+        with self.lock:
+            text = self.text
+        if not text:
+            return grid
+        fx, fy, fw, fh = self.box
+        left, wide = round(fx * cols), max(4, round(fw * cols))
+        y = min(rows - 1, round((fy + fh) * rows) - 2)
+        line = f" {text[:max(1, wide - 2)]} "
+        x = left + max(0, (wide - len(line)) // 2)
+        for i, ch in enumerate(line):
+            if 0 <= x + i < cols and 0 <= y:
+                grid[y][x + i] = bitwall.cell(ch, "ffffff", "000000b8")
+        return grid
+
+
+class Caption:
+    """The label, as a source: `render(cols, rows)` is the whole grid,
+    every cell transparent but the label's."""
+
+    def __init__(self, at, align, cut):
+        self.at, self.align, self.cut = at, align, cut
+        self.lock = threading.Lock()
+        self.text = ""
+        #: The width the label is opening from and to, and since when.
+        self.was, self.to, self.since = 0, 0, 0.0
+        self.shown = ""
+
+    def say(self, text):
+        """Show `text` from now; an empty one closes the label."""
+        text = " ".join(text.split())
+        with self.lock:
+            if text == self.text:
+                return False
+            now = time.monotonic()
+            self.was = self.width(now)
+            if self.text:
+                self.shown = self.text
+            self.text, self.since = text, now
+            return True
+
+    def runs(self, text):
+        """The text as (characters, colour, bold) runs: the title bright,
+        the rest dim, and what is between *stars* in the accent."""
+        if SPLIT in text:
+            head, tail = text.split(SPLIT, 1)
+            parts = [(head, BRIGHT, True), ("  ", DIM, False), (tail, DIM, False)]
+        else:
+            parts = [(text, BRIGHT, True)]
+        out = []
+        for chars, colour, bold in parts:
+            for k, piece in enumerate(chars.split("*")):
+                if piece:
+                    out.append((piece, ACCENT if k % 2 else colour, bold or k % 2 == 1))
+        return out
+
+    def wanted(self, text):
+        """The label's full width for `text`: the accent, padding, text."""
+        if not text:
+            return 0
+        return 1 + PAD + sum(len(t) for t, _, _ in self.runs(text)) + PAD + 1
+
+    def width(self, now):
+        """How wide the label is drawn at `now`, sliding to its new width."""
+        to = self.wanted(self.text)
+        k = min(1.0, (now - self.since) / SLIDE) if SLIDE else 1.0
+        k = 1 - (1 - k) ** 3
+        return round(self.was + (to - self.was) * k)
+
+    def render(self, cols, rows):
+        clear = bitwall.cell(" ")
+        grid = [[clear] * cols for _ in range(rows)]
+        with self.lock:
+            now = time.monotonic()
+            text, width = self.text, self.width(now)
+            # A label closing is laid out as the text it is closing on.
+            text = text or self.shown
+        if rows < 3 or cols < 8 or width < 2:
+            return grid
+        full = self.wanted(text)
+        width = min(width, cols)
+        top = {"top": MARGIN, "bottom": rows - 3 - MARGIN}.get(self.at, (rows - 3) // 2)
+        top = max(0, min(top, rows - 3))
+        if self.align == "left":
+            left = min(PAD, cols - width)
+        else:
+            left = (cols - min(full, cols)) // 2
+        right = left + width - 1
+        for y in range(3):
+            row = grid[top + y]
+            for x in range(left, right + 1):
+                row[x] = bitwall.cell(" ", BRIGHT, PANEL)
+            row[left] = bitwall.cell("█", ACCENT)
+            row[right] = bitwall.cell(" ", BRIGHT, PANEL)
+        # The text, clipped to the label as it opens.
+        x = left + 1 + PAD
+        for chars, colour, bold in self.runs(text) if text else ():
+            for ch in chars:
+                if left + 1 <= x < right:
+                    grid[top + 1][x] = bitwall.cell(ch, colour, PANEL, bold=bold)
+                x += 1
+        if self.cut:
+            grid[top][left] = bitwall.cell("◢", ACCENT)
+            grid[top + 2][left] = bitwall.cell("◥", ACCENT)
+            grid[top][right] = bitwall.cell("◣", PANEL)
+            grid[top + 2][right] = bitwall.cell("◤", PANEL)
+        return grid
+
+
+class Strip:
+    """The strip, as a source: `render(cols, rows)` is the whole grid,
+    every cell transparent but the strip's share of the rows, boxed all
+    round in the accent so it reads as one thing at the bottom, the top or
+    the middle of the wall."""
+
+    def __init__(self, at, mark=None):
+        self.at = at
+        self.mark = mark
+        #: Whether the mark is a picture laid over the strip, not cells,
+        #: and where it goes now in the strip's cells, (x, y, w, h), or
+        #: None while there is no strip.
+        self.pictured = False
+        self.mark_at = None
+        self.cut = set()
+        self.lock = threading.Lock()
+        self.text = ""
+        self.rose = ("", 0.0, 0.0, 0.0, 1.0)     # spec, from, to, start, seconds
+
+    def say(self, text):
+        text = " ".join(text.split())
+        with self.lock:
+            if text == self.text:
+                return False
+            self.text = text
+            return True
+
+    def rise(self, spec):
+        """Move the strip off its edge, `rise <share> <seconds>`: a share of
+        the way across the wall, 0 home, taken at an even pace from where
+        it is now, so what it covered shows."""
+        parts = spec.split()
+        try:
+            to = max(0.0, min(1.0, float(parts[1]))) if parts[:1] == ["rise"] else 0.0
+            secs = max(0.0, float(parts[2])) if len(parts) > 2 else 0.0
+        except (IndexError, ValueError):
+            to, secs = 0.0, 0.0
+        with self.lock:
+            if spec == self.rose[0]:
+                return False
+            self.rose = (spec, self.share(time.monotonic()), to, time.monotonic(), secs)
+            return True
+
+    def share(self, now):
+        """How far off its edge the strip is now."""
+        _, start, to, began, secs = self.rose
+        if secs <= 0 or now >= began + secs:
+            return to
+        return start + (to - start) * (now - began) / secs
+
+    @staticmethod
+    def runs(text, colour, bold):
+        """A line as (characters, colour, bold) runs, *stars* in the accent."""
+        return [(piece, ACCENT if k % 2 else colour, bold or k % 2 == 1)
+                for k, piece in enumerate(text.split("*")) if piece]
+
+    def render(self, cols, rows):
+        clear = bitwall.cell(" ")
+        grid = [[clear] * cols for _ in range(rows)]
+        with self.lock:
+            text = self.text
+        if not text or rows < 3:
+            self.mark_at = None
+            return grid
+        high = min(rows, max(4, round(rows * SHARE)))
+        top = {"bottom": rows - high, "top": 0}.get(self.at, (rows - high) // 2)
+        off = round(self.share(time.monotonic()) * (rows - high))
+        top = max(0, top - off) if self.at != "top" else min(rows - high, top + off)
+        bottom = top + high - 1
+        line = lambda ch: bitwall.cell(ch, ACCENT, STRIP)
+        for y in range(top + 1, bottom):
+            grid[y] = [line("│")] + [bitwall.cell(" ", BRIGHT, STRIP)] * (cols - 2) + [line("│")]
+        grid[top] = [line("╭")] + [line("─")] * (cols - 2) + [line("╮")]
+        grid[bottom] = [line("╰")] + [line("─")] * (cols - 2) + [line("╯")]
+        head, _, tail = text.partition(SPLIT)
+        lines = [(head, BRIGHT, True)] + ([(tail, REST, False)] if tail else [])
+        inner = list(range(top + 1, bottom))
+        if self.pictured and cols > 12 and len(inner) >= 2:
+            self.mark_at = (MARK_X, inner[0], MARK_W, 2)
+        elif self.mark and cols > 12 and len(inner) >= len(self.mark):
+            self.mark_at = None
+            for r, row in enumerate(self.mark):
+                for c, ch in enumerate(row):
+                    grid[inner[0] + r][MARK_X + c] = bitwall.cell(ch, ACCENT, STRIP)
+        else:
+            self.mark_at = None
+        first = inner[0] + max(0, (len(inner) - len(lines)) // 2)
+        for n, (line, colour, bold) in enumerate(lines):
+            y = first + n
+            if y not in inner:
+                break
+            marked = self.mark or self.pictured
+            room = cols - 10 - (9 if marked else 1)
+            if len(line.replace("*", "")) > room:
+                if (line, cols) not in self.cut:
+                    self.cut.add((line, cols))
+                    log(f"caption line longer than its {room} cells, cut: {line!r}")
+                line = line[:max(1, room - 1)].rstrip() + "…"
+            runs = self.runs(line, colour, bold)
+            wide = sum(len(t) for t, _, _ in runs)
+            x = max(9 if marked else 2, (cols - wide) // 2)
+            for chars, c, b in runs:
+                for ch in chars:
+                    if x < cols - 1:
+                        grid[y][x] = bitwall.cell(ch, c, STRIP, bold=b)
+                    x += 1
+        return grid
+
+
+class Mark:
+    """The strip's mark as a picture, on a video layer of its own: put up
+    where the strip says, moved with it, taken down with it."""
+
+    def __init__(self, layer):
+        self.layer = layer
+        self.shown = None           # the pixel box it is up at
+        self.pngs = {}
+
+    @staticmethod
+    def open(target):
+        """The layer for the mark, or None where it cannot be pictured."""
+        try:
+            import PIL                                          # noqa: F401
+        except ImportError:
+            log("no Pillow: the mark in octants")
+            return None
+        if not os.path.exists(NERD_FONT):
+            log(f"no {NERD_FONT}: the mark in octants")
+            return None
+        try:
+            lay = bitwall.layer(target, place="top")
+        except Exception as e:                                  # noqa: BLE001
+            log(f"no layer for the mark ({e}): the mark in octants")
+            return None
+        until = time.monotonic() + 5
+        while lay.pixels() is None and time.monotonic() < until:
+            time.sleep(0.05)
+        if lay.z is None or not lay.takes("png"):
+            log("the wall gave no layer that takes a PNG: the mark in octants")
+            lay.close()
+            return None
+        return Mark(lay)
+
+    def png(self, w, h):
+        """The info circle, amber on transparent, centred in w by h."""
+        if (w, h) not in self.pngs:
+            import io
+            from PIL import Image, ImageDraw, ImageFont
+            side = min(w, h)
+            img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(img)
+            font = ImageFont.truetype(NERD_FONT, side)
+            # Sized so the circle itself, not the font's line, fills
+            # nine tenths of the shorter side.
+            l, t, r, b = draw.textbbox((0, 0), INFO_GLYPH, font=font)
+            font = ImageFont.truetype(NERD_FONT, max(4, round(side * side * 0.9
+                                                             / max(1, b - t))))
+            l, t, r, b = draw.textbbox((0, 0), INFO_GLYPH, font=font)
+            draw.text(((w - (r - l)) / 2 - l, (h - (b - t)) / 2 - t), INFO_GLYPH,
+                      font=font, fill="#" + ACCENT)
+            buf = io.BytesIO()
+            img.save(buf, "PNG", optimize=True)
+            self.pngs[(w, h)] = buf.getvalue()
+        return self.pngs[(w, h)]
+
+    def follow(self, w, strip, stop):
+        """Keep the picture where the strip's mark is, until stopped."""
+        while not stop.wait(0.05):
+            cells = strip.mark_at
+            box = w.box(cells) if cells else None
+            if box is None and cells:
+                # A wall that has not said its cell: the glass shared out
+                # among the cells.
+                glass, (cols, rows) = self.layer.pixels(), w.area()
+                if glass and cols and rows:
+                    cw, ch = glass[0] // cols, glass[1] // rows
+                    ox, oy = (glass[0] - cols * cw) // 2, (glass[1] - rows * ch) // 2
+                    x, y, cw_, ch_ = cells
+                    box = (ox + x * cw, oy + y * ch, cw_ * cw, ch_ * ch)
+            if box is not None:
+                # The mark stands TALL lines high, square, on the middle of
+                # its two rows, reaching a little into the strip's edges.
+                x, y, bw, bh = box
+                side = round(bh * TALL / 2)
+                box = (x + bw // 2 - side // 2, y + bh // 2 - side // 2, side, side)
+            if box == self.shown:
+                continue
+            if box is None:
+                self.layer.clear()
+            else:
+                x, y, bw, bh = box
+                self.layer.frame(self.png(bw, bh), at=(x, y), size=(bw, bh), hold="still")
+            self.shown = box
+
+    def close(self):
+        self.layer.close()
+
+
+def follow_file(path, caption, stop):
+    """Show the first line of `path` whenever it changes."""
+    seen = None
+    while not stop.is_set():
+        try:
+            st = os.stat(path)
+            key = (st.st_mtime_ns, st.st_size, st.st_ino)
+            if key != seen:
+                seen = key
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    line = fh.readline().rstrip("\n")
+                    then = fh.readline().strip()
+                if hasattr(caption, "rise") and caption.rise(then) and then:
+                    log(f"caption: {then}")
+                if caption.say(line):
+                    log(f"caption: {line!r}" if line.strip() else "caption cleared")
+        except FileNotFoundError:
+            if seen is not None:
+                seen = None
+                if caption.say(""):
+                    log(f"{path} gone, caption cleared")
+        except OSError as e:
+            log(f"{path}: {e}")
+        stop.wait(0.1)
+
+
+def follow_stdin(caption, stop):
+    """Show each line read from stdin; stdin ending leaves the last."""
+    for line in sys.stdin:
+        line = line.rstrip("\n")
+        if caption.say(line):
+            log(f"caption: {line!r}" if line.strip() else "caption cleared")
+    log("stdin ended; the caption stays")
+
+
+def parse(argv):
+    ap = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
+    ap.add_argument("--text", default="",
+                    help="what to say first; ` | ` splits a bright title "
+                         "from a dim rest")
+    ap.add_argument("--file", default=None,
+                    help=f"a file whose first line is the caption, read as it "
+                         f"changes, or - for lines on stdin (default "
+                         f"{DEFAULT_FILE} where no --text is given)")
+    ap.add_argument("--at", choices=("bottom", "top", "middle"), default="bottom",
+                    help="where on the wall it sits: against the bottom or the "
+                         "top edge, or across the middle (default bottom)")
+    ap.add_argument("--align", choices=("centre", "left"), default="centre",
+                    help="where along that edge (default centre)")
+    ap.add_argument("--style", choices=("strip", "label", "subtitle"), default="strip",
+                    help="a strip the width of the wall, a label sized to the "
+                         "text, or a film's subtitle along the bottom of --box "
+                         "(default strip)")
+    ap.add_argument("--box", default="0,0,1,1",
+                    help="for a subtitle, the film's box as shares of the wall: "
+                         "left,top,width,height (default the whole wall)")
+    ap.add_argument("--font", default=None,
+                    help="the caption's font size, or base for the base's grid "
+                         "(default 52 for a strip, 28 for a label)")
+    ap.add_argument("--place", default=os.environ.get("BITWALL_PLACE") or "top",
+                    help="top, above, or a layer's number (default top)")
+    ap.add_argument("target", help="the wall, host:wall")
+    a = ap.parse_args(argv)
+    if a.font is None:
+        a.font = "52" if a.style == "strip" else "28"
+    if a.file is None and not a.text:
+        a.file = DEFAULT_FILE
+    if a.place not in ("above", "top") and not a.place.isdigit():
+        ap.error(f"--place {a.place!r}: above, top or a number")
+    if a.font != "base" and not (a.font.isdigit() and 4 <= int(a.font) <= 400):
+        ap.error(f"--font {a.font!r}: base, or a size from 4 to 400")
+    return a
+
+
+def main():
+    a = parse(sys.argv[1:])
+    stop = threading.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: stop.set())
+
+    place = int(a.place) if a.place.isdigit() else a.place
+    # The mark's layer first: placed from the top as well, the cells
+    # layer opened after it goes under it, so the mark lies on the strip.
+    pictured = Mark.open(a.target) if a.style == "strip" else None
+    w = bitwall.CellsLayer(a.target, place=place, min_frame=1 / 30).attach()
+    if w.z is None:
+        log(f"{a.target}: no cells layer {a.place}: "
+            f"{getattr(w, '_refused', None) or 'the wall did not open one'}")
+        if pictured is not None:
+            pictured.close()
+        w.detach()
+        return 1
+    if a.style == "strip":
+        caption = Strip(a.at, mark(INFO) if w.can("\U0001CD00") else None)
+    elif a.style == "subtitle":
+        caption = Subtitle(tuple(float(v) for v in a.box.split(",")))
+    else:
+        caption = Caption(a.at, a.align, cut=w.can("◢◣◤◥"))
+    if pictured is not None:
+        caption.pictured = True
+        threading.Thread(target=pictured.follow, args=(w, caption, stop),
+                         daemon=True).start()
+    caption.say(a.text)
+    w.meta(name="Caption", description="A line of text on a label along the "
+           f"{a.at} of the wall")
+    with w.transition():
+        if a.font != "base":
+            w.set_font_size(int(a.font))
+        w.set_source(caption.render)
+    cols, rows = w.area()
+    log(f"caption -> {a.target} layer {w.z}, {cols}x{rows}, at the {a.at}, "
+        f"font {a.font}, mark "
+        + ("pictured" if pictured else "in cells") + ", reading "
+        + ("stdin" if a.file == "-" else a.file or "nothing more")
+        + (f", first {a.text!r}" if a.text else ""))
+
+    if a.file == "-":
+        threading.Thread(target=follow_stdin, args=(caption, stop),
+                         daemon=True).start()
+    elif a.file:
+        threading.Thread(target=follow_file, args=(a.file, caption, stop),
+                         daemon=True).start()
+    seen = (cols, rows)
+    while not stop.wait(1):
+        if w.area() != seen:
+            seen = w.area()
+            log(f"area {seen[0]}x{seen[1]}")
+    log("stopping")
+    if pictured is not None:
+        pictured.close()
+    w.detach()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

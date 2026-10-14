@@ -1,0 +1,120 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.14"
+# dependencies = ["numpy"]
+# ///
+"""Cells in a terminal, or in a tmux pane.
+
+    senders/games/cells/pane-cells
+    senders/games/cells/pane-cells --population 12 --no-merge
+
+One of the two front ends on `life.py`. It takes the area from the terminal
+itself, asks the population for a grid, and writes the cells that changed
+since the last frame as truecolour ANSI. Diffing matters here for the same
+reason it matters on a wall: the bodies cover a fraction of the screen and
+the black around them never changes.
+
+Autowrap is turned off because the grid is exactly as wide as the screen,
+and with wrap on the last cell of a line pushes the cursor onto the next
+one. The arguments are the wall sender's, parsed by the same code, so the
+two front ends cannot drift apart in what they accept.
+"""
+import importlib.util
+import os
+import sys
+import time
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
+
+from life import World                                          # noqa: E402
+
+# The wall front end, loaded by path: it is called `main`, as every wall
+# front end in this repo is, and the name is taken.
+_spec = importlib.util.spec_from_file_location(
+    "cellsmain", os.path.join(_HERE, "main.py"))
+wallmain = importlib.util.module_from_spec(_spec)
+sys.modules["cellsmain"] = wallmain
+_spec.loader.exec_module(wallmain)
+
+GAP = 4          # re-homing the cursor costs more than a few unchanged cells
+
+
+def sgr(g):
+    p = ["0"]
+    if g.fg is not None:
+        p += ["38", "2", str(int(g.fg[0:2], 16)), str(int(g.fg[2:4], 16)),
+              str(int(g.fg[4:6], 16))]
+    if g.bg is not None:
+        p += ["48", "2", str(int(g.bg[0:2], 16)), str(int(g.bg[2:4], 16)),
+              str(int(g.bg[4:6], 16))]
+    return "\033[" + ";".join(p) + "m"
+
+
+def paint(grid, prev, cols, rows):
+    """ANSI for the cells that differ from the previous frame."""
+    out = []
+    cur = None
+    for y in range(rows):
+        row = grid[y]
+        old = prev[y] if prev is not None and y < len(prev) else None
+        x = 0
+        while x < cols:
+            if old is not None and row[x] is old[x]:
+                x += 1
+                continue
+            start, end, gap, probe = x, x + 1, 0, x + 1
+            while probe < cols:
+                if old is not None and row[probe] is old[probe]:
+                    gap += 1
+                    if gap > GAP:
+                        break
+                else:
+                    end = probe + 1
+                    gap = 0
+                probe += 1
+            out.append(f"\033[{y + 1};{start + 1}H")
+            for i in range(start, end):
+                g = row[i]
+                a = (g.fg, g.bg)
+                if a != cur:
+                    out.append(sgr(g))
+                    cur = a
+                out.append(g.ch)
+            x = end
+    if out:
+        out.append("\033[0m")
+    return "".join(out)
+
+
+def main():
+    args = wallmain.parse(["terminal"] + sys.argv[1:])
+    cfg = wallmain.configure(args)
+    fps = min(60.0, max(1.0, args.fps))
+    world = World(cfg)
+    prev = None
+    area = None
+    sys.stdout.write("\033[?25l\033[?7l\033[0m\033[2J")
+    try:
+        while True:
+            cols, rows = os.get_terminal_size()
+            if (cols, rows) != area:
+                area, prev = (cols, rows), None
+                sys.stdout.write("\033[0m\033[2J")
+            grid = world.frame(cols, rows)
+            data = paint(grid, prev, cols, rows)
+            prev = grid
+            if data:
+                sys.stdout.write(data)
+                sys.stdout.flush()
+            time.sleep(1.0 / fps)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sys.stdout.write("\033[0m\033[?7h\033[?25h\033[2J\033[H")
+        sys.stdout.flush()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

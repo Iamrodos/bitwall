@@ -1,0 +1,122 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.14"
+# dependencies = ["aiohttp"]
+# ///
+"""The demos carousel: one wall in the middle, its neighbours either side.
+
+    demos/bitwall-demos [--port 8901] [snake raycast film ...]
+
+Then open `http://localhost:8901/demos`, or from elsewhere with `--host`,
+and point a sender at each name:
+
+    BITWALL_RUN=$TMPDIR/bitwall-web senders/games/snake/main.py \\
+        localhost:snake
+
+A page rather than a receiver. It embeds the web receiver, which does the
+walls, and adds the one route that arranges them -- so the receiver never
+learns that a carousel exists, and a wall here is the same wall as one in
+a tab on its own.
+
+Only the three in view exist. Moving along builds the one arriving and
+throws away the one leaving, which closes its socket: a wall nobody is
+looking at has nothing watching it, and its sender stops composing. Thirty
+demos cost three.
+"""
+import argparse
+import asyncio
+import json
+import os
+import sys
+
+from aiohttp import web
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+from bitwall.receivers import web as receiver                  # noqa: E402
+
+
+class Carousel:
+    """The one route the receiver does not have."""
+
+    def __init__(self, server, names=()):
+        self.server = server
+        #: What this carousel was told to show. A server makes a wall up
+        #: for any name that is asked for, which is what lets a sender
+        #: pick one -- but a page that then showed every wall the server
+        #: happens to hold would put whatever a stale tab reconnected to
+        #: in front of whoever is looking at this one.
+        self.names = list(names)
+
+    async def page(self, request):
+        """The walls to show, and the shape each one wants.
+
+        Names come from the query -- /demos?names=a,b:80x40,c -- or from
+        every receiver the server knows. A name may carry the grid its
+        demo wants, and otherwise what the sender says it is showing is
+        used, so a box can be shaped before anything has painted.
+        """
+        want = [n for n in request.query.get("names", "").split(",") if n]
+        if not want:
+            want = self.names or sorted(self.server.walls)
+        for item in want:
+            self.server.get(item.partition(":")[0])
+
+        demos = []
+        for item in want:
+            name, _, shape = item.partition(":")
+            said = self.server.walls[name][0].says()
+            nominal = said.get("nominal") or (0, 0)
+            try:
+                cols, rows = (int(v) for v in shape.lower().split("x"))
+            except ValueError:
+                cols, rows = nominal
+            demos.append({"name": name, "label": said.get("name") or name,
+                          "cols": cols, "rows": rows})
+
+        with open(os.path.join(HERE, "demos.html")) as fh:
+            html = fh.read()
+        # JSON inside a <script> element is not JSON in a JSON document:
+        # the parser looks for `</script` before the script is javascript
+        # at all, so a label containing one would end the element and
+        # whatever followed would be markup. Escaping the angle bracket
+        # keeps the value a value.
+        blob = json.dumps(demos).replace("<", "\\u003c")
+        return web.Response(
+            text=html.replace("{{DEMOS}}", blob),
+            content_type="text/html",
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate",
+                     "Pragma": "no-cache"})
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("names", nargs="*", default=[],
+                    help="walls to create at startup")
+    ap.add_argument("--run", default=receiver.RUN,
+                    help="run dir; each wall is RUN/bitwall/<name>")
+    ap.add_argument("--port", type=int, default=receiver.PORT)
+    ap.add_argument("--host", action="append", metavar="ADDR", help=receiver.HOST_HELP)
+    args = ap.parse_args()
+
+    async def run():
+        server, app = receiver.server().build(args.run, args.names, open_names=True)
+        app.router.add_get("/demos", Carousel(server, args.names).page)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        hosts = args.host or [receiver.HOST]
+        for host in hosts:
+            await web.TCPSite(runner, host, args.port).start()
+        print(f"bitwall-demos  http://{hosts[0]}:{args.port}/demos  "
+              f"run={args.run}", flush=True)
+        await asyncio.Event().wait()
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

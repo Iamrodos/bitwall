@@ -1,0 +1,27 @@
+# What lands here is large, or not ours, or both: films to point the video
+# sender at, and art packs from the scene archive.
+#
+# The file types are ignored rather than the directory, so a README saying
+# where to get them travels with the repo and a clone can fetch its own.
+
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.m4v
+*.webm
+
+*.ans
+*.ANS
+*.asc
+*.diz
+*.DIZ
+*.nfo
+*.tnd
+
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.zip
+*.srt

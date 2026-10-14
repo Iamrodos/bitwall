@@ -1,0 +1,592 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.14"
+# ///
+"""What sender hosts can run, and what they are running.
+
+    controllers/bitwall-senders list [HOST ...]              # what can run
+    controllers/bitwall-senders start SENDER WALL [--opt V ...] [--on HOST] [--replace]
+    controllers/bitwall-senders status [HOST ...]            # what is running
+    controllers/bitwall-senders move ID WALL [--on HOST] [--replace]
+    controllers/bitwall-senders stop ID [--on HOST]
+
+    controllers/bitwall-senders start bitwall/snake pi.local --font 30
+    controllers/bitwall-senders start bitwall/ticker pi.local      # a layer above its base
+    controllers/bitwall-senders start --replace bitwall/fluid pi.local
+    controllers/bitwall-senders move mac-7f3a2c pi.local:1   # without a restart
+    controllers/bitwall-senders status --json                # for a program
+    controllers/bitwall-senders start bitwall/mirror pi-a.local --to pi-b.local,pi-b.local:1
+
+A sender host keeps a catalogue at `~/.bitwall/senders/` and a record of
+what it is running at `~/.bitwall/running/`. Everything done there is a
+script sent over ssh and run on the host -- `catalogue.py` to walk the
+catalogue, `instance.py` to start, stop and look -- so nothing is
+installed on a host and nothing runs there between questions. HOST is
+this machine unless it says otherwise.
+
+**Only what the catalogue lists is started**, with its options checked
+against their types and passed as an argv, never through a shell, and the
+wall last. A `walls` option is checked by the catalogue's own `walls()`,
+the rules a target is held to, and passed on as it was written.
+A sender the host hides (`~/.bitwall/catalogue.json`) is not there to
+start, and one whose `available` says it cannot run there is refused with
+its reason.
+
+**A sender goes where its entry places it**: the base, or a layer
+`above` it or at the `top`. The sender is told the place in
+`BITWALL_PLACE`, and the wall says the layer it gave. An entry placed
+`controller` holds only a controller session on its wall, which carries
+its id as a layer does (the mirror, which reads its wall's glass and
+shows it on others): nothing on the wall is asked to make room.
+
+**The wall is the truth.** A start opens a controller session on the
+wall and asks its `sessions` whether the place is free: a base start
+refuses a wall whose base is held, whoever started it, unless told
+`--replace`, which stops the base's sender through its record where this
+host has one and otherwise leaves the new sender to take the base, as
+every base does; a layer start refuses a wall that takes no layers, or
+has every one held. It holds a lock on the sender host while it asks and starts,
+so two starts from one host cannot both find the place free. A start is
+done when a session on the wall says the new instance's id, a layer or a
+controller. Status says, for each record, whether its sender is up,
+whether its wall says it is there, and on which layer.
+
+**A sender whose entry says `"moves": true` moves while it runs.** `move`
+asks the new wall for room as a start does, then has the sender's host
+write the wall into its record and signal it, and the library moves the
+sender there with everything it holds: the same process, the same
+instance, its state and its meta. The move is done when the new wall says
+the instance and the old one no longer does. A sender whose entry does
+not say it moves is refused; it moves by `stop` and `start`.
+
+**A Windows machine is a sender host too**, and runs this as well. Its
+requests go as base64, which PowerShell passes as it is; `instance.py`
+starts a sender there through WMI, so it outlives the ssh or console that
+asked, and stops and moves it through its record (WINDOWS.md, *A sender
+host*). Run on Windows, this puts Git's `ssh` first on the path, since
+Windows' own hangs when a program reads it through a pipe from an ssh
+session.
+
+Exit status: 0 done, 1 refused or failed, 2 a host or wall could not be
+asked.
+"""
+import argparse
+import base64
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(_HERE))                      # repo root
+
+from bitwall import LOCAL, Controller, address, relay           # noqa: E402
+from bitwall.receivers import pi as _pi                         # noqa: E402
+from bitwall.session import NoWall, Refused                     # noqa: E402
+
+sys.path.insert(0, _HERE)
+from catalogue import Bad, walls                                # noqa: E402
+
+WALKER = os.path.join(_HERE, "catalogue.py")
+INSTANCE = os.path.join(_HERE, "instance.py")
+CATALOGUE = "~/.bitwall/senders"
+SETTINGS = "~/.bitwall/catalogue.json"
+SEEN_WAIT = 30.0        # how long a start waits for the wall to say its id
+#: Where Git keeps the ssh that does not hang in an ssh session on Windows.
+GIT_SSH = r"C:\Program Files\Git\usr\bin"
+
+if os.name == "nt" and os.path.isdir(GIT_SSH):
+    os.environ["PATH"] = os.pathsep.join([GIT_SSH, os.environ.get("PATH", "")])
+
+
+class Failed(Exception):
+    def __init__(self, message, code=1):
+        super().__init__(message)
+        self.code = code
+
+
+# ------------------------------------------------------------- on a host
+
+def _windows_said(err):
+    """Whether a failure is PowerShell's, on a host whose `python3` would
+    not run: the Store's alias refused, or none there."""
+    return any(w in err for w in ("NativeCommandFailed", "WindowsApps",
+                                  "is not recognized", "Access is denied",
+                                  "CommandNotFoundException"))
+
+
+def on_host(host, script, args):
+    """Run one of the scripts here on a host, fed from stdin, and read the
+    line of JSON it answers with."""
+    if host in LOCAL:
+        # On Windows `python3` is the Store's, an app alias WMI cannot start
+        # a sender with; this one, uv's, it can.
+        argv = [sys.executable if os.name == "nt" else "python3", "-"] + args
+    else:
+        argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                f"{_pi.USER}@{host}",
+                "python3 - " + " ".join(a if a.startswith('"$HOME') else shlex.quote(a)
+                                        for a in args)]
+    with open(script) as fh:
+        code = fh.read()
+    try:
+        out = subprocess.run(argv, input=code, capture_output=True,
+                             text=True, timeout=60)
+        if host not in LOCAL and out.returncode != 0 and _windows_said(out.stderr):
+            # A Windows host, whose `python3` is the Store's app alias,
+            # which an ssh login may not run: uv's Python instead.
+            argv[-1] = relay.WINDOWS_PYTHON + argv[-1][len("python3"):]
+            out = subprocess.run(argv, input=code, capture_output=True,
+                                 text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise Failed(f"{host}: {e or 'timed out'}", 2)
+    if out.returncode != 0:
+        raise Failed(f"{host}: " + (out.stderr.strip().splitlines() or ["failed"])[-1], 2)
+    try:
+        return json.loads(out.stdout)
+    except ValueError:
+        raise Failed(f"{host}: the answer was not JSON", 2)
+
+
+def catalogue(host):
+    where = (os.path.expanduser(CATALOGUE) if host in LOCAL
+             else f'"$HOME/{CATALOGUE[2:]}"')
+    return on_host(host, WALKER, [where])
+
+
+def instance(host, verb, **args):
+    said = on_host(host, INSTANCE, [verb, base64.urlsafe_b64encode(
+        json.dumps(args).encode()).decode("ascii")])
+    if "error" in said:
+        raise Failed(f"{host}: {said['error']}")
+    return said
+
+
+# -------------------------------------------------------------- on a wall
+
+def wall_of(target):
+    """A wall as `host:wall`, wall 0 said rather than left out."""
+    try:
+        host, wall = address(target)
+    except ValueError as e:
+        raise Failed(str(e))
+    return f"{host}:{wall}"
+
+
+def open_wall(wall):
+    """A controller session on a wall, or `Failed` where there is no wall
+    there to ask or it would not open one."""
+    try:
+        return Controller(wall).open()
+    except NoWall:
+        raise Failed(f"no wall at {wall}", 2)
+    except Refused as e:
+        raise Failed(f"{wall}: {e}", 2)
+
+
+def peek(c):
+    """What a wall says of itself on an open controller session: the
+    base's meta, whether anybody is watching, how many layers it takes,
+    its layers as `sessions` lists them (name, z, type and instance, by
+    z), the instances its controller sessions carry, and the base
+    session's name, or None where no base is on it."""
+    said = {"meta": {}, "base": None, "watching": None, "layers": {}, "places": 1,
+            "controllers": set()}
+    for m in c.ask("report"):
+        if m.name == "watching" and m.args[:1] and m.args[0].isdigit():
+            said["watching"] = int(m.args[0])
+        elif m.name == "meta" and m.args[:1] == ("set",) and len(m.args) >= 3:
+            said["meta"][m.args[1]] = " ".join(m.args[2:])
+        elif m.name == "caps" and str(m.opts.get("layers", "")).isdigit():
+            said["places"] = int(m.opts["layers"])
+    for m in c.ask("sessions"):
+        if m.name == "session" and m.args[1:2] == ("layer",) and len(m.args) >= 4 \
+                and m.args[2].isdigit():
+            z = int(m.args[2])
+            said["layers"][z] = {"name": m.args[0], "z": z, "type": m.args[3],
+                                 "instance": m.opts.get("instance")}
+            if z == 0:
+                said["base"] = m.args[0]
+        elif m.name == "session" and m.args[1:2] == ("controller",) \
+                and m.opts.get("instance"):
+            said["controllers"].add(m.opts["instance"])
+    return said
+
+
+def placed(said, iid):
+    """The layer a wall says instance `iid` is on, or None."""
+    return next((z for z, x in said["layers"].items() if x["instance"] == iid), None)
+
+
+def seen(said, iid, place):
+    """Whether a wall says instance `iid` is on it, at the place its entry
+    gives: a controller session carrying it, or a layer."""
+    if place == "controller":
+        return iid in said["controllers"]
+    return placed(said, iid) is not None
+
+
+def free_place(said, place):
+    """Whether the wall has room for a layer asked for at `place`."""
+    if place == "base":
+        return said["base"] is None
+    return any(z not in said["layers"] for z in range(1, said["places"]))
+
+
+def look(wall):
+    """What a wall says of itself, on a session opened and closed for
+    the asking. None if there is no wall there to ask."""
+    try:
+        c = open_wall(wall)
+    except Failed:
+        return None
+    try:
+        return peek(c)
+    finally:
+        c.close()
+
+
+def as_seen_from(host, wall):
+    """The wall as the sender on `host` names it: a wall on the sender's
+    own machine is `localhost`, reached without ssh, whatever this machine
+    calls it. The record keeps the wall as this machine names it, which is
+    how it is looked at from here."""
+    whose, _, number = wall.rpartition(":")
+    if host not in LOCAL and whose == host:
+        return f"localhost:{number}"
+    return wall
+
+
+def who(said):
+    """The base, as a refusal names it: what it calls itself, and its
+    instance, or its session where it has none."""
+    meta = said["meta"]
+    name = meta.get("name", said["base"] or "a sender that gave no name")
+    return f"{name} ({meta.get('instance') or 'session ' + str(said['base'])})"
+
+
+# ---------------------------------------------------------------- options
+
+def options_argv(entry, given):
+    """The argv for a sender's options, each checked against the catalogue:
+    what was given, else the default, in the catalogue's order."""
+    opts = entry["options"]
+    values, rest = {}, list(given)
+    while rest:
+        word = rest.pop(0)
+        if not word.startswith("--"):
+            raise Failed(f"{word!r}: options are --name value")
+        name, eq, value = word[2:].partition("=")
+        opt = opts.get(name)
+        if opt is None:
+            raise Failed(f"{entry['id']} has no option --{name}; it has "
+                         + (", ".join(f"--{n}" for n in opts) or "none"))
+        if opt["type"] == "bool":
+            if eq:
+                raise Failed(f"--{name} is on or off: give it, or leave it out")
+            values[name] = True
+            continue
+        if not eq:
+            if not rest:
+                raise Failed(f"--{name} needs a value")
+            value = rest.pop(0)
+        if opt["type"] == "choice":
+            if value not in opt["choices"]:
+                raise Failed(f"--{name} {value}: not one of {'|'.join(opt['choices'])}")
+            values[name] = value
+        elif opt["type"] == "walls":
+            try:
+                walls(value, opt["min"], opt["max"])
+            except Bad as e:
+                raise Failed(f"--{name} {value}: {e}")
+            values[name] = value
+        else:
+            if not re.match(r"^[0-9]+$", value) or not opt["min"] <= int(value) <= opt["max"]:
+                raise Failed(f"--{name} {value}: not a whole number in {opt['min']}..{opt['max']}")
+            values[name] = int(value)
+    argv, chosen = [], {}
+    for name, opt in opts.items():
+        value = values.get(name, opt["default"])
+        chosen[name] = value
+        if opt["type"] == "bool":
+            argv += [f"--{name}"] if value else []
+        elif opt["type"] == "walls" and value == "":
+            pass
+        else:
+            argv += [f"--{name}", str(value)]
+    return argv, chosen
+
+
+# ----------------------------------------------------------------- verbs
+
+def describe(opt):
+    kind = opt["type"]
+    if kind == "choice":
+        what = "|".join(opt["choices"])
+    elif kind == "font":
+        what = f"font {opt['min']}..{opt['max']}"
+    elif kind == "walls":
+        what = f"{opt['min']}..{opt['max']} walls, host or host:wall, by commas"
+        if opt["default"] == "":
+            return what + ", none unless given"
+    else:
+        what = "on/off"
+    default = ("on" if opt["default"] else "off") if kind == "bool" else opt["default"]
+    return f"{what}, default {default}"
+
+
+def do_list(a):
+    status = 0
+    for host in a.hosts or ["localhost"]:
+        try:
+            cat = catalogue(host)
+        except Failed as e:
+            status = 2
+            print(json.dumps({"host": host, "error": str(e)}) if a.json
+                  else f"{host}\n  ! could not be asked: {e}")
+            continue
+        if cat["problems"]:
+            status = max(status, 1)
+        if a.json:
+            print(json.dumps({"host": host, **cat}))
+            continue
+        print(host)
+        if not cat["senders"] and not cat["problems"] and not cat.get("unavailable"):
+            print(f"  nothing in {cat['root']}")
+        width = max([len(s["id"]) for s in cat["senders"]] + [8])
+        for s in cat["senders"]:
+            print(f"  {s['id']:<{width}}  {s['label']} -- {s['description']}")
+            for name, opt in s["options"].items():
+                print(f"  {'':<{width}}    --{name:<10} {opt['label']}: {describe(opt)}")
+        if cat.get("unavailable"):
+            print("  unavailable:")
+            for u in cat["unavailable"]:
+                print(f"    {u['id']:<{width}}  {u['reason']}")
+        if cat.get("hidden"):
+            print(f"  {cat['hidden']} hidden ({SETTINGS})")
+        for p in cat["problems"]:
+            print(f"  ! {p['id'] or '(the top)'}: {p['problem']}")
+    return status
+
+
+def make_room(host, wall, said, place, replace):
+    """Refuse a wall with no room at `place`, or with `replace` stop the
+    base's sender through its record where this host has one; what was
+    stopped, said for the line that reports it. A controller takes no
+    room."""
+    if place == "controller":
+        return ""
+    if place != "base" and said["places"] < 2:
+        raise Failed(f"{wall} takes no layers, only a base")
+    if not free_place(said, place) and place != "base":
+        raise Failed(f"{wall} has every layer held; stop one first")
+    if free_place(said, place):
+        return ""
+    if not replace:
+        raise Failed(f"{wall}'s base has {who(said)}; stop it first, or --replace")
+    held = said["meta"].get("instance")
+    rec = next((r for r in instance(host, "status")["running"]
+                if held and r["id"] == held), None)
+    if rec is None:
+        return ""
+    instance(host, "stop", id=held)
+    return f"stopped {held} ({said['meta'].get('name') or rec['sender']}); "
+
+
+def do_start(a, given):
+    host, wall = a.on, wall_of(a.wall)
+    cat = catalogue(host)
+    entry = next((s for s in cat["senders"] if s["id"] == a.sender), None)
+    if entry is None:
+        gone = next((u for u in cat.get("unavailable", []) if u["id"] == a.sender), None)
+        if gone is not None:
+            raise Failed(f"{a.sender} is unavailable here: {gone['reason']}")
+        raise Failed(f"{host} has no sender {a.sender}; `list` says what it has")
+    argv, chosen = options_argv(entry, given)
+    place = entry.get("place", "base")
+    if a.replace and place != "base":
+        raise Failed(f"--replace is for a base, and {entry['id']} goes {place} it")
+    if not instance(host, "lock", wall=wall)["locked"]:
+        raise Failed(f"another start onto {wall} is under way from {host}")
+    c = None
+    try:
+        c = open_wall(wall)
+        done = make_room(host, wall, peek(c), place, a.replace)
+        started = instance(host, "start", sender=entry["id"], wall=wall, place=place,
+                           moves=entry.get("moves", False),
+                           start=entry["start"], stop=entry["stop"],
+                           status=entry["status"], argv=argv + [as_seen_from(host, wall)],
+                           options=chosen)
+        iid = started["id"]
+        until = time.monotonic() + SEEN_WAIT
+        while time.monotonic() < until:
+            time.sleep(1.0)
+            said = peek(c)
+            if seen(said, iid, place):
+                z = placed(said, iid)
+                print(f"{done}started {iid} on {wall} {place}"
+                      + (f", layer {z}" if place not in ("base", "controller") else ""))
+                return 0
+            rec = next((r for r in instance(host, "status")["running"]
+                        if r["id"] == iid), None)
+            if rec and not rec["up"]:
+                break
+        tail = log_tail(host, iid)
+        raise Failed(f"{iid} started but {wall} never showed it"
+                     + (f"; its log ends:\n{tail}" if tail else "")
+                     + f"\n  `stop {iid}` clears its record")
+    finally:
+        if c is not None:
+            c.close()
+        instance(host, "unlock", wall=wall)
+
+
+def do_move(a):
+    host, wall = a.on, wall_of(a.wall)
+    rec = next((r for r in instance(host, "status")["running"] if r["id"] == a.id), None)
+    if rec is None:
+        raise Failed(f"{host} is running no {a.id}; `status` says what it is")
+    if not rec.get("moves"):
+        raise Failed(f"{a.id} ({rec['sender']}) does not say it moves; "
+                     f"stop it and start it on {wall}")
+    if not rec["up"]:
+        raise Failed(f"{a.id} is not running; `stop {a.id}` clears its record")
+    was, place = rec["wall"], rec.get("place", "base")
+    if was == wall:
+        print(f"{a.id} is on {wall} already")
+        return 0
+    if a.replace and place != "base":
+        raise Failed(f"--replace is for a base, and {a.id} is a layer {place} it")
+    if not instance(host, "lock", wall=wall)["locked"]:
+        raise Failed(f"another start onto {wall} is under way from {host}")
+    c = None
+    try:
+        c = open_wall(wall)
+        done = make_room(host, wall, peek(c), place, a.replace)
+        instance(host, "repoint", id=a.id, wall=wall, target=as_seen_from(host, wall))
+        until = time.monotonic() + SEEN_WAIT
+        while time.monotonic() < until:
+            time.sleep(1.0)
+            said = peek(c)
+            old = look(was)
+            if seen(said, a.id, place) and (old is None or not seen(old, a.id, place)):
+                z = placed(said, a.id)
+                print(f"{done}moved {a.id} from {was} to {wall} {place}"
+                      + (f", layer {z}" if place not in ("base", "controller") else ""))
+                return 0
+        tail = log_tail(host, a.id)
+        raise Failed(f"{a.id} was told to move but {wall} never showed it"
+                     + (f"; its log ends:\n{tail}" if tail else ""))
+    finally:
+        if c is not None:
+            c.close()
+        instance(host, "unlock", wall=wall)
+
+
+def log_tail(host, iid, lines=8):
+    try:
+        said = instance(host, "tail", id=iid, lines=lines)
+    except Failed:
+        return ""
+    return "\n".join("    " + line for line in said.get("lines", []))
+
+
+def do_status(a):
+    walls, status, shown = {}, 0, []
+    for host in a.hosts or ["localhost"]:
+        try:
+            running = instance(host, "status")["running"]
+        except Failed as e:
+            status = 2
+            shown.append({"host": host, "error": str(e)})
+            continue
+        for rec in running:
+            if rec["wall"] not in walls:
+                walls[rec["wall"]] = look(rec["wall"])
+            said = walls[rec["wall"]]
+            rec.setdefault("place", "base")
+            rec["z"] = placed(said, rec["id"]) if said else None
+            rec["on_wall"] = bool(said) and seen(said, rec["id"], rec["place"])
+        shown.append({"host": host, "running": running})
+    if a.json:
+        for h in shown:
+            print(json.dumps(h))
+        return status
+    for h in shown:
+        print(h["host"])
+        if "error" in h:
+            print(f"  ! could not be asked: {h['error']}")
+            continue
+        if not h["running"]:
+            print("  nothing running")
+        rows = []
+        for r in h["running"]:
+            state = ("up, on its wall" if r["up"] and r["on_wall"]
+                     else "up, NOT on its wall" if r["up"] else "DEAD")
+            where = r["place"] + (f" {r['z']}" if r["place"] not in ("base", "controller")
+                                  and r["z"] is not None else "")
+            rows.append((r["id"], r["sender"], f"{r['wall']} {where}", state))
+        widths = [max(len(x[i]) for x in rows) for i in range(3)] if rows else []
+        for row in rows:
+            print("  " + "  ".join(f"{v:<{widths[i]}}" for i, v in enumerate(row[:3]))
+                  + "  " + row[3])
+    return status
+
+
+def do_stop(a):
+    said = instance(a.on, "stop", id=a.id)
+    print(f"{a.id} {'stopped' if said['stopped'] else 'was not running'}"
+          + (", ended by force when asking did not stop it" if said.get("forced") else "")
+          + "; record cleared")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__.split("\n\n")[0],
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    verbs = ap.add_subparsers(dest="verb", required=True)
+    p = verbs.add_parser("list", help="what a host can run")
+    p.add_argument("hosts", nargs="*")
+    p.add_argument("--json", action="store_true")
+    p = verbs.add_parser("start", help="run a catalogue sender on a wall")
+    p.add_argument("sender", help="its name, as `list` shows it")
+    p.add_argument("wall", help="host, or host:wall")
+    p.add_argument("--on", default="localhost", help="the sender host")
+    p.add_argument("--replace", action="store_true",
+                   help="for a base: stop the one there first, through its record")
+    p = verbs.add_parser("status", help="what a host is running")
+    p.add_argument("hosts", nargs="*")
+    p.add_argument("--json", action="store_true")
+    p = verbs.add_parser("move", help="move a running sender to another wall")
+    p.add_argument("id")
+    p.add_argument("wall", help="host, or host:wall")
+    p.add_argument("--on", default="localhost", help="the sender host")
+    p.add_argument("--replace", action="store_true",
+                   help="for a base: stop the one there first, through its record")
+    p = verbs.add_parser("stop", help="stop an instance and clear its record")
+    p.add_argument("id")
+    p.add_argument("--on", default="localhost", help="the sender host")
+    a, given = ap.parse_known_args()
+    if given and a.verb != "start":
+        ap.error(f"unrecognised arguments: {' '.join(given)}")
+    try:
+        if a.verb == "list":
+            return do_list(a)
+        if a.verb == "start":
+            return do_start(a, given)
+        if a.verb == "status":
+            return do_status(a)
+        if a.verb == "move":
+            return do_move(a)
+        return do_stop(a)
+    except Failed as e:
+        print(f"bitwall-senders: {e}", file=sys.stderr)
+        return e.code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

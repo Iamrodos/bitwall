@@ -1,0 +1,174 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""An example presence feeder: a skeleton to copy and make your own.
+
+    controllers/presence-example lounge pi.local:0,pi.local:1
+    controllers/presence-example lounge pi.local --check 'test -e /tmp/lounge-here' --every 5
+
+A wall started with a presence (`--presence 0=lounge` to the painter,
+`make kitchen presence=lounge` to the web receiver) goes dark, says
+`display away` and tells its senders `watching 0` while whoever feeds
+that presence says nobody is in the room, and lights again when somebody
+is (PROTOCOL.md, "`presence` is whether anybody is there"). This is the
+least such a feeder is: it asks a check whether the room is occupied and
+tells the walls that follow the room.
+
+The check is a stand-in. Its default is whether a file exists, so
+`touch /tmp/lounge-here` puts somebody in the lounge and `rm` takes them
+out. Replace it with whatever really knows: a motion sensor, a light
+switch, a phone on the Wi-Fi, a screen lock. Any shell command will do:
+exit 0 means somebody is there, exit 1 nobody, and anything else (a
+check that broke) counts as somebody, so a wall is never left dark by a
+fault. Being sure a room is empty usually wants a grace period too, so a
+wall does not blank the moment somebody sits still; that belongs in the
+check.
+"""
+import argparse
+import os
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(_HERE))                      # repo root
+
+from bitwall import Controller                                  # noqa: E402
+from bitwall.session import NoWall, Refused                     # noqa: E402
+
+AGAIN = 60.0     # every wall is told again this often, as PROTOCOL.md asks
+RETRY = 3.0      # seconds before a lost session is opened again
+
+
+def log(*words):
+    print(time.strftime("%H:%M:%S"), *words, flush=True)
+
+
+def occupied(check):
+    """Whether anybody is in the room. Replace this, or the command."""
+    try:
+        status = subprocess.run(check, shell=True, timeout=30).returncode
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    return status != 1
+
+
+class Feed(threading.Thread):
+    """A controller session held on one wall, told the room's presence.
+
+    A wall forgets its presence when its receiver restarts: the new one
+    starts present and its report shows no `from`. So the session is
+    opened again whenever it ends, and a report or `presence` line that
+    names this room with no `from` is answered at once.
+    """
+
+    def __init__(self, target, room, me, stop):
+        super().__init__(daemon=True)
+        self.target, self.room, self.me, self.stop = target, room, me, stop
+        self.present = True
+        self.follows = None          # whether the wall follows this room
+        self.ctl = None
+
+    def run(self):
+        while not self.stop.is_set():
+            c = Controller(self.target, name=self.me)
+            try:
+                c.open()
+            except (NoWall, Refused) as e:
+                log(f"{self.target}: no session ({e}); trying again")
+                self.stop.wait(RETRY)
+                continue
+            self.ctl = c
+            for said in c.report:                # what it was as it opened
+                self.heard(said)
+            self.tell(self.present)              # and what it is now
+            while (said := c.read()) is not None:   # and what it says since
+                self.heard(said)
+            self.ctl = None
+            c.close()
+            if not self.stop.is_set():
+                log(f"{self.target}: session ended; opening it again")
+                self.stop.wait(RETRY)
+
+    def heard(self, said):
+        """A wall says `presence 1 name=lounge [from=... age=...]` in its
+        report and whenever its presence changes."""
+        if getattr(said, "name", None) != "presence":
+            return
+        follows = said.get("name") == self.room
+        if follows != self.follows:
+            self.follows = follows
+            log(f"{self.target}: follows {said.get('name') or 'no presence'}"
+                + ("" if follows else f", not {self.room}: left alone"))
+        if follows and said.get("from") is None:
+            self.tell(self.present)
+
+    def tell(self, present):
+        """`presence 0|1 from=<who>`: `from` is required, one feeder a wall."""
+        self.present = present
+        c = self.ctl
+        if c is not None and self.follows:
+            c.send(f"presence {int(present)} from={self.me}")
+
+    def close(self):
+        c = self.ctl
+        if c is not None:
+            c.close()                            # the wall hears `close`
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__.split("\n\n")[0],
+        formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    ap.add_argument("room", help="the presence name the walls follow, e.g. lounge")
+    ap.add_argument("walls", nargs="+",
+                    help="the walls to tell, host:wall, comma or space separated")
+    ap.add_argument("--check", default=None,
+                    help="shell command: exit 0 somebody is there, 1 nobody "
+                         "(default: test -e /tmp/<room>-here)")
+    ap.add_argument("--every", type=float, default=5.0,
+                    help="seconds between checks (default 5)")
+    a = ap.parse_args()
+
+    check = a.check or f"test -e /tmp/{a.room}-here"
+    # Who this feeder says it is, on its session and in `from`: a token.
+    me = re.sub(r"[^A-Za-z0-9_-]", "-", f"presence-{a.room}")[:32]
+    walls = [w for arg in a.walls for w in arg.split(",") if w]
+
+    stop = threading.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: stop.set())
+
+    present = occupied(check)
+    feeds = []
+    for target in walls:
+        feed = Feed(target, a.room, me, stop)
+        feed.present = present
+        feeds.append(feed)
+        feed.start()
+    log(f"{a.room}: {'somebody' if present else 'nobody'} there; "
+        f"telling {', '.join(walls)}; check {check!r} every {a.every:g}s")
+
+    told = time.monotonic()
+    while not stop.wait(a.every):
+        now = occupied(check)
+        if now != present:
+            log(f"{a.room}: {'somebody' if now else 'nobody'} there")
+        if now != present or time.monotonic() - told >= AGAIN:
+            present, told = now, time.monotonic()
+            for feed in feeds:
+                feed.tell(present)
+
+    for feed in feeds:
+        feed.close()
+    log("stopped")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

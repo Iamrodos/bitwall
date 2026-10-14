@@ -1,0 +1,114 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.14"
+# dependencies = ["numpy"]
+# ///
+"""The pipes screensaver in a terminal, or in a tmux pane.
+
+    senders/games/pipes/pane-pipes
+    senders/games/pipes/pane-pipes --stats
+
+One of the two front ends on `game.py`. It takes the area from the terminal
+itself, asks the renderer for a grid, and writes it as ANSI.
+
+Almost nothing changes between frames -- a growing tip and its shading --
+so this diffs against the last grid and writes only the cells that differ,
+which is the same saving the wall gets from bitwall's own diff. `--stats`
+prints the frame time and the bytes per frame, which is how the cost was
+measured rather than guessed.
+"""
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from game import Game                                           # noqa: E402
+
+
+def sgr(g):
+    p = ["0"]
+    if g.fg is None:
+        p.append("39")
+    else:
+        p += ["38", "2", str(int(g.fg[0:2], 16)), str(int(g.fg[2:4], 16)),
+              str(int(g.fg[4:6], 16))]
+    if g.bg is None:
+        p.append("49")
+    else:
+        p += ["48", "2", str(int(g.bg[0:2], 16)), str(int(g.bg[2:4], 16)),
+              str(int(g.bg[4:6], 16))]
+    return "\033[" + ";".join(p) + "m"
+
+
+def paint(grid, prev, cols, rows):
+    """ANSI for the cells that differ from the last frame."""
+    out = []
+    cur = None
+    for y in range(rows):
+        row = grid[y]
+        old = prev[y] if prev is not None and y < len(prev) else None
+        if row is old:
+            continue
+        x = 0
+        while x < cols:
+            if old is not None and row[x] == old[x]:
+                x += 1
+                continue
+            out.append("\033[%d;%dH" % (y + 1, x + 1))
+            while x < cols and (old is None or row[x] != old[x]):
+                g = row[x]
+                a = (g.fg, g.bg)
+                if a != cur:
+                    out.append(sgr(g))
+                    cur = a
+                out.append(g.ch)
+                x += 1
+    return "".join(out)
+
+
+def main():
+    stats = "--stats" in sys.argv[1:]
+    game = Game()
+    area = None
+    prev = None
+    sent = frames = 0
+    t0 = time.monotonic()
+    sys.stdout.write("\033[?25l\033[?7l\033[0m\033[2J")
+    try:
+        while True:
+            cols, rows = os.get_terminal_size()
+            if (cols, rows) != area:
+                area, prev = (cols, rows), None
+                sys.stdout.write("\033[0m\033[2J")
+            t = time.perf_counter()
+            grid = game.frame(cols, rows)
+            data = paint(grid, prev, cols, rows)
+            prev = grid
+            if data:
+                sys.stdout.write(data)
+                sys.stdout.flush()
+                sent += len(data.encode("utf-8"))
+            frames += 1
+            if stats and frames % game.FPS == 0:
+                el = max(1e-6, time.monotonic() - t0)
+                sys.stderr.write(
+                    "\r%dx%d  room %dx%dx%d  %5.1f fps  %6d B/frame  "
+                    "%6.1f KiB/s  %4.1f ms build " %
+                    (cols, rows, *game.dims, frames / el, sent / frames,
+                     sent / el / 1024, (time.perf_counter() - t) * 1000))
+                sys.stderr.flush()
+            time.sleep(max(0.0, game.next_frame - time.monotonic()))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sys.stdout.write("\033[0m\033[?7h\033[?25h\033[2J\033[H")
+        sys.stdout.flush()
+        el = max(1e-6, time.monotonic() - t0)
+        sys.stderr.write("%d frames, %.1f fps, %d bytes, %.1f KiB/s\n"
+                         % (frames, frames / el, sent, sent / el / 1024))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

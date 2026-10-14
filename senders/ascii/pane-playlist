@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Classic terminal animations, one after another, forever.
+#
+# Each item gets SECS seconds and is then killed, so a stream that hangs
+# (towel.blinkenlights.nl, a slow ascii.live) costs one slot, not the wall.
+#
+# The streams that clear the screen before every frame go through `whole`,
+# which hands each frame on complete and drawn over the last: a frame
+# bigger than a packet otherwise lands in two reads, and the wall catches
+# the blank screen between them as a flash.
+SECS="${1:-30}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ITEMS=(
+  "asciiquarium"
+  "cbonsai -l -i -w 2"
+  "pipes.sh"
+  "nyancat -n -s"
+  "sl -l"
+  "$HERE/whole curl -sN parrot.live"
+  "$HERE/across curl -sN ascii.live/forrest"
+  "$HERE/whole curl -sN ascii.live/nyan"
+  "$HERE/whole curl -sN ascii.live/donut"
+  "$HERE/whole curl -sN ascii.live/rick"
+  "cmatrix -b -u 4"
+  "$HERE/whole curl -sN ascii.live/earth"
+  "$HERE/whole curl -sN ascii.live/torus-knot"
+  "$HERE/whole curl -sN ascii.live/can-you-hear-me"
+)
+# Items after SECS replace the list: pane-playlist 30 "curl -sN ascii.live/batman-running"
+(( $# > 1 )) && ITEMS=("${@:2}")
+
+# macOS has no timeout(1). Interrupt rather than kill: a curses program
+# (cmatrix) restores the terminal on SIGINT, and dies on SIGALRM leaving the
+# pane in its alternate screen with its scroll region, which corrupts every
+# item after it.
+limit() {
+  perl -e '$s = shift; $p = fork // die; if (!$p) { exec @ARGV }
+           $SIG{ALRM} = sub { kill "INT", $p; sleep 1; kill "KILL", $p };
+           alarm $s; waitpid $p, 0' "$@"
+}
+
+# One item is not a playlist. A timer exists to stop a stream that hangs
+# costing the whole wall, and with nothing to move on to there is nothing
+# to protect: cutting it short only restarts what is already running,
+# which a viewer sees as the animation resetting every SECS.
+if (( ${#ITEMS[@]} == 1 )); then
+  while true; do
+    ${ITEMS[0]}
+    stty sane 2>/dev/null
+    printf '\033c'
+    clear
+  done
+fi
+
+while true; do
+  for item in "${ITEMS[@]}"; do
+    limit "$SECS" $item
+    # Full reset (RIS) whatever the last item left behind.
+    stty sane 2>/dev/null
+    printf '\033c'
+    clear
+  done
+done

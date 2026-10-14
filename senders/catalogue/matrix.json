@@ -1,0 +1,13 @@
+{
+  "label": "Matrix",
+  "description": "Digital rain",
+  "start": "../games/matrix/main.py",
+  "moves": true,
+  "options": {
+    "font": {"type": "font", "label": "Font size",
+             "description": "Cell size on the wall", "default": 18, "min": 6, "max": 40},
+    "glyphs": {"type": "choice", "label": "Alphabet",
+               "description": "What falls; auto asks the screen what it can draw",
+               "choices": ["auto", "katakana", "ascii"], "default": "auto"}
+  }
+}

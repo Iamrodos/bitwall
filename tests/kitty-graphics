@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""Whether the terminal this runs in draws kitty graphics, and two pictures
+to look at if it does.
+
+    tests/kitty-graphics            ask, then draw
+    tests/kitty-graphics --ask      ask only
+    tests/kitty-graphics --draw | tests/wall-cat shell
+                                    draw without asking, to stdout
+
+Run it in the terminal itself -- Ghostty, kitty, WezTerm, a herdr or tmux
+pane -- not through a pipe: the answer comes back on the terminal's input.
+
+The question is kitty's own: a one-pixel image sent with `a=q`, which a
+terminal that has the protocol answers and does not draw, followed by a
+primary device attributes request (`ESC [c`), which every terminal answers.
+A graphics reply before the attributes is a yes; the attributes alone are a
+no, with no timeout to wait on. The cell's size in pixels is asked as well
+(`ESC [16t`), since that is what a picture's cells come to on the glass.
+
+The pictures are drawn with `q=2`, so the terminal answers nothing: an
+answer to a drawing command would otherwise arrive as typed input. One is a
+PNG with an alpha edge, 256x128, put in 32x8 cells; the other raw RGB,
+8x4 pixels, stretched to 16x4 cells, to show the terminal scaling. Enter
+deletes both.
+
+`--draw` skips the question and writes the pictures to stdout, from the
+top left of a cleared screen, and holds them until it is stopped: for a
+pipe into a wall, where there is no terminal to ask and the answer is
+whoever is looking.
+"""
+import base64
+import os
+import select
+import signal
+import struct
+import sys
+import termios
+import time
+import tty
+import zlib
+
+ESC = "\x1b"
+ST = ESC + "\\"
+
+
+def ask(tty_fd, question, until, wait=2.0):
+    """Write a question and read the terminal's answer up to and including
+    `until`, or whatever came in `wait` seconds."""
+    os.write(tty_fd, question.encode())
+    got = b""
+    end = time.time() + wait
+    while time.time() < end:
+        ready, _, _ = select.select([tty_fd], [], [], max(0.0, end - time.time()))
+        if not ready:
+            break
+        got += os.read(tty_fd, 4096)
+        if until(got):
+            break
+    return got
+
+
+def probe(tty_fd):
+    """(yes, what the terminal said, cell size in pixels or None)."""
+    query = f"{ESC}_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA{ST}{ESC}[c"
+    said = ask(tty_fd, query, lambda b: b.rstrip().endswith(b"c") and b"\x1b[?" in b)
+    graphics = said.split(b"\x1b[?")[0]
+    yes = b"_Gi=31;OK" in graphics
+    cell = None
+    size = ask(tty_fd, f"{ESC}[16t", lambda b: b.endswith(b"t"), wait=1.0)
+    try:
+        _, h, w = size.decode().strip("\x1b[t").split(";")
+        cell = (int(w), int(h))
+    except ValueError:
+        pass
+    return yes, said, cell
+
+
+def png(width, height):
+    """An RGBA PNG: a rainbow across, dark to light down, the right quarter
+    fading to transparent so an alpha edge shows."""
+    rows = []
+    for y in range(height):
+        row = bytearray([0])                         # filter: none
+        for x in range(width):
+            h = x / width * 6
+            i, f = int(h), h - int(h)
+            r, g, b = [(1, f, 0), (1 - f, 1, 0), (0, 1, f), (0, 1 - f, 1),
+                       (f, 0, 1), (1, 0, 1 - f)][i % 6]
+            v = 0.35 + 0.65 * y / height
+            a = 255 if x < width * 3 // 4 else int(255 * (width - x) / (width / 4))
+            row += bytes((int(r * v * 255), int(g * v * 255), int(b * v * 255), a))
+        rows.append(bytes(row))
+
+    def chunk(kind, data):
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF))
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(b"".join(rows), 9))
+            + chunk(b"IEND", b""))
+
+
+def draw_only():
+    """The pictures on stdout, no question asked, held until stopped."""
+    out = sys.stdout.fileno()
+    held = {"on": True}
+
+    def stop(*_):
+        held["on"] = False
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, stop)
+    os.write(out, f"{ESC}[0m{ESC}[H{ESC}[2J".encode())
+    os.write(out, b"A PNG, 256x128 with an alpha edge on the right, in 32x8 cells:\r\n")
+    send(out, "a=T,i=4201,f=100,c=32,r=8,q=2", png(256, 128))
+    os.write(out, b"\r\n" * 9 + b"Raw RGB, 8x4 pixels, stretched to 16x4 cells:\r\n")
+    send(out, "a=T,i=4202,f=24,s=8,v=4,c=16,r=4,q=2", checks())
+    os.write(out, b"\r\n" * 5 + b"Held until stopped.\r\n")
+    while held["on"]:
+        time.sleep(0.2)
+    os.write(out, f"{ESC}_Ga=d,d=I,i=4201,q=2{ST}{ESC}_Ga=d,d=I,i=4202,q=2{ST}".encode())
+    return 0
+
+
+def checks():
+    """8x4 pixels of red and blue, a checkerboard."""
+    return bytes(c for y in range(4) for x in range(8)
+                 for c in ((255, 60, 60) if (x + y) % 2 else (40, 120, 255)))
+
+
+def send(tty_fd, keys, data):
+    """An image, base64 in chunks of 4096 as the protocol has them, the keys
+    on the first chunk, `m=1` on every chunk but the last."""
+    payload = base64.b64encode(data).decode()
+    parts = [payload[i:i + 4096] for i in range(0, len(payload), 4096)] or [""]
+    for n, part in enumerate(parts):
+        more = 1 if n < len(parts) - 1 else 0
+        head = f"{keys},m={more}" if n == 0 else f"m={more}"
+        os.write(tty_fd, f"{ESC}_G{head};{part}{ST}".encode())
+
+
+def main():
+    if "--draw" in sys.argv[1:]:
+        return draw_only()
+    if not os.isatty(0):
+        print("run this in the terminal itself, not through a pipe", file=sys.stderr)
+        return 2
+    only_ask = "--ask" in sys.argv[1:]
+    fd = os.open("/dev/tty", os.O_RDWR)
+    saved = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        yes, said, cell = probe(fd)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+    hints = {k: os.environ[k] for k in ("TERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION",
+                                        "KITTY_WINDOW_ID", "TMUX", "HERDR_PANE_ID",
+                                        "HERDR_SESSION") if k in os.environ}
+    hints.update({k: v for k, v in os.environ.items()
+                  if k.startswith("HERDR") and k not in hints})
+    print("kitty graphics:", "yes" if yes else "no")
+    print("it said:       ", repr(said.decode(errors="replace")))
+    print("cell:          ", f"{cell[0]}x{cell[1]} pixels" if cell else "not said")
+    for k, v in hints.items():
+        print(f"{k + ':':15} {v}")
+    if not yes or only_ask:
+        return 0 if yes else 1
+
+    print("\nA PNG, 256x128 with an alpha edge on the right, in 32x8 cells:")
+    send(fd, "a=T,i=4201,f=100,c=32,r=8,q=2", png(256, 128))
+    print("\n")
+    print("Raw RGB, 8x4 pixels, stretched to 16x4 cells:")
+    send(fd, "a=T,i=4202,f=24,s=8,v=4,c=16,r=4,q=2", checks())
+    print("\n")
+    input("Enter deletes them. ")
+    os.write(fd, f"{ESC}_Ga=d,d=I,i=4201,q=2{ST}{ESC}_Ga=d,d=I,i=4202,q=2{ST}".encode())
+    print("deleted")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

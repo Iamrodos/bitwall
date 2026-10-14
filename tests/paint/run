@@ -1,0 +1,24 @@
+#!/bin/sh
+# Build the Pi painter's tests under the address and undefined-behaviour
+# sanitizers, and run them.
+#
+#     tests/paint/run [name ...]
+#
+# A name runs only the tests whose names contain it. CC picks the
+# compiler. tests/bitwall-tests runs this as its painter group. libpng is
+# the real one, found by pkg-config where it can be, and libjpeg too where
+# pkg-config finds it, which builds the painter's JPEG frames.
+set -e
+here=$(cd "$(dirname "$0")" && pwd)
+out=$(mktemp -d "${TMPDIR:-/tmp}/bitwall-paint-XXXXXX")
+trap 'rm -rf "$out"' EXIT
+png=$(pkg-config --cflags --libs libpng 2>/dev/null || echo -lpng)
+if jpeg=$(pkg-config --cflags --libs libjpeg 2>/dev/null); then
+    png="$png -DBITWALL_JPEG $jpeg"
+fi
+${CC:-cc} -std=c99 -Wall -Wextra -Wno-unused-function -g \
+    -fsanitize=address,undefined \
+    -fno-sanitize-recover=undefined -Werror=format -DBITWALL_TEST \
+    -I"$here/stub" "$here/test_paint.c" "$here/stub/fake.c" $png -pthread \
+    -o "$out/paint-tests"
+ASAN_OPTIONS=detect_leaks=0 "$out/paint-tests" "$@"

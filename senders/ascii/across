@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""Move a running-on-the-spot animation across the screen.
+
+    across [--step N] curl -sN ascii.live/forrest
+
+Reads a stream of frames that each start with clear-and-home, and redraws
+every frame shifted STEP columns further right, wrapping from the right
+edge back in from the left.
+"""
+import os
+import re
+import subprocess
+import sys
+
+CLEAR = re.compile(rb"\x1b\[2J\x1b\[H")
+ESC = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+args = sys.argv[1:]
+step = 4
+if args[:1] == ["--step"]:
+    step = int(args[1])
+    args = args[2:]
+
+
+def size():
+    try:
+        return os.get_terminal_size(sys.stdout.fileno())
+    except OSError:
+        return os.terminal_size((80, 24))
+
+
+def draw(frame, x):
+    cols, rows = size()
+    lines = ESC.sub("", frame.decode("utf-8", "replace")).split("\n")
+    lines = [l.rstrip("\r") for l in lines][:rows]
+    top = max(0, (rows - len(lines)) // 2)
+    out = ["\x1b[H", "\x1b[K\n" * top]
+    for l in lines:
+        row = (" " * x + l) if x >= 0 else l[-x:]
+        out.append(row[:cols] + "\x1b[K\n")
+    out.append("\x1b[J")
+    sys.stdout.write("".join(out).rstrip("\n"))
+    sys.stdout.flush()
+
+
+def main():
+    sys.stdout.write("\x1b[?25l\x1b[2J")
+    width = 40
+    x = -width
+    buf = b""
+    # Run the source ourselves, so stopping this stops it too.
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE) if args else None
+    src = proc.stdout if proc else sys.stdin.buffer.raw
+    try:
+        loop(src, x, width, buf)
+    finally:
+        if proc:
+            proc.kill()
+
+
+def loop(src, x, width, buf):
+    while True:
+        chunk = os.read(src.fileno(), 65536)
+        if not chunk:
+            break
+        buf += chunk
+        parts = CLEAR.split(buf)
+        buf = parts.pop()               # the frame still arriving
+        for frame in parts:
+            if not frame.strip():
+                continue
+            width = max(len(l) for l in frame.decode("utf-8", "replace").split("\n"))
+            draw(frame, x)
+            x += step
+            if x >= size().columns:
+                x = -width
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (KeyboardInterrupt, BrokenPipeError):
+        pass

@@ -1,0 +1,41 @@
+{
+  "label": "Cells (Rust)",
+  "description": "Soft organisms that drift, split, merge and die, in Rust",
+  "start": "../target/release/cells",
+  "options": {
+    "font": {
+      "type": "font",
+      "label": "Font size",
+      "description": "Cell size on the wall",
+      "default": 18,
+      "min": 4,
+      "max": 40
+    },
+    "kinds": {
+      "type": "choice",
+      "label": "Kinds",
+      "description": "Which kinds of organism are born",
+      "choices": [
+        "drifter,swimmer,mote",
+        "drifter",
+        "swimmer",
+        "mote"
+      ],
+      "default": "drifter,swimmer,mote"
+    },
+    "fps": {
+      "type": "choice",
+      "label": "Frames a second",
+      "description": "The most it draws; the wall's own rate caps it",
+      "choices": [
+        "12",
+        "20",
+        "25",
+        "30",
+        "35",
+        "60"
+      ],
+      "default": "12"
+    }
+  }
+}

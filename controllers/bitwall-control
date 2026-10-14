@@ -1,0 +1,3470 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["aiohttp"]
+# ///
+"""Every wall on every device, on one page, with its controls and its numbers.
+
+    controllers/bitwall-control             # this machine and its tailnet
+    controllers/bitwall-control --port 8911 --host 127.0.0.1
+
+A controller in the PROTOCOL.md sense: it talks to receivers, never to
+senders. Each device is asked which walls it has, one listing of
+`<run>/bitwall/*/door.in` (on Windows, of its pipes: WINDOWS.md, *The
+control page on Windows*), and on each wall the page holds one controller
+session, `control-<device>-<wall>`, for as long as the page server runs.
+The session asks to `follow in`, so the page sees everything the wall
+says to anyone and every command it hears, tagged with whose session it
+was; `measures <ms>` at the rate chosen gives it the wall's numbers, and
+`measures 0` stops them, so a wall nobody is watching the numbers of does
+not make them; pictures and mirror frames come on the same session.
+Commands go down it with an id, and their answers come back on it. A
+session that ends, because the receiver was restarted or the device went
+away, is opened again.
+
+Everything the wall says is the untrusted side: wall names, session
+names, `sessions` answers and meta are escaped before the page shows
+them.
+
+The page is one table of devices, each with its walls in the order they
+stand, and nothing on it is sent anywhere but the machine this runs on.
+It listens on 127.0.0.1 and on this machine's Tailscale address, and
+nowhere else unless told otherwise, because anyone who can reach it can
+change every wall: the iPad reaches it over the tailnet, and the house
+network does not. Without Tailscale it is this machine alone.
+"""
+import argparse
+import asyncio
+import collections
+import concurrent.futures
+import contextlib
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+from aiohttp import WSMsgType, web
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(_HERE))                      # repo root
+
+from bitwall import LOCAL, RUN_HERE, WALL_TOKEN, Controller, Link, protocol  # noqa: E402
+from bitwall import receivers as _receivers                     # noqa: E402
+from bitwall.receivers import pi as _pi                         # noqa: E402
+from bitwall import local as _local, portable, relay           # noqa: E402
+from bitwall.session import PIPES, Blob, NoWall, Refused        # noqa: E402
+
+#: Whether this page server runs on Windows, where this machine's walls
+#: are named pipes opened in this process (WINDOWS.md); a Windows host's
+#: walls anywhere are reached through the relay.
+WINDOWS = portable.WINDOWS
+#: Where Git for Windows keeps an `ssh` that exits when its stdout is a
+#: pipe, which Windows' own does not (AGENTS.md, Traps).
+GIT_SSH = r"C:\Program Files\Git\usr\bin"
+
+#: The devices, and the order their walls stand in from left to right as
+#: you face them. A wall a device has that is not listed goes at the end.
+#: Filled in by `main` from the devices file, or this machine alone.
+DEVICES = []
+#: Where the devices are kept: a JSON list of {name, host, order}
+#: (controllers/devices.example.json).
+DEVICES_FILE = "~/.bitwall/devices.json"
+
+WEB = os.path.join(os.path.dirname(_HERE), "bitwall", "receivers", "web")
+
+HISTORY = 400        # lines of a wall's traffic kept for the page
+RETRY = 3.0          # seconds before a session that ended is opened again
+FIND = 30.0          # seconds between asking a device which walls it has
+RUNNING = 5.0        # seconds between asking a sender host what it runs
+
+#: The machines senders run on, whose records say what was started where:
+#: the devices' hosts.
+SENDER_HOSTS = []
+INSTANCE = os.path.join(_HERE, "instance.py")
+WALKER = os.path.join(_HERE, "catalogue.py")
+CATALOGUE = "~/.bitwall/senders"
+SENDERS = os.path.join(_HERE, "bitwall-senders")
+#: This page server's code, as a page last loaded from it: a page that
+#: reconnects to different code reloads rather than run old code against it.
+with open(os.path.abspath(__file__), "rb") as _fh:
+    VERSION = __import__("hashlib").sha1(_fh.read()).hexdigest()[:12]
+LOG_LINES = 300      # how much of a sender's log the page is shown
+FREED = 90.0         # how long a restart waits for the wall to let the old one go
+ANSWER = 2.0         # how long a command's answer is waited for
+PUSH = 0.25          # the most often a wall's state goes to the page
+GLASS_WIDTH = 960    # the most pixels across a picture of the glass is asked for
+
+#: Which walls a host has: one listing of `<run>/bitwall/*/door.in` by
+#: the host's own shell, which knows where it keeps its walls.
+FIND_WALLS = r"""
+run={run}
+for d in "$run"/bitwall/*/door.in; do [ -p "$d" ] && echo "wall $d"; done
+[ -p "$run/bitwall-web.in" ] && echo "web $run"
+true
+"""
+
+#: A command to a web receiver on its own pair of fifos in the run
+#: directory, run on the web receiver's host: the command goes in with an
+#: id, and the lines that come back carrying it are its answer, the last
+#: of them anything but a `wall` line. Exit 0 when the answer is not an
+#: error.
+WEB_COMMAND = r"""
+import os, secrets, select, sys, time
+run, words = sys.argv[1], sys.argv[2]
+cid = "ctl" + secrets.token_hex(6)
+out = os.open(os.path.join(run, "bitwall-web.out"), os.O_RDONLY | os.O_NONBLOCK)
+fd = os.open(os.path.join(run, "bitwall-web.in"), os.O_WRONLY | os.O_NONBLOCK)
+os.write(fd, (words + " id=" + cid + "\n").encode())
+os.close(fd)
+end, buf, got, mark = time.time() + 5, b"", [], " id=" + cid
+while time.time() < end:
+    if not select.select([out], [], [], max(0, end - time.time()))[0]:
+        break
+    try:
+        data = os.read(out, 65536)
+    except BlockingIOError:
+        continue
+    if not data:
+        time.sleep(0.02)
+        continue
+    *lines, buf = (buf + data).split(b"\n")
+    for line in lines:
+        text = line.decode(errors="replace")
+        if text.endswith(mark):
+            got.append(text[:-len(mark)])
+            if not text.startswith("wall "):
+                print("\n".join(got))
+                sys.exit(1 if text.startswith("error ") else 0)
+print("\n".join(got + ["error no answer from the web receiver"]))
+sys.exit(1)
+"""
+
+
+#: The verbs of a meta statement: a report's line that starts with none of
+#: them is a layer's, its session's name first.
+META_VERBS = ("set", "hide", "show", "age", "clear")
+
+
+def with_id(command, cid):
+    """The command, carrying an id where it will be read as one: in front
+    of the verb for `meta`, whose value is the rest of the line."""
+    verb, space, rest = command.partition(" ")
+    if verb == "meta":
+        return f"meta id={cid}{space}{rest}"
+    return f"{command} id={cid}"
+
+
+def ssh(host, script):
+    """How to run a script on a device: here for this machine, as a sender
+    does, else over ssh on one shared connection."""
+    if host in LOCAL:
+        return ["sh", "-c", script]
+    if not portable.SSH_SHARES:
+        return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                f"{_pi.USER}@{host}", script]
+    cm = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"bitwall-cm-{host}")
+    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+            "-o", f"ControlPath={cm}", "-o", "ControlMaster=auto",
+            "-o", "ControlPersist=60", f"{_pi.USER}@{host}", script]
+
+
+def python_here():
+    """The Python a script carried to this machine runs on: `python3`, as
+    on every other host, and on Windows this one, which has what it
+    imports wherever it was started from."""
+    return sys.executable if WINDOWS else "python3"
+
+
+def token(text):
+    return re.sub(r"[^A-Za-z0-9_-]", "-", text)[:32]
+
+
+def options_argv(options):
+    """A record's options as `bitwall-senders start` takes them again."""
+    argv = []
+    for name, value in (options or {}).items():
+        argv += [f"--{name}"] if value is True else [] if value in (False, "") \
+            else [f"--{name}", str(value)]
+    return argv
+
+
+def pairs(text):
+    """`k=v` words as a dict, the rest ignored."""
+    return dict(w.split("=", 1) for w in text.split() if "=" in w)
+
+
+class Wall:
+    """One wall's state as its session tells it, and the session itself."""
+
+    def __init__(self, server, device, number, run):
+        self.server = server
+        self.device = device
+        self.number = number
+        self.key = f"{device['name']}:{number}"
+        self.run = run
+        #: What this page's session on the wall is called; the wall may
+        #: hand it a `-r<k>` name when the last one has not yet gone.
+        self.session = token(f"control-{device['name']}-{number}")
+        self.history = collections.deque(maxlen=HISTORY)
+        self.status = "starting"
+        self.since = time.time()
+        self.lines = 0
+        self.dropped = 0
+        self.opened = 0
+        self.last_line = None
+        self.grid = None
+        self.font = None
+        self.caps = []
+        self.receiver = None         # the program keeping it, as its report says
+        self.reach = None            # how its glass is reached from elsewhere, by scheme
+        self.names = []              # the measures the wall can show
+        self.stats = {}
+        self.measures = {}           # the wall's own line: the glass and the painter
+        self.smeasures = {}          # a line for each session, by its name
+        self.measured = None
+        self.display = None          # lit, blank, away or doze, as said
+        self.power = None            # on or standby: the monitor, where it is known
+        self.watching = None         # how many are looking, as the wall counts them
+        self.presence = None         # whether anybody is there, and who says
+        self.meta = {}               # what the base says about itself
+        self.metas = {}              # what each layer above it says, by session
+        self.reporting = set()       # sessions a followed report is being said to
+        self.sessions = []           # who is on the wall, as it lists them
+        self.base = None             # the session holding the base, if one does
+        self.pic = None              # what the last picture was, and when
+        self.pictures = None         # the formats its pictures come in, as its report says
+        self.blobs = {}              # command id -> the future its picture comes to
+        self.unheard = set()         # ids of pictures asked while live, kept out of the traffic
+        self.pixels = None           # the glass, (w, h), as `screen` says
+        self.pic_data = b""
+        self.every = 1000            # ms between measure lines
+        self.live = False            # whether the session asks for them at all
+        self.mirror = 0              # ms between mirror frames, or 0 for none
+        self.looking = None          # the task re-picturing a wall with no glass, while live
+        self.gone = False
+        self.ctl = None
+        # One thread writes to the session, so commands reach the wall in
+        # the order they were given.
+        self.writer = concurrent.futures.ThreadPoolExecutor(1)
+        self.task = None             # run_session, holding the session
+        self.waiting = {}            # command id -> list of answer lines
+        self.listing = None          # a `sessions` answer as it comes in
+        self.seq = 0
+        self._dirty = True
+
+    # -------------------------------------------------------------- state
+
+    def room_for(self, iid, place, replace):
+        """Why a sender, instance `iid` going at `place`, cannot be moved
+        here, or None where it can: the wall's own `caps` and `sessions`,
+        asked as `bitwall-senders start` asks them."""
+        where = f"{self.device['name']}:{self.number}"
+        if any(x.get("instance") == iid for x in self.sessions) \
+                or (self.meta.get("instance") or {}).get("value") == iid:
+            return f"it is on {where} already"
+        if place == "controller":
+            return None
+        if place == "base":
+            if self.base and not replace:
+                return f"{where}'s base is held"
+            return None
+        said = next((c[7:] for c in self.caps if c.startswith("layers=")), "")
+        places = int(said) if said.isdigit() else 1
+        if places < 2:
+            return f"{where} takes no layers, only a base"
+        held = {x.get("z") for x in self.sessions if x.get("role") == "layer"}
+        if all(str(z) in held for z in range(1, places)):
+            return f"{where} has every layer held"
+        return None
+
+    def view(self):
+        return {
+            "key": self.key, "device": self.device["name"], "number": self.number,
+            "host": self.device["host"], "run": self.run, "session": self.session,
+            "status": self.status, "since": self.since, "lines": self.lines,
+            "dropped": self.dropped, "opened": self.opened, "last_line": self.last_line,
+            "grid": self.grid, "font": self.font, "caps": self.caps, "names": self.names,
+            "stats": self.stats, "measures": self.measures, "measured": self.measured,
+            "smeasures": self.smeasures,
+            "pixels": "%dx%d" % self.pixels if self.pixels else None,
+            "every": self.every, "live": self.live, "pic": self.pic, "mirror": self.mirror,
+            "display": self.display, "power": self.power, "presence": self.presence,
+            "watching": self.watching, "receiver": self.receiver, "reach": self.reach,
+            "meta": self.meta, "metas": self.metas, "sessions": self.sessions,
+            "base": self.base, "capture": self.capture_kind(),
+        }
+
+    def set_status(self, status):
+        if status != self.status:
+            self.status = status
+            self.since = time.time()
+            self.note("~", "", status)
+            self._dirty = True
+
+    def note(self, mark, who, text):
+        """A line into the history, and to the page as it happens. `who`
+        is the session a followed line was said to or came from, and
+        empty for this page's own."""
+        entry = {"t": time.time(), "mark": mark, "who": who, "text": text}
+        self.history.append(entry)
+        self.server.send_all({"type": "line", "key": self.key, **entry})
+
+    def heard(self, said):
+        """One thing the wall said on the session: a line, or a picture or
+        a mirror frame as a whole."""
+        self.lines += 1
+        self.last_line = time.time()
+        if isinstance(said, Blob):
+            head = said.said
+            cid = head.get("id")
+            if cid in self.waiting:
+                self.waiting[cid].append(head.raw[:-len(f" id={cid}")])
+            if cid in self.blobs:
+                if cid not in self.unheard:     # a live one would flood the traffic
+                    self.note(">", "", head.raw)
+                self.unheard.discard(cid)
+                self.blobs.pop(cid).set_result((head, said.data))
+                return
+            # `picture glass qoi 640x360 <bytes>`: only the glass is asked for.
+            size = head.args[2] if len(head.args) > 2 and "x" in head.args[2] else "0x0"
+            w, _, h = size.partition("x")
+            if tuple(head.args[:2]) != ("glass", "qoi"):
+                return
+            if head.name == "picture":
+                self.note(">", "", head.raw)
+                self.picture(w, h, said.data)
+            elif head.name == "mirror":
+                self.mirrored(w, h, said.data)
+            return
+        mark, who, line = ">", "", said
+        if said.name in (">", "<"):
+            # Followed: the direction, the session concerned, and the line
+            # as it was.
+            mark = said.name
+            who = said.args[0] if said.args else ""
+            rest = (said.raw or "").split(" ", 2)
+            line = protocol.parse(rest[2]) if len(rest) > 2 else None
+            if line is None:
+                return
+            line.raw = rest[2]
+        if mark == ">" and not who and line.name == "measure":
+            said = pairs(line.raw[8:])
+            if "session" in said:
+                self.smeasures[said["session"]] = said
+            else:
+                self.measures = said
+                self.measured = time.time()
+                # Each period's session lines follow the wall's, so one
+                # for a session no longer on the wall is let go here.
+                live = {x["name"] for x in self.sessions}
+                self.smeasures = {k: v for k, v in self.smeasures.items() if k in live}
+            self._dirty = True
+            return               # a second's numbers are state, not traffic
+        self.note(mark, who, line.raw)
+        if mark == "<" and line.name == "meta" and line.args[:2] == ("set", "instance") \
+                and len(line.args) >= 3:
+            # A layer saying the instance it was started under, which the
+            # listing had not yet: the card joins it to its record by it.
+            for x in self.sessions:
+                if x["name"] == who:
+                    x["instance"] = line.args[2]
+                    self._dirty = True
+        if mark != ">":
+            return
+        cid = line.get("id")
+        text = line.raw
+        if cid is not None and text.endswith(f" id={cid}"):
+            text = text[:-len(f" id={cid}")]
+        if not who and cid in self.waiting:
+            self.waiting[cid].append(text)
+        if not who and cid in self.blobs and text.startswith("error "):
+            self.blobs.pop(cid).set_result(None)
+        word, _, rest = text.partition(" ")
+        if who:
+            # Which sessions are being told a report, from its `hello` to
+            # its `area`: the `hello` at the door is followed by `opened`.
+            if word == "hello":
+                self.reporting.add(who)
+            elif word in ("area", "opened"):
+                self.reporting.discard(who)
+        if word == "area":
+            grid, _, font = rest.partition(" ")
+            self.grid, self.font = grid, int(font) if font.isdigit() else font
+        elif word == "stats":
+            on, _, opts = rest.partition(" ")
+            self.stats = {"on": on == "1", **pairs(opts)}
+        elif word == "caps":
+            self.caps = rest.split()
+        elif word == "receiver":
+            # Said before `reach` in every report, so a receiver that no
+            # longer says `reach` is not left with the last one's.
+            program, _, opts = rest.partition(" ")
+            self.receiver, self.reach = {"program": program, **pairs(opts)}, None
+        elif word == "reach":
+            scheme, _, opts = rest.partition(" ")
+            self.reach = dict(self.reach or {}, **{scheme: pairs(opts)})
+        elif word == "screen":
+            pw, _, ph = pairs(rest).get("pixels", "").partition("x")
+            if pw.isdigit() and ph.isdigit() and int(pw) and int(ph):
+                self.pixels = (int(pw), int(ph))
+        elif word == "measures":
+            self.names = rest.split()
+        elif word == "pictures":
+            self.pictures = rest.split()
+        elif word == "display":
+            self.display = rest
+        elif word == "power":
+            self.power = rest
+        elif word == "watching":
+            self.watching = int(rest) if rest.isdigit() else None
+        elif word == "presence":
+            here, _, opts = rest.partition(" ")
+            self.presence = {"here": here == "1", **pairs(opts)}
+        elif word == "meta" and (not who or who in self.reporting or who == self.base
+                                 or any(x["name"] == who and x["role"] == "layer"
+                                        for x in self.sessions)):
+            # Meta is per session. A report, this page's own or one said to
+            # another session, carries the base's untagged and each layer's
+            # above it tagged with its session; outside a report, a layer's
+            # answers are its own, and the base's are the wall's.
+            verb, _, more = rest.partition(" ")
+            if not who or who in self.reporting:
+                if verb in META_VERBS:
+                    self.meta_line(self.meta, verb, more)
+                else:
+                    tag, (verb, _, more) = verb, more.partition(" ")
+                    self.meta_line(self.metas.setdefault(tag, {}), verb, more)
+            elif who == self.base:
+                self.meta_line(self.meta, verb, more)
+            else:
+                self.meta_line(self.metas.setdefault(who, {}), verb, more)
+        elif word == "session" and not who:
+            self.session_line(line, cid)
+        elif word == "sessions" and not who:
+            if cid is not None and cid == self.listing_id and self.listing is not None:
+                self.set_sessions(self.listing)
+                self.listing = None
+        elif word == "dropped":
+            self.dropped += int(rest) if rest.isdigit() else 0
+            # Among what was dropped may be a session coming or going.
+            self.ask_sessions()
+        self._dirty = True
+
+    @staticmethod
+    def meta_line(meta, verb, more):
+        """One meta statement, `set name Galaga` and the like, into the
+        keys it is about."""
+        key, _, value = more.partition(" ")
+        if verb == "set":
+            meta.setdefault(key, {}).update(value=value, age=0)
+        elif verb in ("hide", "show"):
+            meta.setdefault(key, {})["hidden"] = verb == "hide"
+        elif verb == "age" and key in meta:
+            meta[key]["age"] = int(value) if value.isdigit() else 0
+        elif verb == "clear":
+            meta.pop(key, None) if key else meta.clear()
+
+    def session_line(self, line, cid):
+        """`session opened|closed|moved ...` as they happen, and `session <name>
+        ...` as a listing answers."""
+        args = list(line.args)
+        if args[:1] == ["opened"] and len(args) >= 5:
+            name, role, z, kind = args[1:5]
+            self.sessions = [x for x in self.sessions if x["name"] != name]
+            one = {"name": name, "role": role, "z": z, "type": kind}
+            if line.opts.get("instance"):
+                one["instance"] = line.opts["instance"]
+            self.sessions.append(one)
+            self.metas.pop(name, None)
+            if role == "layer" and z == "0":
+                self.base, self.meta = name, {}
+        elif args[:1] == ["closed"] and len(args) >= 2:
+            name = args[1]
+            self.sessions = [x for x in self.sessions if x["name"] != name]
+            self.metas.pop(name, None)
+            self.reporting.discard(name)
+            if name == self.base:
+                self.base, self.meta = None, {}
+        elif args[:1] == ["moved"] and len(args) >= 3:
+            name, z = args[1:3]
+            for x in self.sessions:
+                if x["name"] == name:
+                    x["z"] = z
+        elif cid is not None and cid == self.listing_id and len(args) >= 4:
+            if self.listing is None:
+                self.listing = []
+            one = {"name": args[0], "role": args[1], "z": args[2], "type": args[3]}
+            if line.opts.get("instance"):
+                one["instance"] = line.opts["instance"]
+            self.listing.append(one)
+
+    def set_sessions(self, listing):
+        self.sessions = listing
+        live = {x["name"] for x in listing}
+        self.metas = {k: v for k, v in self.metas.items() if k in live}
+        base = next((x["name"] for x in listing if x["role"] == "layer" and x["z"] == "0"), None)
+        if base != self.base:
+            self.base = base
+            if base is None:
+                self.meta = {}
+
+    listing_id = None
+
+    def ask_sessions(self):
+        """Ask who is on the wall; the answer is gathered as it comes."""
+        self.seq += 1
+        self.listing_id = token(f"p{os.getpid()}-{self.seq}")
+        self.listing = []
+        self.send(with_id("sessions", self.listing_id))
+
+    # ------------------------------------------------------------ session
+
+    async def run_session(self):
+        """Hold a controller session on the wall, and open it again
+        whenever it ends."""
+        loop = asyncio.get_running_loop()
+        while not self.gone:
+            self.set_status("connecting")
+            c = Controller(f"{self.device['host']}:{self.number}", name=self.session,
+                           user=_pi.USER, run=self.run)
+            try:
+                await asyncio.to_thread(c.open)
+            except (NoWall, Refused) as e:
+                self.set_status(f"down: {e}")
+                await asyncio.sleep(RETRY)
+                continue
+            except Exception as e:                                 # noqa: BLE001
+                self.set_status(f"down: {e!r}")
+                await asyncio.sleep(RETRY)
+                continue
+            if self.gone:
+                await asyncio.to_thread(c.close)
+                break
+            self.ctl = c
+            self.session = c.name
+            self.opened += 1
+            self.set_status("open")
+            self.pictures = None        # a report that has no line has no formats
+            for said in c.report:
+                self.heard(said)
+            self.send("follow in")
+            self.ask_sessions()
+            if self.live:
+                self.send(f"measures {self.every}")
+            if self.mirror:
+                self.start_mirror()     # a session made again has none
+            ended = asyncio.Event()
+
+            def pump():
+                # A wall slower to close than the page is to stop is still
+                # read after the loop has gone, with nobody left to tell.
+                with contextlib.suppress(RuntimeError):
+                    while (said := c.read()) is not None:
+                        loop.call_soon_threadsafe(self.heard, said)
+                    loop.call_soon_threadsafe(ended.set)
+            threading.Thread(target=pump, daemon=True,
+                             name=f"control-{self.key}").start()
+            await ended.wait()
+            self.ctl = None
+            self.measures, self.smeasures, self.measured = {}, {}, None
+            reason = (f"closed: {c.closed}" if c.state == "closed"
+                      else "the wall has gone" if c.state == "lost" else c.state)
+            await asyncio.to_thread(c.close)
+            if self.gone:
+                break
+            self.set_status(f"down: {reason}")
+            await asyncio.sleep(RETRY)
+
+    def send(self, words):
+        """One command down the session, off the loop's thread: a write
+        waits only when the wall has stopped reading."""
+        c = self.ctl
+        if c is not None and not self.gone:
+            asyncio.get_running_loop().run_in_executor(self.writer, c.send, words)
+
+    def rate(self, live, ms):
+        """Measure lines every `ms`, or none. With none, the wall does not
+        make them at all."""
+        ms = max(200, min(60000, int(ms)))
+        if (live, ms) == (self.live, self.every):
+            return
+        self.live, self.every = live, ms
+        self.note("~", "", f"measures every {ms} ms" if live else "no measures")
+        if not live:
+            self.measures, self.smeasures, self.measured = {}, {}, None
+        self._dirty = True
+        self.send(f"measures {ms}" if live else "measures 0")
+
+    def glass_size(self):
+        """The size the glass is asked for at: wide enough for the modal
+        view, the glass's own shape, and never more than the glass."""
+        pw, ph = self.pixels or (1920, 1080)
+        w = min(pw, GLASS_WIDTH)
+        return w, max(1, round(w * ph / pw))
+
+    def capture_kind(self):
+        """How this wall is pictured: `glass` where its `pictures` says it
+        makes a QOI, or where it says no `pictures` at all; `grid` where it
+        makes only its cells; None where it takes no pictures."""
+        if "picture" not in self.caps:
+            return None
+        if self.pictures is None or "qoi" in self.pictures:
+            return "glass"
+        return "grid" if "grid" in self.pictures else None
+
+    async def grid_picture(self, live=False):
+        """The wall as its cells: the base's grid, then each cells layer's
+        above it in z order, each asked as `picture <session>`, and sent to
+        the page as one picture for it to draw as cells."""
+        layered = [x for x in self.sessions if x.get("role") == "layer"]
+        held = [x for x in layered if x.get("type") == "cells"]
+        left = [x["name"] for x in layered if x.get("type") != "cells"]
+        if left and not live:
+            self.note("~", "", f"picture in cells only, without {' '.join(left)}")
+        held.sort(key=lambda x: int(x["z"]) if str(x.get("z")).isdigit() else 0)
+        layers, data = [], b""
+        for x in held:
+            self.seq += 1
+            cid = token(f"p{os.getpid()}-{self.seq}")
+            got = asyncio.get_running_loop().create_future()
+            self.blobs[cid] = got
+            if live:
+                self.unheard.add(cid)
+            self.send(with_id(f"picture {x['name']}", cid))
+            try:
+                answer = await asyncio.wait_for(got, ANSWER * 2)
+            except asyncio.TimeoutError:
+                self.blobs.pop(cid, None)
+                self.unheard.discard(cid)
+                continue
+            if answer is None:
+                continue
+            head, part = answer
+            size = head.args[2] if len(head.args) > 2 else ""
+            cols, _, rows = size.partition("x")
+            if tuple(head.args[1:2]) != ("grid",) or not (cols.isdigit() and rows.isdigit()):
+                continue
+            layers.append({"session": x["name"], "z": x["z"], "cols": int(cols),
+                           "rows": int(rows), "bytes": len(part)})
+            data += part
+        if not layers:
+            return
+        self.pic = {"key": self.key, "format": "grid", "t": time.time(), "bytes": len(data),
+                    "w": layers[0]["cols"], "h": layers[0]["rows"], "layers": layers,
+                    "without": left}
+        if live:
+            self.pic["mirror"] = "grid"
+        self.pic_data = data
+        self.server.send_picture(self)
+
+    async def look_again(self):
+        """The cells pictured every `mirror` ms, no oftener than a quarter
+        of a second, for as long as the mirror is wanted."""
+        while self.mirror and not self.gone and self.capture_kind() == "grid":
+            began = time.monotonic()
+            await self.grid_picture(live=True)
+            await asyncio.sleep(max(0.05, max(self.mirror, 250) / 1000 - (time.monotonic() - began)))
+
+    def picture(self, w, h, data):
+        """A picture of the glass came: kept, so a page that opens later has
+        it, and sent to every page open now."""
+        self.pic = {"key": self.key, "format": "qoi", "t": time.time(), "bytes": len(data),
+                    "w": int(w) if w.isdigit() else 0, "h": int(h) if h.isdigit() else 0}
+        self.pic_data = data
+        self.server.send_picture(self)
+
+    def set_mirror(self, ms):
+        """Frames every `ms`, or none with 0. The wall keeps the mirror on
+        the session, so it goes when the session does and is asked for
+        again each time the session is opened."""
+        ms = 0 if not ms else max(50, min(60000, int(ms)))
+        if ms == self.mirror:
+            return
+        self.mirror = ms
+        self.note("~", "", f"mirror every {ms} ms" if ms else "no mirror")
+        self._dirty = True
+        if ms:
+            self.start_mirror()
+        elif self.capture_kind() != "grid":
+            self.send("mirror glass off")
+
+    def start_mirror(self):
+        """Ask for the mirror, which a wall starts again with a whole frame,
+        so this is also how a page that has lost track gets one. A wall
+        with no glass is pictured in cells again at the mirror's rate
+        instead: PROTOCOL.md offers no mirror of a cells layer above the
+        base yet, and a picture has them all."""
+        if self.mirror and self.capture_kind() == "grid":
+            if self.looking is None or self.looking.done():
+                self.looking = asyncio.ensure_future(self.look_again())
+            return
+        if self.mirror and "mirror" in self.caps:
+            w, h = self.glass_size()
+            self.send(f"mirror glass every={self.mirror} size={w}x{h}")
+
+    def mirrored(self, w, h, data):
+        """A look at the glass as it changes: whole, so a page that missed
+        one loses nothing, and kept as the picture a page opening later is
+        sent."""
+        self.pic = {"key": self.key, "format": "qoi", "mirror": "qoi", "t": time.time(),
+                    "bytes": len(data), "w": int(w) if w.isdigit() else 0,
+                    "h": int(h) if h.isdigit() else 0}
+        self.pic_data = data
+        self.server.send_frame(dict(self.pic), data)
+
+    async def stop(self):
+        """Let the wall go: the session closed in good order, so the wall
+        hears `close` rather than finding its writer gone."""
+        self.gone = True
+        c = self.ctl
+        if c is not None:
+            await asyncio.get_running_loop().run_in_executor(self.writer, c.close)
+        self.writer.shutdown(wait=False)
+
+    async def command(self, words):
+        """Send one command and wait for what it causes to be said."""
+        c = self.ctl
+        if c is None:
+            return {"ok": False, "answer": [f"no session on the wall: {self.status}"]}
+        self.seq += 1
+        cid = token(f"p{os.getpid()}-{self.seq}")
+        self.waiting[cid] = []
+        if not await asyncio.get_running_loop().run_in_executor(
+                self.writer, c.send, with_id(words, cid)):
+            self.waiting.pop(cid, None)
+            return {"ok": False, "answer": ["could not reach the wall"]}
+        end = time.monotonic() + ANSWER
+        while time.monotonic() < end:
+            await asyncio.sleep(0.05)
+            got = self.waiting[cid]
+            if got and time.monotonic() > end - ANSWER + 0.3:
+                break
+        answer = self.waiting.pop(cid, [])
+        return {"ok": not any(a.startswith("error ") for a in answer), "answer": answer}
+
+
+class Server:
+    def __init__(self):
+        self.walls = {}              # key -> Wall
+        self.sockets = set()
+        self.found = {d["name"]: "not yet asked" for d in DEVICES}
+        self.running = {}            # instance id -> its record, and its host
+        self.poke = asyncio.Event()  # ask the sender hosts again, now
+        self.catalogue = {}          # sender host -> what it can run, as its catalogue says
+        self.reach = {}              # sender host -> the device hosts it can ssh to
+        self.web = {}                # device name -> its web receiver's run and walls
+        self.web_lock = asyncio.Lock()   # this Windows machine's web receiver, one caller at a time
+        self.pipes = {}              # device name -> its run directory, where it is Windows'
+
+    def send_all(self, msg):
+        text = json.dumps(msg)
+        for ws in list(self.sockets):
+            if not ws.closed:
+                asyncio.ensure_future(ws.send_str(text))
+
+    @staticmethod
+    def framed(w):
+        """A picture as one binary message: the length of a JSON header in
+        two bytes, the header, and the picture itself. One message, so
+        nothing sent to the same page can land between the two."""
+        head = json.dumps(w.pic).encode()
+        return len(head).to_bytes(2, "big") + head + w.pic_data
+
+    def send_frame(self, head, frame):
+        """A mirror frame, framed as a picture is."""
+        head = json.dumps(head).encode()
+        data = len(head).to_bytes(2, "big") + head + frame
+        for ws in list(self.sockets):
+            if not ws.closed:
+                asyncio.ensure_future(ws.send_bytes(data))
+
+    def send_picture(self, w):
+        data = self.framed(w)
+        for ws in list(self.sockets):
+            if not ws.closed:
+                asyncio.ensure_future(ws.send_bytes(data))
+
+    def devices(self):
+        out = []
+        for d in DEVICES:
+            walls = [w for w in self.walls.values() if w.device is d]
+            order = d.get("order", [])
+            # The walls in the order given, then the rest: screens by
+            # number, then names.
+            walls.sort(key=lambda w: (0, order.index(w.number), 0, "") if w.number in order
+                       else (1, not w.number.isdigit(),
+                             int(w.number) if w.number.isdigit() else 0, w.number))
+            web = self.web.get(d["name"])
+            out.append({"name": d["name"], "host": d["host"], "found": self.found[d["name"]],
+                        "walls": [w.key for w in walls], "web": web is not None,
+                        "webwalls": [f"{d['name']}:{n}" for n in web["walls"]] if web else []})
+        return out
+
+    async def records(self, host):
+        """What a sender host has running, as its records say, by asking
+        `instance.py` there as `bitwall-senders status` does."""
+        with open(INSTANCE) as fh:
+            code = fh.read()
+        argv = ([python_here(), "-", "status", "{}"] if host in LOCAL else
+                ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                 f"{_pi.USER}@{host}", f"{self.far_python(host)} - status '{{}}'"])
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv, stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            out, _ = await asyncio.wait_for(proc.communicate(code.encode()), 15)
+            return json.loads(out)["running"]
+        except (OSError, asyncio.TimeoutError, ValueError, KeyError):
+            return None
+
+    async def watching_senders(self):
+        """Every sender host's records, to the page whenever they change.
+        A host that cannot be asked keeps what it last said."""
+        import datetime
+        while True:
+            running = dict(self.running)
+            for host in SENDER_HOSTS:
+                recs = await self.records(host)
+                if recs is None:
+                    continue
+                for iid in [i for i, r in running.items() if r["host"] == host]:
+                    del running[iid]
+                for r in recs:
+                    try:
+                        since = datetime.datetime.strptime(
+                            r.get("started", ""), "%Y-%m-%dT%H:%M:%S%z").timestamp()
+                    except ValueError:
+                        since = None
+                    running[r["id"]] = {"host": host, "sender": r.get("sender"),
+                                        "wall": r.get("wall"), "place": r.get("place", "base"),
+                                        "options": r.get("options", {}),
+                                        "pid": r.get("pid"), "up": r.get("up"),
+                                        "since": since, "log": r.get("log")}
+            if running != self.running:
+                self.running = running
+                self.send_all({"type": "running", "running": running})
+            self.poke.clear()
+            try:
+                await asyncio.wait_for(self.poke.wait(), RUNNING)
+            except asyncio.TimeoutError:
+                pass
+
+    def far_python(self, host):
+        """The Python to run a script with on a device over ssh: uv's on a
+        Windows host, whose `python3` an ssh login may not run (relay.py,
+        WINDOWS_PYTHON), else `python3`."""
+        windows = any(d["host"] == host and d["name"] in self.pipes for d in DEVICES)
+        return relay.WINDOWS_PYTHON if windows else "python3"
+
+    async def catalogue_of(self, host):
+        """What a sender host can run, by walking its catalogue there as
+        `bitwall-senders list` does."""
+        with open(WALKER) as fh:
+            code = fh.read()
+        argv = ([python_here(), "-", os.path.expanduser(CATALOGUE)] if host in LOCAL else
+                ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                 f"{_pi.USER}@{host}", f'{self.far_python(host)} - "$HOME/{CATALOGUE[2:]}"'])
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv, stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            out, _ = await asyncio.wait_for(proc.communicate(code.encode()), 20)
+            said = json.loads(out)
+            return {"senders": said["senders"], "problems": said["problems"],
+                    "unavailable": said.get("unavailable", [])}
+        except (OSError, asyncio.TimeoutError, ValueError, KeyError):
+            return None
+
+    async def reachable(self, host):
+        """Which other devices a sender host can reach without a password,
+        so a sender on it may be started on their walls: asked of the host
+        itself, since the keys are its own."""
+        others = [d["host"] for d in DEVICES if d["host"] not in LOCAL and d["host"] != host]
+        if host in LOCAL or not others:
+            return None
+        if any(d["host"] == host and d["name"] in self.pipes for d in DEVICES):
+            # A Windows host's shell is PowerShell, and its ssh to ask
+            # with is Git's (AGENTS.md, Traps).
+            script = ("foreach ($h in " + ",".join("'" + o.replace("'", "''") + "'"
+                                                   for o in others)
+                      + ") { & '" + GIT_SSH + "\\ssh.exe' -o BatchMode=yes "
+                      "-o ConnectTimeout=3 $h true *> $null; "
+                      "if ($LASTEXITCODE -eq 0) { $h } }")
+        else:
+            script = " ".join(f"ssh -o BatchMode=yes -o ConnectTimeout=3 {shlex.quote(o)} true "
+                              f"</dev/null >/dev/null 2>&1 && echo {shlex.quote(o)};"
+                              for o in others)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *ssh(host, script), stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            out, _ = await asyncio.wait_for(proc.communicate(), 20)
+            return out.decode().split()
+        except (OSError, asyncio.TimeoutError):
+            return None
+
+    async def watching_catalogues(self):
+        """Every sender host's catalogue, to the page when it changes. A
+        host that cannot be asked keeps what it last said."""
+        while True:
+            cats = dict(self.catalogue)
+            for host in SENDER_HOSTS:
+                got = await self.catalogue_of(host)
+                if got is not None:
+                    cats[host] = got
+            reach = dict(self.reach)
+            for host in SENDER_HOSTS:
+                got = await self.reachable(host)
+                if got is not None:
+                    reach[host] = got
+            if cats != self.catalogue or reach != self.reach:
+                self.catalogue, self.reach = cats, reach
+                self.send_all({"type": "catalogue", "catalogue": cats, "reach": reach})
+            await asyncio.sleep(FIND)
+
+    async def senders(self, *args):
+        """`bitwall-senders` with these arguments: its exit status, and
+        what it said, both logged with how long it took."""
+        began = time.monotonic()
+        # Windows runs no script by its first line, so there this Python
+        # runs it.
+        proc = await asyncio.create_subprocess_exec(
+            *([sys.executable, SENDERS] if WINDOWS else [SENDERS]), *args,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        out, _ = await proc.communicate()
+        text = out.decode(errors="replace").strip()
+        print(f"{time.strftime('%H:%M:%S')} bitwall-senders {shlex.join(args)} -> "
+              f"{proc.returncode} in {time.monotonic() - began:.1f}s: {text}", flush=True)
+        return proc.returncode, text
+
+    async def sender_op(self, action, iid):
+        """Stop, restart or read the log of a running sender, by its
+        instance id, telling every page how it goes."""
+        rec = self.running.get(iid)
+        if rec is None:
+            return
+        say = lambda state, text="": self.send_all(
+            {"type": "sender-op", "id": iid, "action": action, "state": state, "text": text})
+        if action == "log":
+            say("done", await self.read_log(rec))
+            return
+        say("busy")
+        code, text = await self.senders("stop", iid, "--on", rec["host"])
+        if code != 0 or action == "stop":
+            self.poke.set()
+            return say("done" if code == 0 else "failed", text)
+        code, text = await self.start_when_free(rec["host"], rec["sender"], rec["wall"],
+                                                options_argv(rec.get("options")))
+        say("done" if code == 0 else "failed", text)
+
+    async def move(self, iid, key, replace):
+        """A running sender moved to another wall: stopped where it is and
+        started on the new one with the options it has, at the place its
+        entry gives, and with `--replace` when told to take a held base.
+        The new wall is asked first whether it has the place, so a move
+        that cannot land leaves the sender where it was. Every page is told
+        how it goes, by the sender's instance and by the wall's key."""
+        rec, w = self.running.get(iid), self.walls.get(key)
+        if rec is None or w is None:
+            return
+        print(f"{time.strftime('%H:%M:%S')} move {iid} ({rec['sender']}) to {key}"
+              f"{' replacing its base' if replace else ''}", flush=True)
+
+        def say(state, text=""):
+            if state != "busy":
+                print(f"{time.strftime('%H:%M:%S')} move {iid} to {key}: {state}"
+                      f"{': ' + text if state == 'failed' else ''}", flush=True)
+            self.send_all({"type": "sender-op", "id": iid, "action": "move", "state": state,
+                           "text": text})
+            self.send_all({"type": "wall-op", "key": key, "sender": rec["sender"],
+                           "state": state, "text": text})
+        host = rec["host"]
+        if host not in LOCAL and host != w.device["host"] \
+                and w.device["host"] not in self.reach.get(host, []):
+            return say("failed", f"{host} cannot reach {w.device['host']}")
+        why = w.room_for(iid, rec.get("place", "base"), replace)
+        if why:
+            return say("failed", why)
+        say("busy")
+        code, text = await self.senders("stop", iid, "--on", host)
+        if code != 0:
+            self.poke.set()
+            return say("failed", text)
+        argv = (["--replace"] if replace else []) + options_argv(rec.get("options"))
+        code, text = await self.start_when_free(host, rec["sender"],
+                                                f"{w.device['host']}:{w.number}", argv)
+        say("done" if code == 0 else "failed", text)
+
+    async def start_when_free(self, host, sender, wall, argv=()):
+        """Start a sender on a wall, waiting while the wall still calls a
+        sender just stopped there its own: it takes a few seconds to call
+        one gone, and refuses a start until it has."""
+        until = time.monotonic() + FREED
+        while True:
+            code, text = await self.senders("start", sender, wall, *argv, "--on", host)
+            if code == 0 or "base has" not in text or time.monotonic() > until:
+                break
+            await asyncio.sleep(3)
+        self.poke.set()
+        return code, text
+
+    async def drop(self, key, host, sender, replace, options=None):
+        """A catalogue sender started on a wall, dropped there or asked
+        for on its card: started at the place its entry gives, with the
+        options chosen, and with `--replace` when told to take a held base.
+        Every page is told how it goes, by the wall's key."""
+        w = self.walls.get(key)
+        print(f"{time.strftime('%H:%M:%S')} drop {sender} from {host} on {key}"
+              f"{' replacing its base' if replace else ''} options={options}", flush=True)
+
+        def say(state, text=""):
+            if state != "busy":
+                print(f"{time.strftime('%H:%M:%S')} drop on {key}: {state}"
+                      f"{': ' + text if state == 'failed' else ''}", flush=True)
+            self.send_all({"type": "wall-op", "key": key, "sender": sender, "state": state, "text": text})
+        if w is None or host not in SENDER_HOSTS:
+            return say("failed", "no such wall or sender host")
+        if host not in LOCAL and host != w.device["host"] \
+                and w.device["host"] not in self.reach.get(host, []):
+            return say("failed", f"{host} cannot reach {w.device['host']}")
+        say("busy")
+        # Checked again by `bitwall-senders` against the catalogue; here only
+        # that each is a word it can be given.
+        argv = ["--replace"] if replace else []
+        for name, value in (options or {}).items():
+            if not (isinstance(name, str) and re.match(r"^[a-z][a-z0-9-]{0,31}$", name)):
+                continue
+            if value is True:
+                argv.append(f"--{name}")
+            elif isinstance(value, (int, str)) and not isinstance(value, bool) \
+                    and re.match(r"^[A-Za-z0-9_.,:-]{1,1024}$", str(value)):
+                argv += [f"--{name}", str(value)]
+        code, text = await self.start_when_free(host, sender, f"{w.device['host']}:{w.number}", argv)
+        say("done" if code == 0 else "failed", text)
+
+    async def web_command(self, device, run, words):
+        """A command to a device's web receiver, and its answer. Where the
+        device keeps its walls as Windows' pipes it goes through the relay,
+        or in this process for this machine's, one at a time, since the
+        receiver's `out` takes one reader at a time."""
+        if run.startswith(PIPES):
+            if device["host"] in LOCAL and WINDOWS:
+                async with self.web_lock:
+                    code, answer = await asyncio.to_thread(relay.web, _local, run, words)
+                return code, "\n".join(answer)
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *Link(device["host"]).relay_argv("web", run, words),
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+                out, _ = await asyncio.wait_for(proc.communicate(), 20)
+            except (OSError, asyncio.TimeoutError) as e:
+                return 1, f"error could not ask the web receiver: {e or 'timed out'}"
+            return proc.returncode, out.decode(errors="replace").strip()
+        argv = (["python3", "-", run, words] if device["host"] in LOCAL
+                else ssh(device["host"], f"python3 - {shlex.quote(run)} {shlex.quote(words)}"))
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv, stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            out, _ = await asyncio.wait_for(proc.communicate(WEB_COMMAND.encode()), 15)
+        except (OSError, asyncio.TimeoutError) as e:
+            return 1, f"error could not ask the web receiver: {e or 'timed out'}"
+        return proc.returncode, out.decode(errors="replace").strip()
+
+    async def web_op(self, action, name, wall, presence=None):
+        """A web wall made or removed on a device's web receiver. A wall
+        removed has whatever a controller started on it stopped first, so
+        nothing is left waiting for a wall that will not come back. Every
+        page is told how it goes, by the device and the wall's name."""
+        device = next((d for d in DEVICES if d["name"] == name), None)
+        web = self.web.get(name)
+        print(f"{time.strftime('%H:%M:%S')} web {action} {wall} on {name}"
+              f"{' presence=' + presence if presence else ''}", flush=True)
+
+        def say(state, text=""):
+            if state != "busy":
+                print(f"{time.strftime('%H:%M:%S')} web {action} {wall} on {name}: {state}"
+                      f"{': ' + text if state == 'failed' else ''}", flush=True)
+            self.send_all({"type": "web-op", "device": name, "action": action, "wall": wall,
+                           "state": state, "text": text})
+        if device is None or web is None:
+            return say("failed", f"{name} has no web receiver")
+        if not WALL_TOKEN.match(wall) or wall.isdigit():
+            return say("failed", f"{wall!r} is not a wall's name: a-z, 0-9, _ and -, "
+                                 f"not all digits, at most 32")
+        if presence is not None and not re.match(r"^[A-Za-z0-9_-]{1,32}$", presence):
+            return say("failed", f"{presence!r} is not a presence's name")
+        say("busy")
+        if action == "remove":
+            w = self.walls.get(f"{name}:{wall}")
+            held = set() if w is None else {x.get("instance") for x in w.sessions} \
+                | {(w.meta.get("instance") or {}).get("value")}
+            held.discard(None)
+            if held - set(self.running):
+                # Started since the records were last asked for.
+                for host in SENDER_HOSTS:
+                    for r in await self.records(host) or []:
+                        if r["id"] in held:
+                            self.running.setdefault(r["id"], {"host": host})
+            for iid in [i for i in held if i in self.running]:
+                code, text = await self.senders("stop", iid, "--on", self.running[iid]["host"])
+                if code != 0:
+                    self.poke.set()
+                    return say("failed", text)
+            self.poke.set()
+        words = f"make {wall}" + (f" presence={presence}" if presence else "") \
+            if action == "make" else f"remove {wall}"
+        code, text = await self.web_command(device, web["run"], words)
+        await self.find(device)
+        self.send_all({"type": "devices", "devices": self.devices()})
+        say("done" if code == 0 else "failed", text.removeprefix("error ").strip())
+
+    async def read_log(self, rec):
+        path = rec.get("log")
+        if not path:
+            return "(no log)"
+        if rec["host"] in LOCAL:
+            try:
+                with open(path, errors="replace") as fh:
+                    return "".join(collections.deque(fh, LOG_LINES)) or "(empty)"
+            except OSError as e:
+                return f"(cannot read {path}: {e.strerror})"
+        proc = await asyncio.create_subprocess_exec(
+            *ssh(rec["host"], f"tail -n {LOG_LINES} {shlex.quote(path)}"),
+            stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT)
+        out, _ = await proc.communicate()
+        return out.decode(errors="replace") or "(empty)"
+
+    @staticmethod
+    def versions():
+        """Each receiver program's version as this machine's copy of it
+        works out, which a wall running anything else is behind or ahead
+        of. Worked out when asked, so a change to a receiver's source is
+        seen without restarting the page server."""
+        out = {}
+        for program in _receivers.SOURCES:
+            with contextlib.suppress(OSError):
+                out[program] = _receivers.version(program)
+        return out
+
+    def snapshot(self):
+        return {"type": "state", "version": VERSION, "devices": self.devices(),
+                "versions": self.versions(), "running": self.running,
+                "catalogue": self.catalogue, "reach": self.reach,
+                "walls": {k: w.view() for k, w in self.walls.items()},
+                "history": {k: list(w.history) for k, w in self.walls.items()}}
+
+    async def listing(self, device):
+        """What a device has, as FIND_WALLS says it, a line each, or why it
+        could not be asked: by the host's own shell, or where its walls are
+        Windows' pipes by the relay's `find`, in this process for this
+        machine's. A host whose shell answers the listing with nothing but
+        complaint is asked where it keeps its walls through the relay, once:
+        PowerShell cannot run the listing, and a Windows host says so."""
+        name, host = device["name"], device["host"]
+        if host in LOCAL and WINDOWS:
+            run = (os.environ.get("BITWALL_RUN") or os.environ.get("BITWALL_LOCAL_RUN")
+                   or _local.run_dir())
+            return await asyncio.to_thread(relay.find, _local, run)
+        if name in self.pipes:
+            return await self.relay_find(device)
+        run = (shlex.quote(os.environ["BITWALL_RUN"]) if os.environ.get("BITWALL_RUN")
+               else f'"{RUN_HERE}"')
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *Link(host).argv(FIND_WALLS.format(run=run)),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            out, err = await asyncio.wait_for(proc.communicate(), 15)
+        except (OSError, asyncio.TimeoutError) as e:
+            return f"unreachable: {e or 'timed out'}"
+        lines = out.decode(errors="replace").splitlines()
+        if not lines and err.strip() and host not in LOCAL and proc.returncode not in (0, 255) \
+                and await self.pipes_run(device):
+            return await self.relay_find(device)
+        if proc.returncode not in (0, 1):
+            return "unreachable: " + (err.decode().strip() or "ssh failed")
+        return lines
+
+    async def run_relay(self, host, verb, *args):
+        """The relay run on a host through ssh: its exit code and what it
+        printed, or None where it could not be run."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *Link(host).relay_argv(verb, *args), stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            out, err = await asyncio.wait_for(proc.communicate(), 20)
+        except (OSError, asyncio.TimeoutError):
+            return None
+        return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
+
+    async def pipes_run(self, device):
+        """A device's run directory where it keeps its walls as Windows'
+        pipes, kept for the device, else None: BITWALL_RUN where that names
+        one, or the host's own answer to `relay run`."""
+        run = os.environ.get("BITWALL_RUN") or ""
+        if not run.startswith(PIPES):
+            got = await self.run_relay(device["host"], "run")
+            run = got[1].strip() if got and got[0] == 0 else ""
+        if run.startswith(PIPES):
+            self.pipes[device["name"]] = run
+            print(f"{time.strftime('%H:%M:%S')} {device['name']} keeps its walls "
+                  f"as Windows' pipes, {run}: asked through the relay", flush=True)
+            return run
+        return None
+
+    async def relay_find(self, device):
+        got = await self.run_relay(device["host"], "find", self.pipes[device["name"]])
+        if got is None:
+            return "unreachable: the relay did not answer"
+        code, out, err = got
+        if code != 0:
+            return "unreachable: " + (err.strip()[-200:] or f"the relay exited {code}")
+        return out.splitlines()
+
+    async def find(self, device):
+        """Which walls a device has: a session on each one new, and none
+        on one that has gone."""
+        said = await self.listing(device)
+        if isinstance(said, str):
+            self.found[device["name"]] = said
+            return
+        found, web = {}, None
+        for line in said:
+            kind, _, path = line.partition(" ")
+            if kind == "web" and path:
+                web = path
+            if kind != "wall" or not path.endswith("/door.in"):
+                continue
+            wall_dir = path[:-len("/door.in")]
+            wall = wall_dir.rsplit("/", 1)[-1]
+            if WALL_TOKEN.match(wall):
+                found[wall] = wall_dir
+        self.found[device["name"]] = (f"{len(found)} wall{'s' if len(found) != 1 else ''}"
+                                      if found else "nothing running")
+        # Which of them a web receiver keeps, as it lists them: the run
+        # directory is shared with any other receiver on the device.
+        if web is None:
+            self.web.pop(device["name"], None)
+        else:
+            code, text = await self.web_command(device, web, "list")
+            self.web[device["name"]] = {"run": web, "walls": sorted(
+                line.split(" ", 1)[1] for line in text.splitlines()
+                if line.startswith("wall ")) if code == 0 else []}
+        for n, run_dir in found.items():
+            key = f"{device['name']}:{n}"
+            if key not in self.walls:
+                w = self.walls[key] = Wall(self, device, n, run_dir)
+                w.task = asyncio.ensure_future(w.run_session())
+        # A wall the device no longer has is let go: its session closed
+        # and its card gone, rather than left saying what it last said.
+        # Only when the device answered: one that cannot be reached still
+        # has its walls, as far as anyone knows.
+        for key, w in list(self.walls.items()):
+            if w.device is device and w.number not in found:
+                asyncio.ensure_future(w.stop())
+                del self.walls[key]
+
+    async def finding(self):
+        while True:
+            await asyncio.gather(*(self.find(d) for d in DEVICES))
+            self.send_all({"type": "devices", "devices": self.devices(),
+                           "versions": self.versions()})
+            await asyncio.sleep(FIND)
+
+    async def pushing(self):
+        """Wall state to the page, no more often than PUSH."""
+        while True:
+            await asyncio.sleep(PUSH)
+            for w in self.walls.values():
+                if w._dirty:
+                    w._dirty = False
+                    self.send_all({"type": "wall", "wall": w.view()})
+
+    # -------------------------------------------------------------- http
+
+    async def page(self, request):
+        return web.Response(text=PAGE, content_type="text/html")
+
+    async def screen_js(self, request):
+        return web.FileResponse(os.path.join(WEB, "bitwall-screen.js"),
+                                headers={"Content-Type": "text/javascript"})
+
+    async def font(self, request):
+        return web.FileResponse(os.path.join(WEB, "wall.woff2"),
+                                headers={"Content-Type": "font/woff2"})
+
+    async def answer(self, ws, w, words, ref):
+        try:
+            result = await w.command(words)
+        except Exception as e:
+            print(f"bitwall-control: {w.key} {words}: {e!r}", file=sys.stderr, flush=True)
+            result = {"ok": False, "answer": [f"failed: {e}"]}
+        if not ws.closed:
+            await ws.send_str(json.dumps({"type": "answer", "key": w.key, "words": words,
+                                          "ref": ref, **result}))
+
+    async def ws(self, request):
+        # A page on another site may open a socket here too, and a
+        # browser lets it: the socket is refused unless the page that
+        # asks was served from this same host and port. A browser always
+        # says its page's Origin; a program that says none is let in, as
+        # it could reach every wall's door anyway.
+        if not same_origin(request.headers.get("Origin"), request.host):
+            print(f"bitwall-control: refused a socket from {request.headers.get('Origin')!r} "
+                  f"for {request.host!r}", file=sys.stderr, flush=True)
+            raise web.HTTPForbidden(text="not this page's origin\n")
+        ws = web.WebSocketResponse(heartbeat=20)
+        await ws.prepare(request)
+        self.sockets.add(ws)
+        await ws.send_str(json.dumps(self.snapshot()))
+        for w in list(self.walls.values()):
+            if w.pic:
+                await ws.send_bytes(self.framed(w))
+            # A page that has just come has nothing to paint diffs onto.
+            w.start_mirror()
+        try:
+            async for msg in ws:
+                if msg.type != WSMsgType.TEXT:
+                    continue
+                try:
+                    m = json.loads(msg.data)
+                except ValueError:
+                    continue
+                w = self.walls.get(m.get("key"))
+                kind, ref = m.get("type"), m.get("ref")
+
+                def ack(ok, why=""):
+                    """Every request a page waits on is answered, taken or not,
+                    so none can vanish with the page still waiting."""
+                    if kind in ("drop", "sender", "move", "web"):
+                        print(f"{time.strftime('%H:%M:%S')} request {kind} "
+                              f"{m.get('action') or m.get('sender')} "
+                              f"{m.get('key') or m.get('id')}: {'taken' if ok else why}", flush=True)
+                    asyncio.ensure_future(ws.send_str(json.dumps(
+                        {"type": "ack", "ref": ref, "ok": ok, "why": why})))
+
+                if kind == "ping":
+                    asyncio.ensure_future(ws.send_str(json.dumps({"type": "pong"})))
+                elif kind == "drop" and not w:
+                    ack(False, f"no wall {m.get('key')} yet: the page server is still finding "
+                               f"walls, try again in a few seconds")
+                elif kind == "sender" and m.get("id") not in self.running:
+                    ack(False, f"no record of {m.get('id')} yet: the page server is still "
+                               f"asking the sender hosts, try again in a few seconds")
+                elif m.get("type") == "picture" and w and w.capture_kind() == "glass":
+                    gw, gh = w.glass_size()
+                    asyncio.ensure_future(self.answer(ws, w, f"picture glass size={gw}x{gh}",
+                                                      m.get("ref")))
+                elif m.get("type") == "picture" and w and w.capture_kind() == "grid":
+                    asyncio.ensure_future(w.grid_picture())
+                elif m.get("type") == "mirror" and w and isinstance(m.get("ms"), int):
+                    w.set_mirror(m["ms"])
+                elif m.get("type") == "whole" and w:
+                    w.start_mirror()
+                elif m.get("type") == "rate" and w and isinstance(m.get("ms"), int):
+                    w.rate(bool(m.get("live", True)), m["ms"])
+                elif (m.get("type") == "drop" and w and isinstance(m.get("sender"), str)
+                      and isinstance(m.get("host"), str)):
+                    replace = m.get("replace") is True
+                    opts = m.get("options") if isinstance(m.get("options"), dict) else None
+                    ack(True)
+                    asyncio.ensure_future(self.drop(w.key, m["host"], m["sender"], replace, opts))
+                elif (kind == "web" and m.get("action") in ("make", "remove")
+                      and isinstance(m.get("device"), str) and isinstance(m.get("wall"), str)):
+                    presence = m.get("presence") if isinstance(m.get("presence"), str) \
+                        and m.get("presence") else None
+                    ack(True)
+                    asyncio.ensure_future(self.web_op(m["action"], m["device"], m["wall"], presence))
+                elif kind == "move" and not w:
+                    ack(False, f"no wall {m.get('key')} yet: the page server is still finding "
+                               f"walls, try again in a few seconds")
+                elif kind == "move" and m.get("id") not in self.running:
+                    ack(False, f"no record of {m.get('id')}: it may have stopped")
+                elif kind == "move" and w:
+                    ack(True)
+                    asyncio.ensure_future(self.move(m["id"], w.key, m.get("replace") is True))
+                elif (m.get("type") == "sender" and m.get("action") in ("stop", "restart", "log")
+                      and isinstance(m.get("id"), str)):
+                    ack(True)
+                    asyncio.ensure_future(self.sender_op(m["action"], m["id"]))
+                elif m.get("type") == "command" and w and isinstance(m.get("words"), str):
+                    words = " ".join(m["words"].split())[:500]
+                    if words:
+                        # Each on its own, so a slow answer never holds up the next.
+                        asyncio.ensure_future(self.answer(ws, w, words, m.get("ref")))
+        finally:
+            self.sockets.discard(ws)
+        return ws
+
+
+PAGE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bitwall control</title>
+<style>
+@font-face { font-family: "bitwall wall"; src: url("/font.woff2") format("woff2"); font-display: block; }
+:root {
+  --bg: #f4f3ef; --panel: #ffffff; --ink: #1d1d1b; --dim: #6d6b64; --line: #dcd9d0;
+  --glass: #101114; --glass-ink: #d9d7cf; --ok: #2f7d4f; --warn: #b3741a; --bad: #b3372e;
+  --accent: #2b5fb4; --chip: #efede6;
+  --hat: #1c2d4d; --hat-ink: #dde6f6; --hat-dead: #4d1f22;
+  --layer: #7b4fc4; --basec: #2b7fa0;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #15161a; --panel: #1d1f24; --ink: #e8e6df; --dim: #9a978e; --line: #30333a;
+    --glass: #07080a; --glass-ink: #d9d7cf; --ok: #5cc38a; --warn: #e0a24a; --bad: #e0675e;
+    --accent: #7aa5ec; --chip: #262930;
+    --hat: #1b2a45; --hat-ink: #dde6f6; --hat-dead: #4a1e21;
+    --layer: #a883ec; --basec: #5fb3d3;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.4 var(--sans); }
+header { display: flex; align-items: baseline; gap: 12px; padding: 16px 20px 4px; }
+header .hcontrols { flex: 1; min-width: 0; display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px 12px; }
+header .hgroup { display: inline-flex; align-items: baseline; gap: 12px; white-space: nowrap; }
+header .hstatus { display: flex; align-items: baseline; white-space: nowrap; }
+header h1 { font-size: 17px; margin: 0; font-weight: 600; letter-spacing: .01em; white-space: nowrap; }
+header .conn { color: var(--dim); font-size: 12px; margin-left: auto; font-family: var(--mono);
+               font-variant-numeric: tabular-nums; width: 23ch; text-align: right; }
+header #wsspark { color: var(--dim); margin-left: 6px; opacity: .8; display: flex; }
+header .hlabel { color: var(--dim); font-size: 12px; margin-left: 8px; }
+header button { margin-left: 10px; font-family: var(--mono); }
+main { padding: 8px 20px 40px; display: flex; flex-wrap: wrap; align-items: flex-start; gap: 18px; }
+.device { flex: none; max-width: 100%; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px 16px; }
+/* What a sender host can run, above the walls on it: a small card each. */
+.catalog { margin: 0 0 14px; }
+/* A row that scrolls needs room to scroll in; one that wraps takes what it needs. */
+.catalog:has(.many) { min-width: min(720px, 92vw); }
+.catalog .catbar { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; }
+/* A row of each kind: its word, then its cards, each kind its own colour. */
+.catalog .kindrow { display: flex; gap: 8px; align-items: stretch; margin-bottom: 8px; }
+.catalog .kindrow .kind { flex: none; width: 4.5em; font: 11.5px var(--mono); color: var(--dim);
+                          padding-top: 7px; }
+.catalog .kindrow > .cards { display: flex; flex-wrap: wrap; gap: 8px; }
+.catalog .layer .card { border-color: color-mix(in srgb, var(--layer) 55%, var(--line));
+                        background: color-mix(in srgb, var(--layer) 9%, var(--panel)); }
+.catalog .base .card { border-color: color-mix(in srgb, var(--basec) 55%, var(--line));
+                       background: color-mix(in srgb, var(--basec) 9%, var(--panel)); }
+/* A long catalogue: one row that scrolls, as wide as the walls under it
+ * and never wider, with a filter and a step either way. */
+.catalog .catfilter { font: 13px var(--sans); padding: 3px 8px; border: 1px solid var(--line);
+                           border-radius: 5px; background: var(--panel); color: var(--ink); width: 14em; }
+.catalog.names .card { width: auto; }
+.catalog .many .rail { position: relative; flex: 1; min-width: 0; }
+.catalog .many .cards { display: flex; gap: 8px; overflow-x: auto; scroll-snap-type: x proximity;
+                       scrollbar-width: none; align-items: stretch; }
+.catalog .many .cards::-webkit-scrollbar { display: none; }
+/* The steps are the row's ends, full height, over a fade of the page, as
+ * a streaming service's rows have them. */
+.catalog .many .step { position: absolute; top: 0; bottom: 0; width: 40px; z-index: 2; border: 0;
+                      border-radius: 0; padding: 0; font-size: 34px; line-height: 1; color: var(--ink);
+                      cursor: pointer; }
+.catalog .many .step.back { left: 0; background: linear-gradient(to right, var(--panel) 45%, transparent); }
+.catalog .many .step.fwd { right: 0; background: linear-gradient(to left, var(--panel) 45%, transparent); }
+.catalog .many .step:hover { color: var(--accent); }
+.catalog .many .rail.at-start .step.back, .catalog .many .rail.at-end .step.fwd { display: none; }
+.catalog .many .card { flex: none; scroll-snap-align: start; }
+.catalog .none { color: var(--dim); font-size: 12px; padding: 6px 2px; }
+.catalog .card { cursor: grab; }
+/* A hat takes a catalogue card and nothing else: green where a card may
+ * land, red for anything else dragged over it. */
+.hat.drop-ok { outline: 2px solid var(--ok); outline-offset: 1px; }
+.hat.drop-no { outline: 2px dashed var(--bad); outline-offset: 1px; }
+.hat .op.bad { color: #f0a39d; }
+.hat .note { text-align: center; }
+.confirm .box { max-width: 420px; }
+.confirm p { margin: 4px 4px 8px; }
+.confirm .buttons { display: flex; gap: 8px; justify-content: flex-end; }
+.catalog .card { width: 170px; border: 1px solid var(--line); border-radius: 6px; padding: 6px 9px;
+                 background: var(--bg); font-size: 12px; display: flex; flex-direction: column; gap: 2px; }
+.catalog .card b { font-size: 13px; text-align: center; }
+.catalog .card .d { text-align: center; }
+.catalog .card .id { font-family: var(--mono); font-size: 11px; color: var(--dim); }
+.catalog .card .d { color: var(--dim); line-height: 1.3; }
+.catalog .opts { display: grid; grid-template-columns: auto 1fr; gap: 4px 8px; align-items: center;
+                 margin-top: 4px; padding-top: 5px; border-top: 1px solid var(--line); }
+.catalog .opts label { color: var(--dim); }
+.catalog .opts input.num { width: 5ch; }
+.catalog .opts input.walls { font: 11.5px var(--mono); min-width: 0; }
+.catalog .opts input.walls.bad { border-color: var(--bad); }
+.catalog .opts select { font: 12px var(--sans); }
+.catalog .problem { width: 100%; font: 11.5px var(--mono); color: var(--bad); }
+/* A sender this host says it cannot run, greyed with why: not a card, so never dragged. */
+.catalog .unavailable { width: 100%; font: 11.5px var(--mono); color: var(--dim); }
+.device > .head { display: flex; gap: 10px; align-items: baseline; margin-bottom: 12px; }
+.device > .head h2 { margin: 0; font-size: 15px; }
+.device > .head .fold { align-self: center; background: none; border: 0; padding: 0 2px; color: var(--dim); font: 13px var(--mono); cursor: pointer; width: 1.2em; }
+.device > .head .fold:hover { color: inherit; }
+.device.folded > :not(.head) { display: none; }
+.device.folded > .head { margin-bottom: 0; }
+.device > .head .meta { color: var(--dim); font-size: 12px; font-family: var(--mono); }
+/* A web receiver's walls are made here: a name, a presence if any, make. */
+.device > .head .make { margin-left: auto; display: flex; gap: 6px; align-items: baseline; font-size: 12px; }
+.device > .head .make input { font: 12px var(--mono); width: 11ch; padding: 2px 6px; border: 1px solid var(--line);
+                              border-radius: 5px; background: var(--bg); color: var(--ink); }
+.device > .head .make .op { color: var(--dim); font-family: var(--mono); }
+.device > .head .make .op.bad { color: var(--bad); }
+.walls { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; }
+.wall { width: 372px; max-width: 100%; display: flex; flex-direction: column; }
+.sname { min-width: 6ch; max-width: 14ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The wall, then its sessions: a heading each, what belongs to it a
+ * little in, and its numbers under its facts, in the same shape. */
+.facts .sect + .sect { margin-top: 8px; }
+.facts .sh, .facts .sh .n { color: rgba(255,255,255,.7); font-weight: 600; padding-bottom: 3px; }
+.facts .sh.wallh { display: flex; align-items: center; }
+/* What a session is, after its name: base, video or cells, controller. */
+.facts .sh .kind { color: rgba(255,255,255,.45); font-weight: 400; }
+/* A wall's own action at the right of its heading, drawn as the hat's are. */
+.facts .wctls { margin-left: auto; display: inline-flex; gap: 1px; align-items: center; }
+.facts .wctl { background: none; border: 0; padding: 3px; line-height: 0; color: var(--glass-ink);
+               opacity: .45; cursor: pointer; border-radius: 3px; }
+/* A link that may not reach the glass from where the page is being seen. */
+.facts .wctl.doubt { opacity: .2; }
+.facts .wctl:hover, .facts .wctl:focus-visible { opacity: 1; background: rgba(255,255,255,.14); }
+.facts .wctl svg { width: 12px; height: 12px; display: block; }
+.facts .grp { display: grid; gap: 3px 12px; grid-template-columns: repeat(auto-fit, minmax(185px, 1fr));
+              padding-left: 1.5ch; }
+.facts .strip { border-top: 0; padding: 4px 0 0 1.5ch; background: none;
+                column-count: 2; column-width: auto; }
+.facts .strip div { grid-template-columns: 3.5em minmax(0, 1fr) 40px; }
+.wall > .body { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; display: flex; flex-direction: column; }
+.screen { background: var(--glass); color: var(--glass-ink); aspect-ratio: 16 / 9; position: relative;
+          display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 4px;
+          font-family: var(--mono); }
+.screen .name { font-size: 22px; font-weight: 600; letter-spacing: .02em; }
+.screen .sub { font-size: 12px; opacity: .7; }
+/* The heartbeat: the wall asking a quiet sender whether it is there, and
+ * the sender answering. One triangle each way, lit as it happens. */
+/* The heartbeat, in a row of its own: the wall asking a quiet sender
+ * whether it is there, and the sender answering. */
+.beat { color: rgba(255,255,255,.22); font-size: 15px; line-height: 1; display: flex; gap: 5px; }
+.beat span { transition: color .7s, text-shadow .7s; }
+.beat span.lit { color: #ffc14d; text-shadow: 0 0 10px rgba(255,193,77,.9); transition: none; }
+.facts i { width: 7px; height: 7px; border-radius: 50%; background: var(--dim); display: inline-block;
+           margin-right: 5px; }
+.facts .open i { background: var(--ok); }
+/* On the glass's dark ground in either theme, so the dark theme's red. */
+.facts .off { color: #e0675e; }
+.facts .connecting i { background: var(--warn); }
+.facts .down i { background: var(--bad); }
+.screen .pic { position: absolute; inset: 0; overflow: hidden; display: none; background: #000; }
+.screen.has-pic .pic { display: block; }
+.screen.has-pic .name { display: none; }
+.screen .pic canvas, .modal .pic canvas { position: absolute; display: block; }
+/* What a wall is, under its picture and above its numbers: the same dark
+ * screen and the same columns, so a card reads as one instrument. */
+/* The sender, sitting on the wall: narrower than it, and its own colour,
+ * because it is a thing attached to the wall rather than part of it. */
+.hat { margin: 0 14px; background: var(--hat); color: var(--hat-ink); font-family: var(--mono);
+       font-size: 11.5px; border-radius: 6px 6px 0 0; padding: 6px 10px; display: flex;
+       flex-direction: column; gap: 2px; }
+/* Stretched to line up with the tallest hat: the controls stay at the top,
+ * and the words sit at the bottom against the display. */
+.hat .who { margin-top: auto; }
+/* A hat with one line of words has it in the middle of its space. */
+.hat.one .who { margin-bottom: auto; }
+.hat.none { justify-content: center; }
+.hat.dead { background: var(--hat-dead); }
+.hat.none { text-align: center; background: transparent; color: var(--dim); border: 1px dashed var(--line); border-bottom: 0; }
+/* The sender's actions, small icons at the right of its line, quiet in
+ * the hat's own ink until pointed at. */
+.hat .ctl { grid-column: 3; justify-self: end; display: inline-flex; gap: 1px; align-items: center; }
+.hat .ctl button { background: none; border: 0; margin: 0; padding: 3px; line-height: 0; color: var(--hat-ink);
+                   opacity: .45; cursor: pointer; border-radius: 3px; }
+.hat .ctl button:hover:not(:disabled), .hat .ctl button:focus-visible { opacity: 1; background: rgba(255,255,255,.14); }
+.hat .ctl button:disabled { opacity: .2; cursor: default; }
+.hat .ctl svg { width: 12px; height: 12px; display: block; }
+.hat .op { text-align: center; opacity: .75; font-size: 11px; }
+body.controls-off .hat .ctl { display: none; }
+/* A host's senders with a record that no wall shows: died after their
+ * wall moved on, or were replaced by hand. Each is a hat as a wall's is,
+ * only on no wall: in a row of their own between the catalogue and the
+ * walls, as wide as a wall's hat and rounded all round. */
+.adrift:empty { display: none; }
+.adrift { display: flex; gap: 8px; align-items: flex-start; margin-bottom: 14px; }
+.adrift .kind { flex: none; width: 4.5em; font: 11.5px var(--mono); color: var(--dim); padding-top: 7px; }
+.adrift .hats { display: flex; flex-wrap: wrap; gap: 16px; }
+.adrift .hat { margin: 0; width: 344px; max-width: 100%; border-radius: 6px; }
+/* A sender that can be dragged to another wall: its line in a hat, or its
+ * row on no wall. */
+[data-inst][draggable="true"] { cursor: grab; }
+body.controls-off [data-inst][draggable="true"] { cursor: auto; }
+.modal .logtext { margin: 0; width: min(1000px, 92vw); height: 70vh; overflow: auto; background: var(--panel);
+                  color: var(--ink); font: 12px/1.4 var(--mono); padding: 8px 10px; border-radius: 4px;
+                  border: 1px solid var(--line);
+                  white-space: pre-wrap; overflow-wrap: anywhere; }
+.hat .who { font-size: 13px; font-weight: 600; text-align: center; display: grid;
+            grid-template-columns: 1fr minmax(0, auto) 1fr; align-items: center; gap: 6px; }
+.hat .who .name { grid-column: 2; overflow-wrap: anywhere; }
+.hat .desc { text-align: center; opacity: .75; padding-bottom: 2px; }
+.hat .pair { display: grid; grid-template-columns: 6.6em 1fr; gap: 8px; }
+/* More than one sender on a wall: an entry each, top layer first, the
+ * first taking the spare height so the words still sit on the display. */
+.hat .sender { display: flex; flex-direction: column; gap: 2px; }
+.hat.many .sender:first-child { flex: 1; }
+.hat .sender + .sender { border-top: 1px solid rgba(255,255,255,.35); margin-top: 4px; padding-top: 5px; }
+.hat .sender.dead { background: var(--hat-dead); margin-left: -10px; margin-right: -10px;
+                    padding-left: 10px; padding-right: 10px; }
+.hat .place { font-weight: 400; font-size: 11px; opacity: .6; }
+.hat .pair > span:first-child { color: rgba(255,255,255,.5); cursor: pointer; }
+.hat .pair > span:last-child { min-width: 0; overflow-wrap: anywhere; }
+.facts { background: var(--glass); color: var(--glass-ink); font-family: var(--mono); font-size: 11.5px;
+         border-top: 1px solid rgba(255,255,255,.55); padding: 7px 10px; }
+.facts .title { grid-column: 1 / -1; font-size: 14px; font-weight: 600; letter-spacing: .01em;
+                text-align: center; padding-bottom: 2px; }
+.facts .wide { grid-column: 1 / -1; }
+/* A name and its value, in columns wide enough for the longest name, so
+ * nothing runs into anything. */
+.facts .pair, .facts .wide { display: grid; grid-template-columns: 6.6em 1fr; gap: 8px; align-items: baseline; }
+.facts .n, .strip .n { color: rgba(255,255,255,.45); white-space: nowrap; overflow: hidden;
+                       text-overflow: ellipsis; cursor: pointer; }
+/* What a name means, beside the name: a mouse gets the tooltip, a finger
+ * gets this. */
+#what { position: absolute; z-index: 20; max-width: 260px; background: var(--panel); color: var(--ink);
+        border: 1px solid var(--line); border-radius: 7px; padding: 7px 9px; font-size: 12px;
+        box-shadow: 0 6px 20px rgba(0,0,0,.35); display: none; }
+#what.on { display: block; }
+#what b { display: block; font-family: var(--mono); font-size: 11.5px; color: var(--dim); font-weight: 400; }
+.facts .pair > span:last-child, .facts .wide > span:last-child { min-width: 0; overflow-wrap: anywhere; }
+.modal { position: fixed; inset: 0; background: rgba(0,0,0,.72); display: none; z-index: 10;
+         align-items: center; justify-content: center; }
+.modal.open { display: flex; }
+.modal .box { background: var(--panel); border-radius: 10px; padding: 10px; display: flex; flex-direction: column; gap: 8px;
+              max-width: 96vw; }
+.modal .bar { display: flex; align-items: center; gap: 10px; font-size: 13px; }
+.modal .bar .title { font-weight: 600; font-family: var(--mono); }
+.modal .bar .age { color: var(--dim); font-size: 12px; flex: 1; }
+.modal .pic { position: relative; overflow: hidden; background: #000; border-radius: 4px; }
+/* The instruments, under the picture and part of the same dark screen:
+ * the numbers that move, while the wall is being watched. */
+.strip { display: none; background: var(--glass); color: var(--glass-ink); font-family: var(--mono);
+         font-size: 12px; border-top: 1px solid rgba(255,255,255,.35); padding: 7px 10px;
+         column-width: 160px; column-gap: 12px; }
+/* In columns, so the readings run down the first and on into the next,
+ * in the order they are listed, however many columns fit. */
+.strip.on { display: block; }
+/* Each reading is a row of three fixed columns -- name, number, trace --
+ * and the numbers are tabular, so nothing shifts as a value grows a digit
+ * or loses one. */
+.strip div { display: grid; grid-template-columns: 3.5em 5.5em 46px; align-items: center; gap: 6px;
+             break-inside: avoid; margin-bottom: 4px;
+             font-variant-numeric: tabular-nums; }
+.strip .n { color: rgba(255,255,255,.45); }
+.strip .v { text-align: right; transition: color .6s ease; }
+.strip .v.stale { color: rgba(217,215,207,.78); }
+.strip svg { opacity: .65; display: block; }
+/* Watching rather than working: at `off` the dark stack alone, which is
+ * what a page left up on a screen wants; at `min` a sender's own stop,
+ * restart and log as well, and a web wall's make and remove. Everything
+ * else is for `all`. */
+body:not(.controls-all) .controls, body:not(.controls-all) .history,
+body:not(.controls-all) details { display: none; }
+body.controls-off .min.min.min { display: none; }
+.controls { padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; border-top: 1px solid var(--line); }
+.row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.row > label { width: 72px; color: var(--dim); font-size: 12px; }
+.val { font-family: var(--mono); min-width: 3ch; text-align: center; }
+input.num { font: 13px var(--mono); width: 5ch; text-align: center; padding: 2px 2px; border: 1px solid var(--line);
+            border-radius: 5px; background: var(--bg); color: var(--ink); }
+input.num.pending { border-color: var(--warn); }
+button { font: inherit; font-size: 13px; background: var(--chip); color: var(--ink); border: 1px solid var(--line);
+         border-radius: 6px; padding: 3px 10px; cursor: pointer; }
+button:hover { border-color: var(--accent); }
+button.on { background: var(--accent); color: #fff; border-color: var(--accent); }
+button:disabled { opacity: .45; cursor: default; }
+fieldset.group { border: 1px solid var(--line); border-radius: 8px; margin: 4px 0 0; padding: 4px 10px 10px; }
+fieldset.group > legend { display: flex; align-items: center; gap: 8px; padding: 0 6px; font-size: 12px;
+                          color: var(--ink); font-weight: 600; }
+fieldset.group .inner { display: flex; flex-direction: column; gap: 8px; transition: opacity .15s; }
+fieldset.group.off { padding-bottom: 0; border-bottom-color: transparent; border-left-color: transparent;
+                     border-right-color: transparent; border-radius: 0; }
+fieldset.group.off .inner { display: none; }
+fieldset.group .row > label { width: 50px; }
+button.switch { width: 38px; height: 22px; padding: 0; border-radius: 11px; position: relative;
+                background: var(--line); border-color: var(--line); }
+button.switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
+                       border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.3); transition: left .15s; }
+button.switch[aria-checked="true"] { background: var(--accent); border-color: var(--accent); }
+button.switch[aria-checked="true"]::after { left: 18px; }
+.state { color: var(--dim); font-size: 12px; min-width: 5ch; }
+/* The last cell of a row of choices, showing what is true rather than
+ * offering it: the same shape, in the panel's own colour so that it reads
+ * as a reading and not as a button nobody has pressed. */
+.seg .status { border: 1px solid var(--line); border-left: 0; border-radius: 0 6px 6px 0; padding: 2px 8px;
+               font: 12px var(--mono); color: var(--dim); background: var(--panel); align-self: stretch;
+               display: flex; align-items: center; }
+.seg { display: inline-flex; }
+.seg button { border-radius: 0; margin-left: -1px; padding: 2px 8px; font-size: 12px; font-family: var(--mono); }
+.row > button { font-family: var(--mono); }
+.seg button:first-child { border-radius: 6px 0 0 6px; margin-left: 0; }
+.seg button:last-child { border-radius: 0 6px 6px 0; }
+.seg button:has(+ .status) { border-radius: 0; }
+.chips { display: flex; flex-wrap: wrap; gap: 4px; flex: 1; }
+.chips button { padding: 0 5px; font-size: 11px; font-family: var(--mono); }
+.statsize { display: inline-flex; gap: 6px; align-items: center; }
+/* Where the overlay sits, drawn as the screen it sits on: nine places,
+ * and a dot in the one it is in. */
+.compass { display: grid; grid-template-columns: repeat(3, 15px); gap: 2px; }
+.compass button { padding: 0; height: 13px; position: relative; }
+.compass button::after { content: ""; position: absolute; inset: 0; margin: auto; width: 4px; height: 4px;
+                         border-radius: 50%; background: var(--dim); }
+.compass button.on::after { background: #fff; }
+/* Dimmed and out of reach while the overlay is off: what they set is kept,
+ * and turning it on shows it. */
+.dimmed { opacity: .45; pointer-events: none; }
+.answer { font-family: var(--mono); font-size: 12px; color: var(--bad); }
+.answer:empty { display: none; }
+details { border-top: 1px solid var(--line); }
+details > summary { padding: 7px 12px; cursor: pointer; color: var(--dim); font-size: 12px; user-select: none; }
+details[open] > summary { color: var(--ink); }
+.measures { display: grid; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap: 2px 10px;
+            padding: 2px 0 0; font-family: var(--mono); font-size: 12px; }
+.measures div { display: flex; justify-content: space-between; gap: 6px;
+                font-variant-numeric: tabular-nums; }
+.measures span:first-child { color: var(--dim); }
+.log { font-family: var(--mono); font-size: 11.5px; max-height: 260px; overflow: auto; padding: 0 12px 10px; }
+.log div { white-space: pre-wrap; word-break: break-all; }
+.log .t { color: var(--dim); }
+.log .in { color: var(--accent); } .log .st { color: var(--warn); } .log .err { color: var(--bad); }
+.history { border-top: 1px solid var(--line); padding-top: 8px; }
+.logbar { display: flex; gap: 8px; padding: 0 12px 6px; align-items: center; font-size: 12px; color: var(--dim); }
+.logbar .n { white-space: nowrap; }
+.logbar input { font: inherit; font-size: 12px; flex: 1; min-width: 0; padding: 2px 6px; border: 1px solid var(--line);
+                border-radius: 5px; background: var(--bg); color: var(--ink); }
+@media (max-width: 520px) { header, main { padding-left: 12px; padding-right: 12px; }
+  .device { width: 100%; } .wall { width: 100%; } }
+</style>
+</head>
+<body>
+<header><h1>bitwall control</h1>
+<div class="hcontrols"><span class="hgroup"><span class="hlabel">detail</span><span class="seg" id="levels"></span></span>
+<span class="hgroup"><span class="hlabel">controls</span><span class="seg" id="showing"></span></span>
+<span class="hgroup"><span class="hlabel">capture</span>
+<button id="shootall" title="capture every wall" aria-label="capture every wall">⦿</button></span>
+<span class="hgroup"><span class="hlabel">live</span><span class="seg" id="allmirror"></span></span>
+<span class="hgroup"><span class="hlabel">measures</span><span class="seg" id="allrates"></span></span>
+<span class="hgroup"><span class="hlabel">catalogue</span><span class="seg" id="catalogshow"></span></span></div>
+<span class="hstatus"><span class="conn" id="conn">connecting…</span><span id="wsspark"></span></span></header>
+<main id="devices"></main>
+<div id="what" role="tooltip"></div>
+<div class="modal" id="modal" role="dialog" aria-modal="true">
+  <div class="box">
+    <div class="bar"><span class="title" id="modal-title"></span><span class="age" id="modal-age"></span>
+      <button id="modal-again">capture</button><button id="modal-close" aria-label="close">✕</button></div>
+    <div class="pic" id="modal-pic"></div>
+  </div>
+</div>
+<div class="modal confirm" id="confirmmodal" role="dialog" aria-modal="true">
+  <div class="box">
+    <p id="confirm-text"></p>
+    <div class="buttons"><button id="confirm-no">cancel</button><button id="confirm-yes" class="on">replace</button></div>
+  </div>
+</div>
+<div class="modal" id="logmodal" role="dialog" aria-modal="true">
+  <div class="box">
+    <div class="bar"><span class="title" id="log-title"></span><span class="age" id="log-age"></span>
+      <button id="log-again">refresh</button><button id="log-close" aria-label="close">✕</button></div>
+    <pre class="logtext" id="log-text"></pre>
+  </div>
+</div>
+<script src="/bitwall-screen.js"></script>
+<script>
+"use strict";
+const S = {devices: [], walls: {}, history: {}, answers: {}, filters: {}, open: {}, running: {}, ops: {}};
+let logId = null;
+S.wallops = {};         // wall key -> how a start dropped on it is going
+let pending = null;     // a drop waiting on the replace question
+try { S.open = JSON.parse(localStorage.getItem("bitwall-control-open") || "{}"); } catch (e) {}
+/* What this page is being sent, so the header says what it costs. */
+S.bytes = 0; S.was = 0; S.since = 0;
+/* How many controls the page shows: none, a sender's own, or every one. */
+const SHOWING = ["off", "min", "all"];
+S.controls = "all";
+try { const kept = localStorage.getItem("bitwall-control-controls");
+  S.controls = kept === "0" ? "off" : SHOWING.includes(kept) ? kept : "all"; } catch (e) {}
+S.catalog = false; S.catalogue = {}; S.reach = {};
+try { S.catalog = localStorage.getItem("bitwall-control-catalog") === "1"; } catch (e) {}
+/* The machines folded down to their heading, by name, kept in this browser. */
+S.folded = {};
+try { S.folded = JSON.parse(localStorage.getItem("bitwall-control-folded") || "{}"); } catch (e) {}
+S.level = "more";
+try { S.level = localStorage.getItem("bitwall-control-level") || "more"; } catch (e) {}
+S.auto = {};
+try { S.auto = JSON.parse(localStorage.getItem("bitwall-control-auto") || "{}"); } catch (e) {}
+function saveAuto() { try { localStorage.setItem("bitwall-control-auto", JSON.stringify(S.auto)); } catch (e) {} }
+function saveOpen() { try { localStorage.setItem("bitwall-control-open", JSON.stringify(S.open)); } catch (e) {} }
+/* How much each wall says about itself, for the whole page. */
+const LEVELS = ["min", "more", "all"];
+
+/* What each name means, for a tooltip on a mouse and a line of its own on
+ * a tap. The measures are as PROTOCOL.md defines them. */
+const WHAT = {
+  wall: "which screen this is: the device, and its number on that device",
+  display: "what the wall shows: lit, or dark because blank (somebody asked), away (nobody there) or doze (no sender)",
+  also: "the other layers this sender holds on the wall: the same program, started and stopped with it, so its controls are these",
+  source: "the catalogue entry this sender was started from, and the host it runs on; started by hand means no controller started it, so there is no record",
+  options: "what it was started with, each checked against its catalogue entry",
+  state: "whether its process is still running, from the record on its host, and when it was started",
+  instance: "the id its controller gave it, which the wall carries hidden and the record is named by",
+  pid: "its process on the host it runs on; stop ends that process's whole group",
+  log: "where its output goes, on the host it runs on",
+  watching: "how many can see the wall: tabs in view on the web, 1 or 0 on a Pi; a sender draws nothing at 0",
+  power: "the monitor itself: on, drawing full power whatever it shows, or asleep in standby",
+  presence: "whether anybody is there to see, what this wall follows, and who says so",
+  screen: "the connector the wall is on",
+  receiver: "the program keeping this wall and the version of its source, red where it is not the source this page has: a wall still to be updated, or one ahead of here",
+  started: "when the receiver program started",
+  booted: "when the machine the wall is on last started",
+  grid: "cells across and down, and the font size that produced them",
+  sender: "whether a sender is attached, and how long since its last byte",
+  shot: "how old the picture on this card is",
+  session: "this page's own session on the wall, and how it is doing",
+  "s-head": "a session on the wall, and what it is: the base, a layer's video or cells above it, or a controller watching it",
+  "s-layer": "where the layer is in the stack: the base at the bottom, or its place above",
+  "s-role": "a controller: it watches and commands the wall and draws nothing",
+  "s-session": "the session's name, as the wall lists it",
+  "s-instance": "the record of the controller that started it, or by hand when none did",
+  "s-pid": "the sender's process, on the host that started it",
+  "s-fps": "frames a second the wall took from this session",
+  "s-in": "bytes a second the wall read from this session",
+  "s-out": "bytes a second the wall wrote to this session",
+  "s-dropped": "lines the wall could not fit down this session's out",
+  "s-queue": "bytes waiting on this session's out",
+  "s-quiet": "seconds since this session's last byte",
+  "s-pong": "this session's last ping round trip",
+  "s-decode": "time to decode one of this layer's frames",
+  sessions: "who is on the wall, as it lists them: each session's name, role, place and type",
+  ping: "the wall asking a quiet sender whether it is there, and the answer",
+  since: "how long the session has been in the state it is in",
+  run: "the wall's directory on the device",
+  named: "what this page's session on the wall is called",
+  lines: "lines heard on the session, and when the last one came",
+  reports: "times this page has opened its session, which counts the wall's restarts",
+  dropped: "lines the wall could not fit down the session",
+  atlas: "glyph slots used of all there are, and times the atlas filled",
+  caps: "what this receiver says it can do",
+  fps: "times a second the glass was redrawn, by any layer, the overlay's own refreshes aside",
+  quiet: "seconds since the base's last byte",
+  in: "bytes a second the wall read from every session, commands included",
+  out: "bytes a second the wall wrote to every session, pictures and mirror frames included",
+  inbox: "bytes read and not yet painted",
+  frame: "time taken to read each sender frame's escape codes and set the cells they change",
+  draw: "time taken to hand the GPU the whole grid to draw, each time the glass is updated",
+  swap: "time taken to put the finished picture on the screen, each time the glass is updated; often mostly waiting for the GPU to finish drawing it",
+  pong: "the last ping's round trip",
+  cpu: "the painter's share of a core",
+  gpu: "the painter's share of the GPU, where the driver counts it",
+  temp: "the board's temperature",
+  meta: "what the sender says about itself; a * means it is kept off the glass",
+};
+const AUTO = [[0, "once"], [2000, "2s"], [5000, "5s"], [10000, "10s"]];
+/* How often a live picture is brought up to date, or never. */
+const MIRRORS = [[0, "off"], [100, "100ms"], [250, "250ms"], [500, "500ms"], [1000, "1s"]];
+const PICS = {};           /* key -> {head, bytes} */
+let modalKey = null;
+/* Off, or how often: one choice, since a rate is what being on means. */
+const RATES = [[0, "off"], [250, "250ms"], [1000, "1s"], [2000, "2s"], [5000, "5s"]];
+const POINTS = ["nw", "n", "ne", "w", "c", "e", "sw", "s", "se"];
+const QUIET = /^(ping|pong)\b/;
+let ws, ref = 0;
+
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c])); }
+function ago(t) { if (!t) return "never"; const s = Math.max(0, Date.now() / 1000 - t);
+  return s < 60 ? s.toFixed(0) + "s ago" : s < 3600 ? (s / 60).toFixed(0) + "m ago"
+    : s < 172800 ? (s / 3600).toFixed(1) + "h ago" : (s / 86400).toFixed(1) + "d ago"; }
+function clock(t) { return new Date(t * 1000).toTimeString().slice(0, 8); }
+
+/* A request the page waits on: answered by the server's ack, or failed
+ * here when no answer comes, so nothing waits on a connection that died. */
+const waiting = {};
+function request(msg, failed) {
+  if (!ws || ws.readyState !== 1) {
+    failed("not connected to the page server; reconnecting, try again");
+    try { ws && ws.close(); } catch (e) {}
+    return;
+  }
+  const r = ++ref;
+  waiting[r] = {failed, timer: setTimeout(() => {
+    delete waiting[r];
+    failed("the page server did not answer; reconnecting, try again");
+    try { ws.close(); } catch (e) {}
+  }, 5000)};
+  ws.send(JSON.stringify(Object.assign({}, msg, {ref: r})));
+}
+/* The connection proved alive every little while: one that has gone quiet
+ * without closing -- a sleeping laptop, a network change -- is closed and
+ * made again rather than trusted. */
+let pongAt = Date.now();
+setInterval(() => {
+  if (!ws || ws.readyState !== 1) return;
+  if (Date.now() - pongAt > 30000) { try { ws.close(); } catch (e) {} return; }
+  ws.send(JSON.stringify({type: "ping"}));
+}, 10000);
+
+function connect() {
+  pongAt = Date.now();
+  ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => { S.since = Date.now(); document.getElementById("conn").textContent = "live"; };
+  ws.onclose = () => { document.getElementById("conn").textContent = "disconnected, retrying…"; setTimeout(connect, 1500); };
+  ws.onmessage = ev => {
+    S.bytes += ev.data instanceof ArrayBuffer ? ev.data.byteLength : ev.data.length;
+    if (ev.data instanceof ArrayBuffer) { gotPicture(ev.data); return; }
+    const m = JSON.parse(ev.data);
+    pongAt = Date.now();
+    if (m.type === "pong") return;
+    if (m.type === "ack") {
+      const w = waiting[m.ref]; if (!w) return;
+      clearTimeout(w.timer); delete waiting[m.ref];
+      if (!m.ok) w.failed(m.why);
+      return; }
+    if (m.type === "state" && S.version && m.version !== S.version) { location.reload(); return; }
+    if (m.type === "state") S.version = m.version;
+    if (m.type === "state") { S.devices = m.devices; S.walls = m.walls; S.history = m.history;
+      S.running = m.running || {}; S.catalogue = m.catalogue || {}; S.reach = m.reach || {};
+      S.versions = m.versions || {}; render(); }
+    else if (m.type === "catalogue") { S.catalogue = m.catalogue; S.reach = m.reach || {}; if (S.catalog) render(); }
+    else if (m.type === "running") { S.running = m.running; for (const k of Object.keys(S.walls)) update(k); adrift(); }
+    else if (m.type === "wall-op") { S.wallops[m.key] = m; update(m.key); }
+    else if (m.type === "web-op") { S.webops[m.device] = m; render(); }
+    else if (m.type === "sender-op") {
+      if (m.action === "log") { if (logId === m.id) showLog(m.text); }
+      else { S.ops[m.id] = m; for (const k of Object.keys(S.walls)) update(k); adrift(); } }
+    else if (m.type === "devices") { S.devices = m.devices; S.versions = m.versions || S.versions;
+      // A wall no device has any more is gone, and so is all it said: its
+      // senders are on no wall now.
+      const kept = new Set(m.devices.flatMap(d => d.walls));
+      for (const k of Object.keys(S.walls)) if (!kept.has(k)) delete S.walls[k];
+      render(); }
+    else if (m.type === "wall") { const was = (S.walls[m.wall.key] || {});
+      if (was.every !== m.wall.every || was.live !== m.wall.live || was.mirror !== m.wall.mirror)
+        setTimeout(render, 0);
+      S.walls[m.wall.key] = m.wall; if (m.wall.measured) keep(m.wall.key, m.wall.measures || {}); if (!document.getElementById(id(m.wall.key))) render(); else update(m.wall.key); }
+    else if (m.type === "line") { beat(m); (S.history[m.key] = S.history[m.key] || []).push(m);
+      if (S.history[m.key].length > 400) S.history[m.key].shift(); appendLine(m.key, m); }
+    else if (m.type === "answer") { S.answers[m.key] = m; showAnswer(m.key); }
+  };
+}
+
+/* Whether every wall is already at this rate, so the choice can show
+ * itself as made rather than offered. */
+function everyWall(ms) {
+  const walls = Object.values(S.walls);
+  return walls.length > 0 && walls.every(w =>
+    ms ? w.live !== false && w.every === ms : w.live === false);
+}
+
+function rate(key, live, ms) {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({type: "rate", key, live, ms}));
+}
+
+function send(key, words) {
+  if (!ws || ws.readyState !== 1) return;
+  S.answers[key] = {pending: true, words};
+  showAnswer(key);
+  ws.send(JSON.stringify({type: "command", key, words, ref: ++ref}));
+}
+
+function id(key, part) { return "w-" + key.replace(/[^a-z0-9]/gi, "-") + (part ? "-" + part : ""); }
+
+function render() {
+  document.getElementById("levels").innerHTML = LEVELS.map(x =>
+    `<button data-level="${x}" class="${x === S.level ? "on" : ""}">${x}</button>`).join("");
+  document.getElementById("allrates").innerHTML = RATES.map(([ms, x]) =>
+    `<button data-allrate="${ms}" class="${everyWall(ms) ? "on" : ""}">${x}</button>`).join("");
+  const mirrors = Object.values(S.walls).filter(w => (w.caps || []).includes("mirror"));
+  document.getElementById("allmirror").innerHTML = MIRRORS.map(([ms, x]) =>
+    `<button data-allmirror="${ms}" class="${mirrors.length && mirrors.every(w => (w.mirror || 0) === ms)
+      ? "on" : ""}">${x}</button>`).join("");
+  document.getElementById("showing").innerHTML =
+    SHOWING.map(x => `<button data-controls="${x}" class="${x === S.controls ? "on" : ""}">${x}</button>`).join("");
+  for (const x of SHOWING) document.body.classList.toggle("controls-" + x, x === S.controls);
+  document.getElementById("catalogshow").innerHTML =
+    `<button data-catalog="0" class="${S.catalog ? "" : "on"}">off</button>` +
+    `<button data-catalog="1" class="${S.catalog ? "on" : ""}">on</button>`;
+  const root = document.getElementById("devices");
+  // Where each carousel was scrolled to, put back after the page is built
+  // again, which it is every time the devices are asked what they have.
+  const scrolled = {};
+  root.querySelectorAll("[data-cards]").forEach(b => { scrolled[b.dataset.cards] = b.scrollLeft; });
+  // And a new wall's name being typed keeps its place.
+  const typing = document.activeElement && document.activeElement.dataset
+    && document.activeElement.dataset.webform !== undefined ? document.activeElement : null;
+  const typed = typing && {form: typing.dataset.webform, field: typing.dataset.field,
+                           at: typing.selectionStart};
+  root.innerHTML = S.devices.map(d => `
+    <section class="device${S.folded[d.name] ? " folded" : ""}">
+      <div class="head"><button class="fold" data-fold="${esc(d.name)}" aria-expanded="${!S.folded[d.name]}"
+        title="${S.folded[d.name] ? "show" : "fold"} ${esc(d.name)}">${S.folded[d.name] ? "▸" : "▾"}</button><h2>${esc(d.name)}</h2><span class="meta">${esc(d.host)} · ${esc(d.found)}</span>${makeHtml(d)}</div>
+      ${S.catalog ? catalogHtml(d.host) : ""}
+      <div class="adrift" id="adrift-${esc(d.name)}"></div>
+      <div class="walls">${d.walls.map(k => wallHtml(k)).join("")}</div>
+    </section>`).join("");
+  for (const d of S.devices) for (const k of d.walls) { update(k); fillLog(k); showAnswer(k); paintPic(k); }
+  adrift();
+  if (typed) {
+    const el = root.querySelector(`[data-webform="${CSS.escape(typed.form)}"][data-field="${typed.field}"]`);
+    if (el) { el.focus(); el.setSelectionRange(typed.at, typed.at); }
+  }
+  document.querySelectorAll("[data-cards]").forEach(b => {
+    if (scrolled[b.dataset.cards]) b.scrollLeft = scrolled[b.dataset.cards];
+    railEnds(b);
+  });
+}
+
+/* A web receiver's form for a new wall, and how the last make or remove
+ * on it went. What is typed is kept, since the page is built again
+ * whenever the devices say what they have. */
+S.webops = {}; S.webform = {};
+function makeHtml(d) {
+  if (!d.web) return "";
+  const f = S.webform[d.name] || {}, op = S.webops[d.name];
+  const note = !op ? "" : op.state === "busy" ? `<span class="op">${op.action === "make" ? "making" : "removing"} ${esc(op.wall)}…</span>`
+    : op.state === "failed" ? `<span class="op bad" title="${esc(op.text || "")}">${esc(op.action)} ${esc(op.wall)} failed: ${esc((op.text || "").split("\n")[0])}</span>` : "";
+  return `<span class="make min">${note}<input placeholder="new wall" data-webform="${esc(d.name)}" data-field="wall"` +
+    ` value="${esc(f.wall || "")}" autocomplete="off" spellcheck="false" aria-label="new web wall's name">` +
+    `<input placeholder="presence" data-webform="${esc(d.name)}" data-field="presence" value="${esc(f.presence || "")}"` +
+    ` autocomplete="off" spellcheck="false" aria-label="the presence it follows, if any">` +
+    `<button data-make="${esc(d.name)}" ${op && op.state === "busy" ? "disabled" : ""}>make</button></span>`;
+}
+function webOp(action, device, wall, presence) {
+  S.webops[device] = {action, wall, state: "busy"}; render();
+  request({type: "web", action, device, wall, presence: presence || ""}, why => {
+    S.webops[device] = {action, wall, state: "failed", text: why}; render();
+  });
+}
+function ask(text, yes) {
+  document.getElementById("confirm-text").textContent = text;
+  document.getElementById("confirm-yes").textContent = yes;
+  document.getElementById("confirmmodal").classList.add("open");
+}
+document.addEventListener("input", ev => {
+  const t = ev.target; if (!t.dataset || t.dataset.webform === undefined) return;
+  (S.webform[t.dataset.webform] = S.webform[t.dataset.webform] || {})[t.dataset.field] = t.value;
+});
+document.addEventListener("keydown", ev => {
+  const t = ev.target;
+  if (ev.key === "Enter" && t.dataset && t.dataset.webform !== undefined)
+    document.querySelector(`[data-make="${CSS.escape(t.dataset.webform)}"]`).click();
+});
+
+/* The values a card's options are set to, kept per card and between
+ * visits: what a drag starts the sender with. */
+S.cardopts = {};
+try { S.cardopts = JSON.parse(localStorage.getItem("bitwall-control-cardopts") || "{}"); } catch (e) {}
+function cardValues(host, x) {
+  const kept = S.cardopts[host + "|" + x.id] || {}, out = {};
+  for (const [name, o] of Object.entries(x.options || {}))
+    out[name] = name in kept ? kept[name] : o.default;
+  return out;
+}
+/* Why a walls option's text is not a list of walls, or null where it is:
+ * catalogue.py's walls(), the rules a target is held to, so a drop is
+ * refused here rather than by the sender host. Empty is the option not
+ * given. */
+const WALL_TOKEN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+const HOST = /^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$/, IPV6 = /^[0-9A-Fa-f]*:[0-9A-Fa-f:]*:[0-9A-Fa-f:]*$/;
+function wallsWhy(text, o) {
+  if (text === "" || text == null) return null;
+  const seen = new Set();
+  for (const said of String(text).split(",")) {
+    const target = said.replace(/@(?:[0-9]+x[0-9]+(?:\/[0-9]+)?|\/[0-9]+)$/, "");
+    let host = target, wall = "0";
+    if (target.split(":").length === 2) {
+      [host, wall] = target.split(":");
+      if (!WALL_TOKEN.test(wall)) return `${target}: the wall after ':' must be a number, or a name of a-z, 0-9, _ and -`;
+    }
+    if (!HOST.test(host) && !IPV6.test(host)) return `${target}: not a host, or host:wall`;
+    if (seen.has(host + ":" + wall)) return `${target}: named twice`;
+    seen.add(host + ":" + wall);
+  }
+  return seen.size < o.min || seen.size > o.max ? `${seen.size} walls: not within ${o.min}..${o.max}` : null;
+}
+function optionsHtml(host, x) {
+  const opts = Object.entries(x.options || {});
+  if (!opts.length) return "";
+  const v = cardValues(host, x), key = esc(host + "|" + x.id);
+  return `<div class="opts">` + opts.map(([name, o]) => {
+    const at = `data-cardopt="${key}" data-name="${esc(name)}" draggable="false" title="${esc(o.description)}"`;
+    const input = o.type === "bool" ? `<input type="checkbox" ${at} ${v[name] ? "checked" : ""}>`
+      : o.type === "choice" ? `<select ${at}>` + o.choices.map(c =>
+          `<option ${c === v[name] ? "selected" : ""}>${esc(c)}</option>`).join("") + `</select>`
+      : o.type === "walls" ? `<input class="walls${wallsWhy(v[name], o) ? " bad" : ""}" type="text" spellcheck="false" autocapitalize="off" placeholder="host:wall, …" value="${esc(v[name])}" ${at}>`
+      : `<input class="num" type="number" inputmode="numeric" min="${o.min}" max="${o.max}" value="${v[name]}" ${at}>`;
+    return `<label title="${esc(o.description)}">${esc(o.label)}</label>${input}`;
+  }).join("") + `</div>`;
+}
+document.addEventListener("change", ev => {
+  const t = ev.target; if (!t.dataset || !t.dataset.cardopt) return;
+  const card = S.cardopts[t.dataset.cardopt] = S.cardopts[t.dataset.cardopt] || {};
+  if (t.type === "checkbox") card[t.dataset.name] = t.checked;
+  else if (t.classList.contains("walls")) {
+    t.value = t.value.replace(/\s+/g, "");
+    card[t.dataset.name] = t.value;
+    const [host, ...id] = t.dataset.cardopt.split("|");
+    const x = ((S.catalogue[host] || {}).senders || []).find(y => y.id === id.join("|"));
+    const o = x && x.options[t.dataset.name], why = o && wallsWhy(t.value, o);
+    t.classList.toggle("bad", !!why);
+    t.title = why || (o ? o.description : "");
+  }
+  else if (t.type === "number") {
+    const n = Math.round(+t.value), lo = +t.min, hi = +t.max;
+    card[t.dataset.name] = t.value = Math.min(hi, Math.max(lo, isFinite(n) ? n : lo));
+  } else card[t.dataset.name] = t.value;
+  try { localStorage.setItem("bitwall-control-cardopts", JSON.stringify(S.cardopts)); } catch (e) {}
+});
+
+/* The senders a host can run, as small cards above its walls, in two
+ * rows: the layers, which go over whatever is on a wall, above the bases,
+ * which are what a wall shows. A row with none in it is left out. */
+/* More cards than this in a row and it is a carousel, so a long row does
+ * not push the walls off the screen; one filter searches both. */
+const CAROUSEL = 5;
+const KINDS = [["layer", "layers"], ["base", "bases"]];
+S.catfilter = {};
+function kindOf(x) { return x.place && x.place !== "base" ? "layer" : "base"; }
+
+function cardsHtml(host, kind) {
+  const cat = S.catalogue[host];
+  const deep = LEVELS.indexOf(S.level);
+  const q = (S.catfilter[host] || "").trim().toLowerCase();
+  const shown = cat.senders.filter(x => kindOf(x) === kind && (!q ||
+    `${x.label} ${x.description} ${x.id}`.toLowerCase().includes(q)));
+  return shown.map(x => `<div class="card" draggable="true"
+      data-sender="${esc(x.id)}" data-host="${esc(host)}" data-label="${esc(x.label)}">
+      <b>${esc(x.label)}</b>` +
+      (deep > 0 ? `<span class="d">${esc(x.description)}</span>` : "") +
+      (deep > 1 ? `<span class="id">${esc(x.id)}</span>` + optionsHtml(host, x) : "") +
+    `</div>`).join("") || `<div class="none">nothing matches</div>`;
+}
+
+function catalogHtml(host) {
+  const cat = S.catalogue[host];
+  if (!cat) return "";
+  const problems = (cat.unavailable || []).map(u =>
+    `<div class="unavailable">${esc(u.label)} (${esc(u.id)}): ${esc(u.reason)}</div>`).join("") +
+    cat.problems.map(p =>
+    `<div class="problem">! ${esc(p.id || "(the top)")}: ${esc(p.problem)}</div>`).join("");
+  const names = LEVELS.indexOf(S.level) === 0 ? " names" : "";
+  const rows = KINDS.map(([kind, word]) => {
+    const n = cat.senders.filter(x => kindOf(x) === kind).length;
+    if (!n) return "";
+    const key = esc(host + "|" + kind);
+    const cards = `<div class="cards" data-cards="${key}">${cardsHtml(host, kind)}</div>`;
+    return `<div class="kindrow ${kind}${n > CAROUSEL ? " many" : ""}"><span class="kind">${word}</span>` +
+      (n > CAROUSEL ? `<div class="rail">
+        <button class="step back" data-catscroll="-1" data-host="${key}" aria-label="back">‹</button>
+        ${cards}
+        <button class="step fwd" data-catscroll="1" data-host="${key}" aria-label="on">›</button></div>` : cards) +
+      `</div>`;
+  }).join("");
+  const bar = cat.senders.length > CAROUSEL ? `<div class="catbar"><input class="catfilter" type="search"
+      placeholder="filter ${cat.senders.length} senders" data-catfilter="${esc(host)}"
+      value="${esc(S.catfilter[host] || "")}"></div>` : "";
+  return `<div class="catalog${names}">${bar}${rows}${problems}</div>`;
+}
+document.addEventListener("input", ev => {
+  const t = ev.target; if (!t.dataset || t.dataset.catfilter === undefined) return;
+  const host = t.dataset.catfilter;
+  S.catfilter[host] = t.value;
+  for (const [kind] of KINDS) {
+    const box = document.querySelector(`[data-cards="${CSS.escape(host + "|" + kind)}"]`);
+    if (box) { box.innerHTML = cardsHtml(host, kind); box.scrollLeft = 0; railEnds(box); }
+  }
+});
+/* Each end's step shows only while there is more that way. */
+function railEnds(box) {
+  const rail = box.closest(".rail"); if (!rail) return;
+  rail.classList.toggle("at-start", box.scrollLeft <= 2);
+  rail.classList.toggle("at-end", box.scrollLeft + box.clientWidth >= box.scrollWidth - 2);
+}
+document.addEventListener("scroll", ev => {
+  const t = ev.target; if (t.dataset && t.dataset.cards !== undefined) railEnds(t);
+}, true);
+
+function wallHtml(k) {
+  const w = S.walls[k];
+  return `<article class="wall" id="${id(k)}" data-key="${esc(k)}">
+    <div class="hat" id="${id(k, "hat")}"></div>
+    <div class="body">
+    <div class="screen">
+      <div class="name" id="${id(k, "name")}">${esc(w.device)}:${esc(w.number)}</div>
+      <div class="pic" id="${id(k, "pic")}"></div>
+    </div>
+    <div class="facts" id="${id(k, "facts")}"></div>
+    <div class="controls">
+      <div class="row"><label>base</label><span class="sname" id="${id(k, "basename")}"></span>
+        <span class="dim">font</span><button data-k="${k}" data-font="-1">−</button><input class="num" id="${id(k, "font")}" data-k="${k}" data-num="font" inputmode="numeric">
+        <button data-k="${k}" data-font="1">+</button></div>
+      <div id="${id(k, "layerctl")}"></div>
+      <div class="row" id="${id(k, "picrow")}" style="display:none"><label>picture</label>
+        <div class="seg"><button data-k="${k}" data-capture="1" title="capture now" aria-label="capture">⦿</button>${AUTO.map(([ms, x]) =>
+          `<button data-k="${k}" data-auto="${ms}" id="${id(k, "auto-" + ms)}">${x}</button>`).join("")}<button
+          data-k="${k}" data-expand="1" id="${id(k, "expand")}" title="open large" aria-label="open large">⤢</button><button
+          data-k="${k}" data-forget="1" id="${id(k, "forget")}" title="clear the capture" aria-label="clear the capture">✕</button></div></div>
+      <div class="row" id="${id(k, "mirrorrow")}" style="display:none"><label>live</label>
+        <div class="seg">${MIRRORS.map(([ms, x]) =>
+          `<button data-k="${k}" data-mirror="${ms}" id="${id(k, "mirror-" + ms)}">${x}</button>`).join("")}<button
+          data-k="${k}" data-expand="1" id="${id(k, "mexpand")}" title="open large" aria-label="open large">⤢</button></div></div>
+      <div class="row"><label>screen</label>
+        <div class="seg"><button data-k="${k}" data-blank="1" id="${id(k, "blank-0")}">off</button>
+          <button data-k="${k}" data-blank="0" id="${id(k, "blank-1")}">on</button>
+          <span class="status" id="${id(k, "powerword")}"></span></div></div>
+      <div class="row"><label>measures</label><div class="seg">${RATES.map(([ms, t]) =>
+        `<button data-k="${k}" data-rate="${ms}" id="${id(k, "rate-" + ms)}">${t}</button>`).join("")}</div></div>
+      <div class="row"><label>stats</label>
+        <div class="seg"><button data-k="${k}" data-stats="0" id="${id(k, "stats-0")}">off</button>
+          <button data-k="${k}" data-stats="1" id="${id(k, "stats-1")}">on</button></div>
+        <span class="statsize"><button data-k="${k}" data-ssize="-2">−</button><input class="num" id="${id(k, "ssize")}" data-k="${k}" data-num="ssize" inputmode="numeric">
+        <button data-k="${k}" data-ssize="2">+</button></span></div>
+      <div class="row" id="${id(k, "sopts")}">
+        <label>where</label><div class="compass">${POINTS.map(p =>
+          `<button data-k="${k}" data-at="${p}" id="${id(k, "at-" + p)}" title="${p}" aria-label="${p}"></button>`).join("")}</div></div>
+      <div class="row" id="${id(k, "srow")}" style="align-items:flex-start"><label>show</label>
+        <div class="chips" id="${id(k, "names")}"></div></div>
+      <div class="answer" id="${id(k, "answer")}"></div>
+    </div>
+    <div class="history">
+      <div class="logbar"><span class="n">traffic</span>
+        <input placeholder="filter" id="${id(k, "filter")}" data-filter="${k}" value="${esc(S.filters[k] || "")}">
+        <label><input type="checkbox" id="${id(k, "quiet")}" data-quiet="${k}" ${S.filters[k + "q"] ? "checked" : ""}> ping/pong</label></div>
+      <div class="log" id="${id(k, "log")}"></div>
+    </div>
+    </div>
+  </article>`;
+}
+
+/* What the wall says about its sender, shown in the hat rather than among
+ * the wall's own facts. */
+const HAT_KEYS = ["name", "description", "instance"];
+
+/* A drag's mark on a hat, kept when the hat is drawn again: the wall's
+ * numbers redraw it several times a second, and a finger held still over
+ * it is not reported again to put the mark back. */
+function dropMark(el) {
+  return el.classList.contains("drop-ok") ? " drop-ok" : el.classList.contains("drop-no") ? " drop-no" : "";
+}
+
+/* What a sender's record is having done to it, as it is being done. */
+const DOING = {stop: "stopping", restart: "restarting", move: "moving"};
+
+/* The hat's actions on a sender's record, drawn in the hat's own ink. */
+const ICONS = {
+  stop: `<rect x="2.5" y="2.5" width="7" height="7" rx="1" fill="currentColor"/>`,
+  clear: `<path d="M3 3l6 6M9 3l-6 6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>`,
+  restart: `<path d="M9.6 6.2A3.6 3.6 0 1 1 8.4 3.3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>` +
+           `<path d="M8.9 1.2v2.6H6.3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>`,
+  open: `<path d="M5 2.5H3a.5.5 0 0 0-.5.5v6a.5.5 0 0 0 .5.5h6a.5.5 0 0 0 .5-.5V7" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>` +
+        `<path d="M7 2.5h2.5V5M9.5 2.5 5.5 6.5" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>`,
+  log: `<rect x="2" y="1.5" width="8" height="9" rx="1" fill="none" stroke="currentColor" stroke-width="1.1"/>` +
+       `<path d="M4 4.5h4M4 6.5h4M4 8.5h2.5" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/>`,
+};
+
+/* What a layer says about itself: the base's is the wall's meta, and a
+ * layer above has its own, kept by its session. */
+function metaOf(w, x) {
+  return x.name === w.base ? (w.meta || {}) : ((w.metas || {})[x.name] || {});
+}
+
+/* The record a session was started from, with its id: the one under the
+ * instance `sessions` lists it with, or null. */
+function recordOf(w, x) {
+  return x && x.instance && S.running[x.instance] ? {...S.running[x.instance], id: x.instance} : null;
+}
+
+/* One sender in a hat: its record's controls, what it says it is and
+ * where it sits, and the facts that grow with the detail level. `x` is its
+ * layer as `sessions` lists it, or null while the listing has not come. */
+function hatEntry(w, meta, x, deep, place) {
+  const val = key => (meta[key] || {}).value;
+  const inst = val("instance") || (x && x.instance), rec = inst ? S.running[inst] : null;
+  const name = val("name"), desc = val("description");
+  const op = inst ? S.ops[inst] : null, busy = op && op.state === "busy";
+  const icon = (action, label, glyph, off) =>
+    `<button data-sender-action="${action}" data-id="${esc(inst)}" title="${label}" aria-label="${label}"` +
+    `${off ? " disabled" : ""}><svg viewBox="0 0 12 12" aria-hidden="true">${glyph}</svg></button>`;
+  const ctl = rec ? `<span class="ctl">` +
+    (rec.up ? icon("stop", "stop", ICONS.stop, busy) : icon("stop", "clear", ICONS.clear, busy)) +
+    icon("restart", "restart", ICONS.restart, busy) + icon("log", "log", ICONS.log, false) + `</span>` : "";
+  const opNote = op && (busy || op.state === "failed")
+    ? `<div class="op${op.state === "failed" ? " bad" : ""}" title="${esc(op.text || "")}">${busy ? DOING[op.action] + "…"
+      : op.action + " failed" + (op.text ? ": " + esc(op.text.split("\n")[0]) : "")}</div>` : "";
+  const pair = (n, v) => `<div class="pair"><span class="n" data-what="${n}">${n}</span>` +
+                          `<span>${esc(v)}</span></div>`;
+  const who = `<div class="who"${rec ? ` draggable="${S.controls === "off" ? "false" : "true"}" data-inst="${esc(inst)}"` +
+              ` title="drag to another wall to move it"` : ""}><span class="name">${esc(name || (x && x.name) || "a sender with no name")}` +
+              (place ? ` <span class="place">${esc(place)}</span>` : "") + `</span>${ctl}</div>`;
+  const rest = opNote ? [opNote] : [];
+  if (desc) rest.push(`<div class="desc">${esc(desc)}</div>`);
+  if (deep > 0) {
+    if (rec) {
+      rest.push(pair("source", `${rec.sender} on ${rec.host}`));
+      const opts = Object.entries(rec.options || {}).map(([o, v]) => v === true ? o : `${o} ${v}`);
+      if (opts.length) rest.push(pair("options", opts.join(", ")));
+      rest.push(pair("state", (rec.up ? "up" : "dead") + (rec.since ? `, started ${ago(rec.since)}` : "")));
+    } else if (inst) {
+      rest.push(pair("source", "no record of it on any sender host"));
+    } else {
+      rest.push(pair("source", "started by hand"));
+    }
+  }
+  if (deep > 1) {
+    const session = x ? x.name : w.base;
+    if (inst) rest.push(pair("instance", inst));
+    if (rec) { rest.push(pair("pid", rec.pid)); rest.push(pair("log", rec.log || "–")); }
+    if (session) rest.push(pair("session", session));
+    const bm = (w.smeasures || {})[session];
+    if (bm) rest.push(pair("quiet", `${bm.quiet}s since its last byte`));
+  }
+  return {rec, who, rest};
+}
+
+/* The senders on a wall, top layer first down to the base: what each says
+ * about itself, and, when a controller started it, its record on the host
+ * it runs on, joined by the instance id the wall carries. One sender has
+ * the hat to itself; more are stacked in it, each with its place. */
+function hat(k, deep) {
+  const w = S.walls[k], base = w.meta || {};
+  const el = document.getElementById(id(k, "hat"));
+  // A drag whose source is taken out from under it is ended by the
+  // browser, and the hat is drawn several times a second.
+  if (dragging && dragging.inst && el.querySelector(`[data-inst="${CSS.escape(dragging.inst)}"]`)) return;
+  const wop = S.wallops[k];
+  const dropNote = wop && wop.state === "busy" ? `<span class="op">starting ${esc(wop.sender)}…</span>`
+    : wop && wop.state === "failed" ? `<span class="op bad">${esc(wop.text.split("\n")[0])}</span>` : "";
+  const note = dropNote ? `<div class="note">${dropNote}</div>` : "";
+  let layers = layersOf(w);
+  if (!layers.length && HAT_KEYS.some(key => base[key])) layers = [null];
+  if (!layers.length) {
+    el.className = "hat none" + dropMark(el); el.innerHTML = dropNote || "no sender"; alignHats(); return;
+  }
+  /* Layers saying one instance are one sender's -- a base and the camera
+   * it put over it, say -- and get one entry: the lowest of them as the
+   * sender, its controls, record and words, and the rest listed in it.
+   * A layer with no instance is nobody's but its own. */
+  const instOf = x => x ? ((metaOf(w, x).instance || {}).value || x.instance)
+    : (base.instance || {}).value;
+  const groups = [], byInst = {};
+  for (const x of layers) {
+    const inst = instOf(x);
+    if (inst && byInst[inst]) byInst[inst].push(x);
+    else { const g = [x]; groups.push(g); if (inst) byInst[inst] = g; }
+  }
+  const entries = groups.map(g => {
+    const x = g[g.length - 1];                         // top first: the lowest is last
+    const e = hatEntry(w, x ? metaOf(w, x) : base, x, deep,
+      x && (groups.length > 1 || x.z !== "0" || g.length > 1) ? described(w, x).place : "");
+    if (g.length > 1) {
+      const also = g.slice(0, -1).map(y => {
+        const name = (metaOf(w, y).name || {}).value;
+        return `${described(w, y).place} ${y.type}` + (name ? ` · ${name}` : "");
+      });
+      e.rest.splice(e.rest.findIndex(r => r.includes('class="desc"')) + 1, 0,
+        `<div class="pair"><span class="n" data-what="also">also</span>` +
+        `<span>${esc(also.join(", "))}</span></div>`);
+    }
+    return e;
+  });
+  if (entries.length === 1) {
+    const [e] = entries, rows = [note + e.who, ...e.rest];
+    el.className = "hat" + (e.rec && e.rec.up === false ? " dead" : "") + dropMark(el);
+    el.classList.toggle("one", rows.length === 1);
+    el.innerHTML = rows.join("");
+  } else {
+    el.className = "hat many" + dropMark(el);
+    el.innerHTML = note + entries.map(e =>
+      `<div class="sender${e.rec && e.rec.up === false ? " dead" : ""}">${e.who}${e.rest.join("")}</div>`).join("");
+  }
+  alignHats();
+  adrift();
+}
+
+/* A link to a wall's glass for whoever is looking at this page, from the
+ * ports, addresses and path its report says it is reached on: its HTTPS
+ * name where it has one and the page is seen over the tailnet, since a
+ * browser decodes a film only on a secure page; else the address the page
+ * itself was reached on where the receiver is on this machine and takes
+ * it, else one on the same network as the page's -- the tailnet's
+ * 100.64/10 or not -- marked unsure where none is. */
+function reachLink(w) {
+  const here = location.hostname;
+  const loop = a => ["127.0.0.1", "::1", "localhost", "[::1]"].includes(a);
+  const tailnet = a => /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(a) || /\.ts\.net$/.test(a);
+  const local = ["localhost", "127.0.0.1", "::1"].includes(w.host);
+  const tls = (w.reach || {}).https;
+  if (tls && tls.name && tls.port && (tailnet(here) || (!local && loop(here))))
+    return {url: `https://${tls.name}:${tls.port}${tls.path || "/"}`, sure: true};
+  const r = (w.reach || {}).http;
+  if (!r || !r.port) return null;
+  const bound = (r.bound || "").split(",").filter(Boolean);
+  let host, sure = true;
+  if (bound.includes("*")) { host = local ? here : w.host; sure = local || !tailnet(here); }
+  else if (local && bound.includes(here)) host = here;
+  else if (local && loop(here)) host = bound.find(loop) || bound[0];
+  else {
+    const fit = bound.find(a => !loop(a) && tailnet(a) === tailnet(here));
+    host = fit || bound[0]; sure = !!fit;
+  }
+  if (!host) return null;
+  if (host.includes(":") && !host.startsWith("[")) host = `[${host}]`;
+  return {url: `http://${host}:${r.port}${r.path || "/"}`, sure};
+}
+
+/* A wall as a record names it, `host:wall`, as the page names it. */
+function wallName(wall) {
+  const [host, n] = [wall.slice(0, wall.lastIndexOf(":")), wall.slice(wall.lastIndexOf(":") + 1)];
+  const d = S.devices.find(y => y.host === host);
+  return d ? `${d.name}:${n}` : wall;
+}
+
+/* The records no wall shows, by their instance, each under the device
+ * that is its host: a dead sender whose wall has since shown something
+ * else or nothing has nowhere else to be seen. Each can be dragged onto a
+ * wall, as a running one can. */
+function adrift() {
+  const shown = new Set(Object.values(S.walls).flatMap(w => [((w.meta || {}).instance || {}).value,
+    ...Object.values(w.metas || {}).map(m => (m.instance || {}).value),
+    ...(w.sessions || []).map(x => x.instance)]).filter(Boolean));
+  const lost = Object.entries(S.running).filter(([iid]) => !shown.has(iid));
+  for (const d of S.devices) {
+    const el = document.getElementById("adrift-" + d.name); if (!el) continue;
+    if (dragging && dragging.inst && el.querySelector(`[data-inst="${CSS.escape(dragging.inst)}"]`)) continue;
+    const mine = lost.filter(([, rec]) => rec.host === d.host);
+    const deep = LEVELS.indexOf(S.level);
+    const html = !mine.length ? "" : `<span class="kind">no wall</span><div class="hats">` + mine.map(([iid, rec]) => {
+      /* What it is, from its catalogue entry, since no wall is saying. */
+      const x = ((S.catalogue[rec.host] || {}).senders || []).find(y => y.id === rec.sender);
+      const meta = {name: {value: x ? x.label : rec.sender.split("/").pop()}, instance: {value: iid}};
+      if (x && x.description) meta.description = {value: x.description};
+      const e = hatEntry({smeasures: {}}, meta, null, deep, "last on " + wallName(rec.wall));
+      const rows = [e.who, ...e.rest];
+      return `<div class="hat${rec.up ? "" : " dead"}${rows.length === 1 ? " one" : ""}">${rows.join("")}</div>`;
+    }).join("") + `</div>`;
+    /* Made again only when it says something new: this runs on every
+     * update, and a button replaced between press and release is a click
+     * that never lands. */
+    if (el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html; }
+  }
+}
+
+/* Every hat as tall as the tallest, its words at the bottom against the
+ * display, so the displays all start on one line however much each hat
+ * says. Once a frame, however many walls changed in it. */
+let aligning = false;
+function alignHats() {
+  if (aligning) return;
+  aligning = true;
+  requestAnimationFrame(() => {
+    aligning = false;
+    const hats = [...document.querySelectorAll(".wall > .hat")];
+    for (const h of hats) h.style.minHeight = "";
+    const tallest = Math.max(0, ...hats.map(h => h.offsetHeight));
+    for (const h of hats) h.style.minHeight = tallest + "px";
+  });
+}
+window.addEventListener("resize", alignHats);
+window.addEventListener("resize", () => document.querySelectorAll("[data-cards]").forEach(railEnds));
+
+function update(k) {
+  const w = S.walls[k]; if (!w || !document.getElementById(id(k))) return;
+  const meta = w.meta || {};
+  const named = (meta.name || {}).value;
+  document.getElementById(id(k, "name")).textContent = named || `${w.device}:${w.number}`;
+  const st = w.status.split(":")[0];
+  const m = w.measures || {};
+  showNum(k, "font", w.font);
+  const canPic = !!w.capture;
+  document.getElementById(id(k, "picrow")).style.display = canPic ? "" : "none";
+  const auto = S.auto[k] || 0;
+  for (const [ms] of AUTO) document.getElementById(id(k, "auto-" + ms)).classList.toggle("on", auto === ms);
+  document.getElementById(id(k, "expand")).disabled = !PICS[k];
+  document.getElementById(id(k, "forget")).disabled = !PICS[k];
+  const canMirror = (w.caps || []).includes("mirror");
+  document.getElementById(id(k, "mirrorrow")).style.display = canMirror ? "" : "none";
+  for (const [ms] of MIRRORS)
+    document.getElementById(id(k, "mirror-" + ms)).classList.toggle("on", (w.mirror || 0) === ms);
+  document.getElementById(id(k, "mexpand")).disabled = !PICS[k];
+
+  if (modalKey === k) document.getElementById("modal-age").textContent = !PICS[k] ? ""
+    : w.mirror && PICS[k].head.mirror ? `live, every ${w.mirror} ms` : "captured " + ago(PICS[k].head.t)
+      + ((PICS[k].head.without || []).length ? ", cells only: video layers left out" : "");
+  const display = w.display || (m.display && m.display !== "-" ? m.display : null);
+  const power = w.power || (m.power && m.power !== "-" ? m.power : null);
+  const lit = display === "lit";
+  const name = n => `<span class="n" data-what="${n}"` +
+    `>${n}</span>`;
+  const pair = (n, v) => `<div class="pair">${name(n)}<span>${esc(v)}</span></div>`;
+  /* How much of a wall to say: which wall it is, then how it is working,
+   * then everything, which is what you want when something is wrong. Each
+   * level adds to the end of the one before, so turning the detail up
+   * leaves what was there where it was. */
+  const deep = LEVELS.indexOf(S.level);
+  hat(k, deep);
+  sessionControls(k);
+  const wall = [];
+  /* The wall: its glass, its screen, who is there, and the connection. */
+  wall.push(pair("wall", `${w.device}:${w.number}`));
+  wall.push(pair("display", display || "–"));
+  if (w.watching !== null && w.watching !== undefined) wall.push(pair("watching", String(w.watching)));
+  if (power) wall.push(pair("power", power));
+  if (st !== "open")
+    wall.push(`<div class="pair">${name("session")}<span class="${st}"><i></i>${esc(w.status)}</span></div>`);
+  if (deep > 0) {
+    const pr = w.presence;
+    if (pr && (pr.name || pr.from))
+      wall.push(pair("presence", (pr.here ? "somebody" : "nobody") + (pr.name ? ` · ${pr.name}` : "")
+                     + (deep > 1 && pr.from ? ` · from ${pr.from}` : "")));
+    const screen = [m.connector && m.connector !== "-" ? m.connector : "", w.pixels || ""].filter(Boolean);
+    if (screen.length) wall.push(pair("screen", screen.join(" · ")));
+  }
+  /* The program keeping the wall: at every level where it is not the
+   * source this page has, which is what needs doing something about. */
+  const rc = w.receiver;
+  if (rc) {
+    const want = (S.versions || {})[rc.program], off = !!want && rc.version !== want;
+    if (deep > 0 || off)
+      wall.push(`<div class="pair">${name("receiver")}<span class="${off ? "off" : ""}">` +
+                `${esc(rc.program + " " + (rc.version || "-"))}${off ? " · not the source here" : ""}</span></div>`);
+    if (deep > 1) {
+      if (rc.started) wall.push(pair("started", ago(+rc.started)));
+      if (rc.booted) wall.push(pair("booted", ago(+rc.booted)));
+    }
+  }
+  if (deep > 1) {
+    if (m.atlas) wall.push(pair("atlas", `${m.atlas}/${m.atlas_of}`
+      + (+m.restarts ? `, ${m.restarts} restarts` : "")));
+    wall.push(`<div class="wide">${name("caps")}<span>${esc((w.caps || []).join(" "))}</span></div>`);
+  }
+  /* The wall, its facts and then its numbers; then its sessions, each with
+   * its own facts and numbers in the same shape. */
+  /* A web wall is removed from its own heading, with the hat's stop. */
+  const dev = S.devices.find(d => d.name === w.device);
+  const remove = dev && (dev.webwalls || []).includes(k)
+    ? `<button class="wctl min" data-remove="1" data-k="${esc(k)}" title="remove this web wall"` +
+      ` aria-label="remove this web wall"><svg viewBox="0 0 12 12" aria-hidden="true">${ICONS.stop}</svg></button>` : "";
+  /* And where it says its glass is reached, opened from here. */
+  const link = reachLink(w);
+  const open = link ? `<a class="wctl${link.sure ? "" : " doubt"}" href="${esc(link.url)}" target="_blank" rel="noopener"` +
+    ` title="${esc(link.sure ? "open this wall's glass: " + link.url : link.url + " -- may not be reachable from here")}"` +
+    ` aria-label="open this wall's glass"><svg viewBox="0 0 12 12" aria-hidden="true">${ICONS.open}</svg></a>` : "";
+  let html = `<div class="sect"><div class="sh wallh"><span class="n" data-what="wall">wall</span>` +
+             `<span class="wctls">${open}${remove}</span></div><div class="grp">${wall.join("")}</div>` +
+             `<div class="strip" id="${id(k, "strip")}"></div></div>`;
+  html += sessionsHtml(k, deep, meta);
+  document.getElementById(id(k, "facts")).innerHTML = html;
+
+  document.getElementById(id(k, "blank-1")).classList.toggle("on", lit);
+  document.getElementById(id(k, "blank-0")).classList.toggle("on", display === "blank");
+  document.getElementById(id(k, "powerword")).textContent =
+    (display || "–") + (power === "standby" ? " · standby" : "");
+  const s = w.stats || {};
+  document.getElementById(id(k, "stats-1")).classList.toggle("on", !!s.on);
+  document.getElementById(id(k, "stats-0")).classList.toggle("on", !s.on);
+  for (const part of ["sopts", "srow"])
+    document.getElementById(id(k, part)).classList.toggle("dimmed", !s.on);
+  document.getElementById(id(k, "ssize")).parentElement.classList.toggle("dimmed", !s.on);
+  showNum(k, "ssize", s.size);
+  for (const p of POINTS) document.getElementById(id(k, "at-" + p)).classList.toggle("on", s.at === p);
+  const shown = (s.show || "").split(",");
+  const names = w.names || [];
+  const chips = document.getElementById(id(k, "names"));
+  if (chips.dataset.names !== names.join(",")) {
+    chips.dataset.names = names.join(",");
+    chips.innerHTML = (names.length ? `<button data-k="${esc(k)}" data-show="all">all</button>` : "") +
+      names.map(n => `<button data-k="${esc(k)}" data-name="${esc(n)}">${esc(n)}</button>`).join("");
+  }
+  for (const b of chips.querySelectorAll("[data-name]")) b.classList.toggle("on", shown.includes(b.dataset.name));
+  const fmt = (n, v) => v === "-" || v === undefined ? "–" : ["in", "out", "inbox"].includes(n) ? bytes(+v) + (n === "inbox" ? "" : "/s")
+    : ["frame", "draw", "swap", "pong"].includes(n) ? v + "ms" : ["cpu", "gpu"].includes(n) ? v + "%"
+    : n === "temp" ? v + "°" : n === "atlas" ? v + "/" + m.atlas_of : v;
+  const live = w.live !== false;
+  for (const [ms] of RATES)
+    document.getElementById(id(k, "rate-" + ms)).classList.toggle("on",
+      ms ? live && w.every === ms : !live);
+  const strip = document.getElementById(id(k, "strip"));
+  strip.classList.toggle("on", live && !!w.measured);
+  if (live && w.measured)
+    /* Only what the wall says it has: one that cannot know a number
+     * leaves it out of its line, and is not shown a dash for it. */
+    strip.innerHTML = STRIP.filter(n => n in m).map(n => {
+      /* A window with no frames in it has nothing to say, which at a fast
+       * rate is most of them on a slow wall. What it last said is worth
+       * more than a dash, so it is kept, and dimmed to say it is old. */
+      const fresh = m[n] !== undefined && m[n] !== "-";
+      const held = fresh ? m[n] : (HELD[k] || {})[n];
+      if (fresh) (HELD[k] = HELD[k] || {})[n] = m[n];
+      return `<div><span class="n" data-what="${n}"` +
+        `>${n}</span>` +
+        `<span class="v${fresh ? "" : " stale"}">${esc(held === undefined ? "–" : fmt(n, held))}</span>` +
+        `<span>${spark(k, n)}</span></div>`;
+    }).join("");
+}
+
+/* A number being changed: shown as it is clicked or typed, and sent once,
+ * when the clicking stops or Enter is pressed, so the wall is not redrawn
+ * at every size on the way to the one wanted. */
+const PENDING = {}, LIMITS = {font: [4, 400], ssize: [8, 40]};
+function showNum(k, what, value) {
+  const el = document.getElementById(id(k, what)); if (!el) return;
+  const p = PENDING[k + what];
+  el.classList.toggle("pending", !!p);
+  if (p) { if (document.activeElement !== el) el.value = p.value; }
+  else if (document.activeElement !== el) el.value = value ?? "";
+}
+function nudge(k, what, value, wait) {
+  const [lo, hi] = LIMITS[what];
+  value = Math.max(lo, Math.min(hi, Math.round(value)));
+  const p = PENDING[k + what] || (PENDING[k + what] = {});
+  p.value = value;
+  clearTimeout(p.timer);
+  p.timer = setTimeout(() => {
+    delete PENDING[k + what];
+    send(k, what === "font" ? "font " + value : "stats 1 size=" + value);
+    update(k);
+  }, wait);
+  showNum(k, what);
+}
+function current(k, what) {
+  const p = PENDING[k + what], w = S.walls[k];
+  return p ? p.value : what === "font" ? (+w.font || 14) : (+(w.stats || {}).size || 14);
+}
+
+/* A picture: a two-byte length, a JSON header, and the glass as QOI, or a
+ * wall with no glass as its cells. A mirror's frame is a whole picture
+ * too, so each replaces the last. */
+function gotPicture(buf) {
+  const view = new DataView(buf), n = view.getUint16(0);
+  const head = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 2, n)));
+  const body = new Uint8Array(buf, 2 + n);
+  if (head.format === "grid") {
+    document.fonts.load(`${GRID_FONT}px ${GRID_FAMILY}`).then(() => showPicture(head, gridImage(head, body)));
+    return;
+  }
+  showPicture(head, qoiDecode(body));
+}
+function showPicture(head, image) {
+  if (!image) return;
+  PICS[head.key] = {head, image};
+  paintPic(head.key);
+  if (modalKey === head.key) paintInto(document.getElementById("modal-pic"), head.key, true);
+  update(head.key);
+}
+
+/* A wall's cells as a picture, drawn as the web receiver draws a cells
+ * layer (PROTOCOL.md, *Layers and types*): each layer's repaint through
+ * its parser into a grid, the base first and each layer over it, a cell
+ * left in the default colours transparent, over the wall's black. The
+ * base reads no alpha. The cells are sized so the base's grid is
+ * GRID_WIDTH pixels across, and a layer with a grid of its own is fitted
+ * to the same box, centred. */
+const GRID_WIDTH = 1600, GRID_FONT = 100;
+const GRID_FAMILY = '"bitwall wall", "MesloLGS Nerd Font Mono", Menlo, ui-monospace, monospace';
+function gridImage(head, body) {
+  const B = window.Bitwall, Screen = customElements.get("bitwall-screen");
+  if (!B || !Screen || !head.layers || !head.layers.length) return null;
+  const c = document.createElement("canvas"), ctx = c.getContext("2d");
+  ctx.font = `${GRID_FONT}px ${GRID_FAMILY}`;
+  const m = ctx.measureText("MMMMMMMMMM");
+  const cw0 = m.width / 10 || GRID_FONT * 0.6;
+  const asc = m.fontBoundingBoxAscent || GRID_FONT * 0.94, desc = m.fontBoundingBoxDescent || GRID_FONT * 0.24;
+  const ch0 = asc + desc;
+  const base = head.layers.find(L => L.z === "0") || head.layers[0];
+  const W = GRID_WIDTH, H = Math.max(1, Math.round(W * base.rows * ch0 / (base.cols * cw0)));
+  c.width = W; c.height = H;
+  ctx.fillStyle = "#000000"; ctx.fillRect(0, 0, W, H);
+  ctx.textBaseline = "alphabetic";
+  const P = Screen.prototype;
+  let at = 0;
+  for (const L of head.layers) {
+    const g = new B.Grid(L.cols, L.rows), p = new B.Parser(g);
+    p.layer = L.z !== "0";
+    p.feed(body.subarray(at, at + L.bytes));
+    at += L.bytes;
+    if (!p.layer) { g.fa.fill(255); g.ba.fill(255); }
+    const fit = Math.min(W / (L.cols * cw0), H / (L.rows * ch0));
+    const cw = cw0 * fit, ch = ch0 * fit, fontPx = GRID_FONT * fit;
+    const ox = (W - L.cols * cw) / 2, oy = (H - L.rows * ch) / 2;
+    const d = {ctx, fontPx, baseline: asc * fit, dpr: 1, layerRow: P.layerRow, geometry: P.geometry,
+               snapped: P.snapped, styled: P.styled, decorate: P.decorate, doubled: P.doubled};
+    for (let y = 0; y < L.rows; y++) d.layerRow(g, y, ox, oy + y * ch, cw, ch);
+  }
+  return ctx.getImageData(0, 0, W, H);
+}
+
+/* A QOI image as ImageData, or null if it is not one. */
+function qoiDecode(b) {
+  if (b.length < 22 || b[0] !== 0x71 || b[1] !== 0x6f || b[2] !== 0x69 || b[3] !== 0x66) return null;
+  const w = (b[4] << 24 | b[5] << 16 | b[6] << 8 | b[7]) >>> 0;
+  const h = (b[8] << 24 | b[9] << 16 | b[10] << 8 | b[11]) >>> 0;
+  if (!w || !h || w * h > 1 << 26) return null;
+  const px = new Uint8ClampedArray(w * h * 4), index = new Uint8Array(256);
+  let r = 0, g = 0, bl = 0, a = 255, p = 14, run = 0;
+  const end = b.length - 8;
+  for (let o = 0; o < px.length; o += 4) {
+    if (run > 0) run--;
+    else if (p < end) {
+      const c = b[p++];
+      if (c === 0xfe) { r = b[p++]; g = b[p++]; bl = b[p++]; }
+      else if (c === 0xff) { r = b[p++]; g = b[p++]; bl = b[p++]; a = b[p++]; }
+      else if ((c & 0xc0) === 0x00) { const i = c * 4; r = index[i]; g = index[i + 1]; bl = index[i + 2]; a = index[i + 3]; }
+      else if ((c & 0xc0) === 0x40) { r = (r + ((c >> 4) & 3) - 2) & 255; g = (g + ((c >> 2) & 3) - 2) & 255; bl = (bl + (c & 3) - 2) & 255; }
+      else if ((c & 0xc0) === 0x80) {
+        const c2 = b[p++], dg = (c & 0x3f) - 32;
+        r = (r + dg - 8 + ((c2 >> 4) & 0x0f)) & 255; g = (g + dg) & 255; bl = (bl + dg - 8 + (c2 & 0x0f)) & 255;
+      } else run = c & 0x3f;
+      const i = ((r * 3 + g * 5 + bl * 7 + a * 11) % 64) * 4;
+      index[i] = r; index[i + 1] = g; index[i + 2] = bl; index[i + 3] = a;
+    }
+    px[o] = r; px[o + 1] = g; px[o + 2] = bl; px[o + 3] = a;
+  }
+  return new ImageData(px, w, h);
+}
+
+/* Paint the glass into `box` on a canvas of its own pixels, scaled to fit
+ * the box with its shape kept; the modal is made as large as the window
+ * allows in the glass's shape. */
+function paintInto(box, k, large) {
+  const p = PICS[k]; if (!box || !p) return;
+  const w = p.image.width, h = p.image.height;
+  if (large) {
+    const maxW = window.innerWidth * 0.94 - 20, maxH = window.innerHeight * 0.86 - 60;
+    let bw = maxW, bh = bw * h / w;
+    if (bh > maxH) { bh = maxH; bw = bh * w / h; }
+    box.style.width = Math.round(bw) + "px"; box.style.height = Math.round(bh) + "px";
+  }
+  let el = box.querySelector("canvas");
+  if (!el) { el = document.createElement("canvas"); box.appendChild(el); }
+  if (el.width !== w || el.height !== h) { el.width = w; el.height = h; }
+  el.getContext("2d").putImageData(p.image, 0, 0);
+  const bw = box.clientWidth, bh = box.clientHeight, pad = large ? 0 : 8;
+  const fit = Math.min((bw - 2 * pad) / w, (bh - 2 * pad) / h);
+  el.style.width = Math.round(w * fit) + "px"; el.style.height = Math.round(h * fit) + "px";
+  el.style.left = Math.round((bw - w * fit) / 2) + "px"; el.style.top = Math.round((bh - h * fit) / 2) + "px";
+}
+function mirror(k, ms) { if (ws && ws.readyState === 1) ws.send(JSON.stringify({type: "mirror", key: k, ms})); }
+function paintPic(k) {
+  const scr = document.getElementById(id(k, "pic")); if (!scr) return;
+  scr.parentElement.classList.toggle("has-pic", !!PICS[k]);
+  paintInto(scr, k, false);
+}
+function capture(k) { if (ws && ws.readyState === 1) ws.send(JSON.stringify({type: "picture", key: k})); }
+function openModal(k) {
+  if (!PICS[k]) return;
+  modalKey = k;
+  document.getElementById("modal-title").textContent = k;
+  document.getElementById("modal").classList.add("open");
+  paintInto(document.getElementById("modal-pic"), k, true);
+  update(k);
+}
+/* Dragging a catalogue card, or a sender already running, onto a hat.
+ * Each carries a type of its own, so a hat can tell them from a link or a
+ * file before anything is dropped. */
+const CARD = "application/x-bitwall-sender";
+const RUNNING = "application/x-bitwall-running";
+/* Which card is being dragged, since a drag's data cannot be read until it
+ * is dropped. A sender runs on its own host's walls, and on those of any
+ * device its host can reach; one on this machine runs on any. A layer
+ * goes only on a wall that takes layers above its base. */
+let dragging = null;
+function fits(card, hat) {
+  if (!card) return false;
+  const w = S.walls[hat.closest(".wall").dataset.key];
+  if (card.place !== "base" && w && places(w) < 2) return false;
+  if (card.inst && w && holds(w, card.inst)) return false;
+  return ["localhost", "127.0.0.1", "::1"].includes(card.host) || (w && (w.host === card.host
+    || (S.reach[card.host] || []).includes(w.host)));
+}
+/* How many places a wall has, the base among them, as its `caps` says
+ * with `layers=`; a wall that has not said is taken at its word later. */
+function places(w) {
+  const said = (w.caps || []).find(c => c.startsWith("layers="));
+  return said ? +said.slice(7) || 1 : Infinity;
+}
+/* Whether a wall holds a sender, by its instance. */
+function holds(w, inst) {
+  return ((w.meta || {}).instance || {}).value === inst || (w.sessions || []).some(x => x.instance === inst);
+}
+document.addEventListener("dragstart", ev => {
+  const r = ev.target.closest && ev.target.closest("[data-inst]");
+  const rec = r && S.running[r.dataset.inst];
+  if (rec) {
+    dragging = {host: rec.host, place: rec.place || "base", inst: r.dataset.inst};
+    ev.dataTransfer.setData(RUNNING, r.dataset.inst);
+    ev.dataTransfer.effectAllowed = "move";
+    return;
+  }
+  const c = ev.target.closest && ev.target.closest(".catalog .card");
+  if (!c) return;
+  const x = ((S.catalogue[c.dataset.host] || {}).senders || []).find(y => y.id === c.dataset.sender);
+  dragging = {host: c.dataset.host, place: x && x.place || "base"};
+  ev.dataTransfer.setData(CARD, JSON.stringify({host: c.dataset.host, sender: c.dataset.sender,
+                                                label: c.dataset.label,
+                                                options: x ? cardValues(c.dataset.host, x) : {}}));
+  ev.dataTransfer.effectAllowed = "copy";
+});
+/* Where a card may land: a wall's hat or its display. The green goes on
+ * the hat. */
+function hatUnder(ev) {
+  const t = ev.target.closest && ev.target.closest(".wall > .hat, .wall .screen");
+  return t ? t.closest(".wall").querySelector(":scope > .hat") : null;
+}
+function clearDrop() { document.querySelectorAll(".hat.drop-ok, .hat.drop-no")
+  .forEach(h => h.classList.remove("drop-ok", "drop-no")); }
+/* A drag says it is over something many times a second, and says it has
+ * left whenever it crosses from one of the hat's own lines to the next,
+ * which is no leaving at all; and a finger held still is not reported at
+ * all. So the mark follows only what the drag is over, and goes when it
+ * is over something else or the drag ends -- never on a leave, or on a
+ * pause. */
+function overHat(ev) {
+  const h = hatUnder(ev);
+  if (!h) { clearDrop(); return; }
+  const types = [...ev.dataTransfer.types];
+  const ok = (types.includes(CARD) || types.includes(RUNNING)) && fits(dragging, h);
+  // Safari takes a drop only where both entering and being over were
+  // accepted, so both come here.
+  if (ok) { ev.preventDefault(); ev.dataTransfer.dropEffect = types.includes(RUNNING) ? "move" : "copy"; }
+  else ev.dataTransfer.dropEffect = "none";
+  if (!h.classList.contains(ok ? "drop-ok" : "drop-no")) {
+    clearDrop();
+    h.classList.add(ok ? "drop-ok" : "drop-no");
+  }
+}
+document.addEventListener("dragenter", overHat);
+document.addEventListener("dragover", overHat);
+document.addEventListener("dragend", () => { dragging = null; clearDrop();
+  for (const k of Object.keys(S.walls)) update(k); adrift(); });
+document.addEventListener("drop", ev => {
+  const h = hatUnder(ev);
+  clearDrop();
+  const types = h ? [...ev.dataTransfer.types] : [];
+  if (types.includes(RUNNING)) {
+    ev.preventDefault();
+    const inst = ev.dataTransfer.getData(RUNNING);
+    if (fits(dragging, h)) moveTo(h.closest(".wall").dataset.key, inst);
+    return;
+  }
+  if (!types.includes(CARD)) return;
+  ev.preventDefault();
+  let card; try { card = JSON.parse(ev.dataTransfer.getData(CARD)); } catch (e) { return; }
+  startOn(h.closest(".wall").dataset.key, card);
+});
+/* Start a catalogue sender on a wall, at the place its entry gives: a
+ * layer goes straight on, and a base onto a held base asks first whether
+ * to replace what is there. */
+function startOn(k, card) {
+  const w = S.walls[k], meta = w.meta || {};
+  const x = ((S.catalogue[card.host] || {}).senders || []).find(y => y.id === card.sender);
+  if ((x && x.place || "base") !== "base" || !w.base) return dropOn(k, card, false);
+  const inst = (meta.instance || {}).value, name = (meta.name || {}).value || w.base;
+  pending = {k, card, inst: true};
+  ask(`Replace ${name} on ${w.device}:${w.number} with ${card.label}? ${name} will ` +
+      (inst && S.running[inst] ? "stop." : "be displaced: it was started by hand."), "replace");
+}
+
+/* Move a running sender to a wall: a layer goes straight on, and a base
+ * onto a held base asks first whether to replace what is there. */
+function moveTo(k, inst) {
+  const w = S.walls[k], meta = w.meta || {}, rec = S.running[inst];
+  if (!rec) return;
+  if ((rec.place || "base") !== "base" || !w.base) return moveOn(k, inst, false);
+  const held = (meta.instance || {}).value, name = (meta.name || {}).value || w.base;
+  pending = {k, move: inst};
+  ask(`Move ${rec.sender.split("/").pop()} to ${w.device}:${w.number}, replacing ${name}? ${name} will ` +
+      (held && S.running[held] ? "stop." : "be displaced: it was started by hand."), "replace");
+}
+function moveOn(k, inst, replace) {
+  const rec = S.running[inst];
+  S.ops[inst] = {id: inst, action: "move", state: "busy"};
+  S.wallops[k] = {state: "busy", sender: rec ? rec.sender : inst};
+  for (const key of Object.keys(S.walls)) update(key); adrift();
+  request({type: "move", id: inst, key: k, replace}, why => {
+    S.ops[inst] = {id: inst, action: "move", state: "failed", text: why};
+    S.wallops[k] = {state: "failed", sender: rec ? rec.sender : inst, text: why};
+    for (const key of Object.keys(S.walls)) update(key); adrift();
+  });
+}
+
+/* The wall's layers from its `sessions`, top first, each with its place,
+ * what it is, its record's instance, its numbers and its stop; the
+ * controllers folded to one line. A layer with a record is stopped
+ * through it; one started by hand has none to stop it through. */
+/* A layer's place and what it is: its record's sender where a controller
+ * started it, else the base's name or the session's own. */
+function described(w, x) {
+  const rec = recordOf(w, x);
+  const place = x.z === "0" ? "base 0" : `layer ${x.z}`;
+  const what = rec ? rec.sender.split("/").pop()
+    : x.z === "0" && ((w.meta || {}).name || {}).value || x.name;
+  return {rec, place, what};
+}
+function layersOf(w) {
+  return (w.sessions || []).filter(x => x.role === "layer").sort((a, b) => +b.z - +a.z);
+}
+/* What a session is measured by, in the order they are shown. */
+const SSTRIP = ["fps", "in", "out", "dropped", "queue", "quiet", "pong", "decode"];
+function sfmt(n, v) {
+  return ["in", "out"].includes(n) ? bytes(+v) + "/s" : n === "queue" ? bytes(+v)
+    : ["pong", "decode"].includes(n) ? v + "ms" : n === "quiet" ? v + "s"
+    : n === "fps" ? (+v).toFixed(1) : v;
+}
+/* A session's numbers as the wall's are shown: name, number, trace; at
+ * `min` only how fast it is going. */
+const SSTRIP_MIN = ["fps", "decode"];
+function sessionStrip(k, x, m, deep) {
+  const rows = (deep > 0 ? SSTRIP : SSTRIP_MIN).filter(n => m[n] !== undefined && m[n] !== "-").map(n =>
+    `<div><span class="n" data-what="s-${n}">${n}</span><span class="v">${esc(sfmt(n, m[n]))}</span>` +
+    `<span>${spark(k, n + ":" + x.name)}</span></div>`);
+  return rows.length ? `<div class="strip on">${rows.join("")}</div>` : "";
+}
+/* The wall's sessions: each layer, top first, then each controller, at
+ * every level as the wall is, with more as the level rises: at `min` each
+ * heading and how fast it goes; at `more` its place, type, the base's grid
+ * and what its sender says, and all its numbers; at `all` its name,
+ * instance and pid, and how this page's own connection is doing. */
+function sessionsHtml(k, deep, meta) {
+  const w = S.walls[k], sm = w.smeasures || {}, all = w.sessions || [];
+  const kv = (n, v) => `<div class="pair"><span class="n" data-what="${WHAT["s-" + n] ? "s-" + n : esc(n)}">` +
+    `${esc(n)}</span><span>${esc(v)}</span></div>`;
+  const one = (title, kind, pairs, strip) =>
+    `<div class="sect"><div class="sh"><span class="n" data-what="s-head">session</span> ${esc(title)}` +
+    ` <span class="kind">${esc(kind)}</span></div>` +
+    `${pairs.length ? `<div class="grp">${pairs.join("")}</div>` : ""}${strip}</div>`;
+  const out = [];
+  for (const x of layersOf(w)) {
+    const {rec, place, what} = described(w, x), pairs = [];
+    if (deep > 0) pairs.push(kv("layer", place));
+    if (deep > 0 && x.z === "0") {
+      if (w.grid) pairs.push(kv("grid", `${w.grid} @${w.font}`));
+      for (const key of Object.keys(meta).filter(y => !HAT_KEYS.includes(y)).sort())
+        pairs.push(kv(key + (meta[key].hidden ? "*" : ""), (meta[key].value || "") +
+                      (deep > 1 && meta[key].age !== undefined ? ` (${meta[key].age}s)` : "")));
+    }
+    if (deep > 1) {
+      pairs.push(kv("session", x.name), kv("instance", x.instance || "by hand"));
+      if (rec) pairs.push(kv("pid", rec.pid));
+    }
+    out.push(one(what, x.z === "0" ? "base" : x.type, pairs, sessionStrip(k, x, sm[x.name] || {}, deep)));
+  }
+  for (const x of all.filter(y => y.role === "controller")) {
+    const mine = x.name === w.session, pairs = [];
+    if (deep > 0 && mine) pairs.push(kv("role", "controller, this page"));
+    if (mine && deep > 1) {
+      pairs.push(`<div class="pair"><span class="n">ping</span><span class="beat"><span id="${id(k, "out")}">▸</span>` +
+                 `<span id="${id(k, "in")}">◂</span></span></div>`);
+      pairs.push(kv("since", ago(w.since)), kv("run", w.run), kv("lines", `${w.lines}, ${ago(w.last_line)}`),
+                 kv("reports", w.opened), kv("dropped", w.dropped));
+      if (PICS[k]) pairs.push(kv("shot", ago(PICS[k].head.t)));
+    }
+    out.push(one(x.name, "controller", pairs, sessionStrip(k, x, sm[x.name] || {}, deep)));
+  }
+  return out.join("");
+}
+/* The controls each session gets: the base's name on the font row, and a
+ * stop for each layer above it, through its record; a layer started by
+ * hand has none to stop it through, and one of the base's own sender --
+ * the same instance -- is stopped with the base, so it gets no stop of its
+ * own that would take the base down too. Built again only when it changes. */
+function sessionControls(k) {
+  const w = S.walls[k], layers = layersOf(w);
+  const base = layers.find(x => x.z === "0");
+  const bn = document.getElementById(id(k, "basename"));
+  if (bn) bn.textContent = base ? described(w, base).what : "nothing";
+  const el = document.getElementById(id(k, "layerctl")); if (!el) return;
+  const baseRec = base ? recordOf(w, base) : null;
+  const rows = layers.filter(x => x.z !== "0").map(x => {
+    const {rec, place, what} = described(w, x);
+    const op = rec ? S.ops[rec.id] : null, busy = op && op.state === "busy";
+    const stop = rec && baseRec && rec.id === baseRec.id
+      ? `<span class="dim" title="the base's own sender's: stopped with the base">with base</span>`
+      : rec ? `<button data-sender-action="stop" data-id="${esc(rec.id)}" ${busy ? "disabled" : ""}>stop</button>`
+      : `<span class="dim" title="started by hand: there is no record to stop it through">hand</span>`;
+    return `<div class="row"><label>${esc(place)}</label><span class="sname" title="${esc(x.name)}">${esc(what)}</span>${stop}</div>`;
+  });
+  const html = rows.join("");
+  if (el.dataset.sig !== html) { el.dataset.sig = html; el.innerHTML = html; }
+}
+
+/* What can be started on a wall: every sender host's catalogue whose host
+ * can reach it. */
+function dropOn(k, card, replace) {
+  const x = ((S.catalogue[card.host] || {}).senders || []).find(y => y.id === card.sender);
+  for (const [name, o] of Object.entries((x && x.options) || {})) {
+    const why = o.type === "walls" && wallsWhy((card.options || {})[name], o);
+    if (why) { S.wallops[k] = {state: "failed", sender: card.sender, text: `${o.label}: ${why}`}; update(k); return; }
+  }
+  S.wallops[k] = {state: "busy", sender: card.sender}; update(k);
+  request({type: "drop", key: k, host: card.host, sender: card.sender, replace,
+           options: card.options || {}},
+          why => { S.wallops[k] = {state: "failed", sender: card.sender, text: why}; update(k); });
+}
+function closeConfirm() { pending = null; document.getElementById("confirmmodal").classList.remove("open"); }
+
+function openLog(iid) {
+  logId = iid;
+  const rec = S.running[iid] || {};
+  document.getElementById("log-title").textContent = `${rec.sender || "sender"} on ${rec.wall || "?"}`;
+  document.getElementById("log-age").textContent = "reading…";
+  document.getElementById("logmodal").classList.add("open");
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({type: "sender", action: "log", id: iid}));
+}
+function showLog(text) {
+  const pre = document.getElementById("log-text");
+  pre.textContent = text;
+  pre.scrollTop = pre.scrollHeight;
+  document.getElementById("log-age").textContent = "read " + new Date().toTimeString().slice(0, 8);
+}
+function closeLog() { logId = null; document.getElementById("logmodal").classList.remove("open"); }
+function closeModal() { modalKey = null; document.getElementById("modal").classList.remove("open"); }
+
+/* The last minute of each number, kept for the traces beside them. A
+ * measure the wall does not know, or has nothing to say about yet, keeps
+ * no history: a flat line at zero would read as a number, not as no
+ * number. */
+const STRIP = ["fps", "frame", "swap", "in", "out", "cpu", "gpu", "temp", "draw"];
+const TRACE = 40;
+const HIST = {}, HELD = {};
+function keep(key, m) {
+  const h = HIST[key] = HIST[key] || {};
+  for (const n of STRIP) {
+    const v = parseFloat(m[n]);
+    if (isNaN(v)) continue;
+    (h[n] = h[n] || []).push(v);
+    if (h[n].length > TRACE) h[n].shift();
+  }
+  const w = S.walls[key] || {}, sm = w.smeasures || {};
+  for (const x of w.sessions || []) for (const f of SSTRIP) {
+    const v = parseFloat((sm[x.name] || {})[f]);
+    if (isNaN(v)) continue;
+    const n = f + ":" + x.name;
+    (h[n] = h[n] || []).push(v);
+    if (h[n].length > TRACE) h[n].shift();
+  }
+}
+
+/* One number's recent history as a line, drawn against its own range so a
+ * steady value is flat and a change is visible whatever the scale. */
+function spark(key, n) {
+  const h = (HIST[key] || {})[n] || [];
+  if (h.length < 3) return "";
+  const w = 46, ht = 12, lo = Math.min(...h), hi = Math.max(...h);
+  const span = hi - lo || 1;
+  const pts = h.map((v, i) => `${(i * w / (h.length - 1)).toFixed(1)},` +
+    `${(ht - 1 - (v - lo) / span * (ht - 2)).toFixed(1)}`).join(" ");
+  return `<svg width="${w}" height="${ht}" viewBox="0 0 ${w} ${ht}" aria-hidden="true">` +
+    `<polyline points="${pts}" fill="none" stroke="currentColor" stroke-width="1"/></svg>`;
+}
+
+/* A ping or a pong, shown where it happened. */
+function beat(m) {
+  const word = m.text.split(" ")[0];
+  if (word !== "ping" && word !== "pong") return;
+  const el = document.getElementById(id(m.key, m.mark === "<" ? "in" : "out"));
+  if (!el) return;
+  el.classList.add("lit");
+  setTimeout(() => el.classList.remove("lit"), 400);
+}
+
+/* The explanation, beside the name it belongs to and inside the window. */
+function explain(el) {
+  const box = document.getElementById("what");
+  const n = el.dataset.what, text = WHAT[n] || WHAT[n.split(":")[0]];
+  if (!text) return hideWhat();
+  if (box.dataset.for === n + el.closest(".wall").dataset.key && box.classList.contains("on"))
+    return hideWhat();
+  box.dataset.for = n + el.closest(".wall").dataset.key;
+  box.innerHTML = `<b>${esc(n)}</b>${esc(text)}`;
+  box.classList.add("on");
+  const r = el.getBoundingClientRect(), w = box.offsetWidth, h = box.offsetHeight;
+  const left = Math.min(Math.max(8, r.left + scrollX), scrollX + innerWidth - w - 8);
+  const above = r.bottom + h + 10 > innerHeight;
+  box.style.left = left + "px";
+  box.style.top = (above ? r.top + scrollY - h - 6 : r.bottom + scrollY + 6) + "px";
+}
+function hideWhat() { document.getElementById("what").classList.remove("on"); }
+
+function bytes(v) { return v >= 1e6 ? (v / 1e6).toFixed(1) + "MB" : v >= 1e3 ? (v / 1e3).toFixed(1) + "KB" : v.toFixed(0) + "B"; }
+
+function lineHtml(e) {
+  const cls = e.mark === "<" ? "in" : e.mark === "~" ? "st" : e.text.startsWith("error ") ? "err" : "";
+  return `<div class="${cls}"><span class="t">${clock(e.t)}</span> ${esc(e.mark)} ${e.who ? esc(e.who) + " " : ""}${esc(e.text)}</div>`;
+}
+function shows(k, e) {
+  if (!S.filters[k + "q"] && QUIET.test(e.text)) return false;
+  const f = (S.filters[k] || "").toLowerCase();
+  return !f || e.text.toLowerCase().includes(f);
+}
+function fillLog(k) {
+  const el = document.getElementById(id(k, "log")); if (!el) return;
+  el.innerHTML = (S.history[k] || []).filter(e => shows(k, e)).map(lineHtml).join("");
+  el.scrollTop = el.scrollHeight;
+}
+function appendLine(k, e) {
+  const el = document.getElementById(id(k, "log")); if (!el || !shows(k, e)) return;
+  const stuck = el.scrollTop + el.clientHeight >= el.scrollHeight - 8;
+  el.insertAdjacentHTML("beforeend", lineHtml(e));
+  while (el.childElementCount > 400) el.firstElementChild.remove();
+  if (stuck) el.scrollTop = el.scrollHeight;
+}
+/* Only a refusal is worth a line: when a command works, the control
+ * itself shows the new state, and the whole answer is in the history. */
+function showAnswer(k) {
+  const el = document.getElementById(id(k, "answer")); const a = S.answers[k]; if (!el || !a) return;
+  el.textContent = a.pending || a.ok !== false ? "" : a.words + ": " + a.answer.join(" · ");
+}
+
+document.addEventListener("click", ev => {
+  if (ev.target.id === "modal") { closeModal(); return; }
+  if (ev.target.closest("#modal-close")) { closeModal(); return; }
+  if (ev.target.closest("#log-close")) { closeLog(); return; }
+  if (ev.target.closest("#confirm-no")) { closeConfirm(); return; }
+  if (ev.target.closest("#confirm-yes")) { const p = pending; closeConfirm();
+    if (p && p.remove) webOp("remove", p.device, p.wall);
+    else if (p && p.move) moveOn(p.k, p.move, true); else if (p) dropOn(p.k, p.card, p.inst); return; }
+  if (ev.target.closest("#log-again")) { if (logId) openLog(logId); return; }
+  const fold = ev.target.closest("[data-fold]");
+  if (fold) {
+    const name = fold.dataset.fold;
+    if (S.folded[name]) delete S.folded[name]; else S.folded[name] = true;
+    try { localStorage.setItem("bitwall-control-folded", JSON.stringify(S.folded)); } catch (e) {}
+    render();
+    return;
+  }
+  const sa = ev.target.closest("[data-sender-action]");
+  if (sa) {
+    if (sa.dataset.senderAction === "log") openLog(sa.dataset.id);
+    else {
+      const iid = sa.dataset.id, action = sa.dataset.senderAction;
+      S.ops[iid] = {id: iid, action, state: "busy"};
+      for (const k of Object.keys(S.walls)) update(k);
+      request({type: "sender", action, id: iid}, why => {
+        S.ops[iid] = {id: iid, action, state: "failed", text: why};
+        for (const k of Object.keys(S.walls)) update(k);
+      });
+    }
+    return; }
+  if (ev.target.closest("#modal-again")) { if (modalKey) capture(modalKey); return; }
+  if (ev.target.closest(".screen.has-pic")) { const a = ev.target.closest(".wall"); if (a) openModal(a.dataset.key); return; }
+  const what = ev.target.closest("[data-what]");
+  if (what) { explain(what); return; }
+  hideWhat();
+  const b = ev.target.closest("button"); if (!b) return;
+  if (b.dataset.level) { S.level = b.dataset.level;
+    try { localStorage.setItem("bitwall-control-level", S.level); } catch (e) {}
+    render(); return; }
+  if (b.dataset.allrate) {
+    const ms = +b.dataset.allrate;
+    for (const key in S.walls) rate(key, ms > 0, ms || S.walls[key].every || 1000);
+    return; }
+  if (b.dataset.allmirror !== undefined) {
+    for (const key in S.walls) if ((S.walls[key].caps || []).includes("mirror")) mirror(key, +b.dataset.allmirror);
+    return; }
+  if (b.id === "shootall") {
+    /* Every wall that can take a picture, in one go, so a glance at the
+     * page is a glance at the room. */
+    for (const key in S.walls) if (S.walls[key].capture) capture(key);
+    return; }
+  if (b.dataset.catscroll) {
+    const box = document.querySelector(`[data-cards="${CSS.escape(b.dataset.host)}"]`);
+    if (box) {
+      const from = box.scrollLeft, by = +b.dataset.catscroll * box.clientWidth * 0.8;
+      box.scrollBy({left: by, behavior: "smooth"});
+      /* A page that is not being drawn does not animate; jump instead. */
+      setTimeout(() => { if (box.scrollLeft === from) box.scrollLeft = from + by; railEnds(box); }, 500);
+    }
+    return; }
+  if (b.dataset.catalog) { S.catalog = b.dataset.catalog === "1";
+    try { localStorage.setItem("bitwall-control-catalog", S.catalog ? "1" : "0"); } catch (e) {}
+    render(); return; }
+  if (b.dataset.controls) { S.controls = b.dataset.controls;
+    try { localStorage.setItem("bitwall-control-controls", S.controls); } catch (e) {}
+    render(); return; }
+  if (b.dataset.make) {
+    const f = S.webform[b.dataset.make] || {}, wall = (f.wall || "").trim();
+    if (!wall) return;
+    S.webform[b.dataset.make] = {presence: f.presence};
+    webOp("make", b.dataset.make, wall, (f.presence || "").trim());
+    return; }
+  const k = b.dataset.k, w = S.walls[k]; if (!w) return;
+  const s = w.stats || {};
+  if (b.dataset.remove) {
+    const on = layersOf(w).map(x => described(w, x).what);
+    pending = {remove: true, device: w.device, wall: w.number};
+    ask(`Remove the web wall ${w.device}:${w.number}? ` + (on.length
+      ? `${on.join(", ")} on it will stop, and every tab showing it will close.`
+      : "Every tab showing it will close."), "remove");
+    return; }
+  if (b.dataset.font) nudge(k, "font", current(k, "font") + (+b.dataset.font), 400);
+  else if (b.dataset.stats) send(k, "stats " + b.dataset.stats);
+  else if (b.dataset.rate) rate(k, +b.dataset.rate > 0, +b.dataset.rate || w.every || 1000);
+  else if (b.dataset.capture) capture(k);
+  else if (b.dataset.mirror !== undefined) mirror(k, +b.dataset.mirror);
+  else if (b.dataset.auto !== undefined) { S.auto[k] = +b.dataset.auto; saveAuto(); if (S.auto[k]) capture(k); update(k); }
+  else if (b.dataset.expand) openModal(k);
+  else if (b.dataset.forget) { delete PICS[k]; S.auto[k] = 0; saveAuto();
+    if (modalKey === k) closeModal();
+    const box = document.getElementById(id(k, "pic")); box.innerHTML = "";
+    box.parentElement.classList.remove("has-pic"); update(k); }
+  /* `blank 1` darkens, `blank 0` lights, and lighting wakes a monitor
+   * that has gone to sleep. */
+  else if (b.dataset.blank) send(k, "blank " + b.dataset.blank);
+  else if (b.dataset.ssize) nudge(k, "ssize", current(k, "ssize") + (+b.dataset.ssize), 400);
+  else if (b.dataset.at) send(k, "stats 1 at=" + b.dataset.at);
+  else if (b.dataset.show) send(k, "stats 1 show=" + b.dataset.show);
+  else if (b.dataset.name) {
+    const shown = (s.show || "").split(",").filter(Boolean), n = b.dataset.name;
+    const next = shown.includes(n) ? shown.filter(x => x !== n) : (w.names || []).filter(x => x === n || shown.includes(x));
+    if (next.length) send(k, "stats " + (s.on ? "1" : "0") + " show=" + next.join(","));
+  }
+});
+document.addEventListener("keydown", ev => {
+  if (ev.key !== "Escape") return;
+  hideWhat();
+  if (modalKey) closeModal();
+  if (logId) closeLog();
+  if (pending) closeConfirm();
+});
+addEventListener("scroll", hideWhat, true);
+document.addEventListener("keydown", ev => {
+  const t = ev.target; if (!t.dataset || !t.dataset.num) return;
+  if (ev.key === "Enter") { const v = parseInt(t.value, 10); if (!isNaN(v)) nudge(t.dataset.k, t.dataset.num, v, 0); t.blur(); }
+  else if (ev.key === "Escape") { t.blur(); showNum(t.dataset.k, t.dataset.num,
+    t.dataset.num === "font" ? S.walls[t.dataset.k].font : (S.walls[t.dataset.k].stats || {}).size); }
+  else if (ev.key === "ArrowUp" || ev.key === "ArrowDown") { ev.preventDefault();
+    nudge(t.dataset.k, t.dataset.num, current(t.dataset.k, t.dataset.num) + (ev.key === "ArrowUp" ? 1 : -1), 400); }
+});
+document.addEventListener("input", ev => {
+  const t = ev.target;
+  if (t.dataset.filter) { S.filters[t.dataset.filter] = t.value; fillLog(t.dataset.filter); }
+  if (t.dataset.quiet) { S.filters[t.dataset.quiet + "q"] = t.checked; fillLog(t.dataset.quiet); }
+});
+document.addEventListener("toggle", ev => {
+  const d = ev.target; if (d.dataset && d.dataset.open) { S.open[d.dataset.open] = d.open; saveOpen(); }
+  if (d.open && d.dataset.open && d.dataset.open.endsWith("h")) fillLog(d.dataset.open.slice(0, -1));
+}, true);
+setInterval(() => {
+  for (const k in S.walls) update(k);
+  const el = document.getElementById("conn");
+  if (!ws || ws.readyState !== 1) return;
+  const rate = S.bytes - S.was;
+  S.was = S.bytes;
+  el.textContent = `live · in ${bytes(rate)}/s`;
+  (HIST.ws = HIST.ws || {}).in = (HIST.ws.in || []).concat(rate).slice(-TRACE);
+  document.getElementById("wsspark").innerHTML = spark("ws", "in");
+}, 1000);
+/* Pictures on their own clocks, only while someone can see the page. */
+const lastAsked = {};
+setInterval(() => {
+  if (document.hidden) return;
+  const now = Date.now();
+  for (const k in S.auto) if (S.auto[k] && S.walls[k] && !S.walls[k].mirror && S.walls[k].capture
+      && now - (lastAsked[k] || 0) >= S.auto[k]) { lastAsked[k] = now; capture(k); }
+}, 250);
+window.addEventListener("resize", () => { for (const k in PICS) paintPic(k); if (modalKey) paintInto(document.getElementById("modal-pic"), modalKey, true); });
+connect();
+</script>
+</body>
+</html>
+"""
+
+
+def tailscale_address():
+    """This machine's Tailscale address, or None where there is none."""
+    for exe in ("tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale"):
+        try:
+            out = subprocess.run([exe, "ip", "-4"], capture_output=True,
+                                 text=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        ip = out.stdout.split()[0] if out.returncode == 0 and out.stdout.split() else ""
+        if ip.startswith("100."):
+            return ip
+    return None
+
+
+async def main_async(hosts, port):
+    server = Server()
+    app = web.Application()
+    app.router.add_get("/", server.page)
+    app.router.add_get("/ws", server.ws)
+    app.router.add_get("/font.woff2", server.font)
+    app.router.add_get("/bitwall-screen.js", server.screen_js)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    for host in hosts:
+        await web.TCPSite(runner, host, port).start()
+    print("bitwall-control  " + "  ".join(f"http://{h}:{port}/" for h in hosts)
+          + f"  devices={','.join(d['name'] for d in DEVICES)}", flush=True)
+    tasks = [asyncio.ensure_future(server.finding()), asyncio.ensure_future(server.pushing()),
+             asyncio.ensure_future(server.watching_senders()),
+             asyncio.ensure_future(server.watching_catalogues())]
+    # SIGTERM and ^C both cancel this task, so the cleanup below runs on
+    # a loop that is still running. Only the first does: a stop comes as
+    # several signals at once -- uv passes on what the process group was
+    # sent as well -- and a second cancel would cut the cleanup short.
+    me = asyncio.current_task()
+
+    def stop():
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            asyncio.get_running_loop().add_signal_handler(sig, lambda: None)
+        me.cancel()
+    # Windows' loop takes no signal handlers; there ^C cancels this task
+    # by way of asyncio.run, to the same cleanup.
+    if not WINDOWS:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            asyncio.get_running_loop().add_signal_handler(sig, stop)
+    try:
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        for t in tasks:
+            t.cancel()
+        # Every session closed before the server goes, and none waited on
+        # for longer than a wall that is not answering deserves.
+        with contextlib.suppress(asyncio.TimeoutError):
+            walls = list(server.walls.values())
+            await asyncio.wait_for(
+                asyncio.gather(*(w.stop() for w in walls), return_exceptions=True), 8)
+            # A wall still being opened closes what it opens once it sees
+            # it is gone, so each wall's own loop is let finish too.
+            await asyncio.wait_for(
+                asyncio.gather(*(w.task for w in walls if w.task),
+                               return_exceptions=True), 8)
+        await runner.cleanup()
+
+
+def same_origin(origin, host):
+    """Whether a page at `origin` was served from `host`, the request's
+    Host header: the same host and port, the port given or the scheme's
+    own. No origin at all is a program, not a page, and is let in."""
+    if origin is None:
+        return True
+    from urllib.parse import urlsplit
+
+    def where(scheme, netloc):
+        u = urlsplit(f"{scheme}://{netloc}")
+        try:
+            port = u.port
+        except ValueError:
+            return None
+        return (u.hostname or "").lower(), port or (443 if scheme in ("https", "wss") else 80)
+    u = urlsplit(origin)
+    if u.scheme not in ("http", "https") or not u.netloc or not host:
+        return False
+    there = where(u.scheme, u.netloc)
+    return there is not None and there == where(u.scheme, host)
+
+
+def devices_file(ap, path):
+    """The devices a file names, checked: each a name, a host and the
+    order its walls stand in, if any. Other keys are other readers'."""
+    try:
+        with open(os.path.expanduser(path), encoding="utf-8") as fh:
+            said = json.load(fh)
+    except (OSError, ValueError) as e:
+        ap.error(f"--devices {path}: {e}")
+    devices = []
+    for d in said if isinstance(said, list) else []:
+        name, host = d.get("name", ""), d.get("host", "")
+        order = d.get("order", [])
+        if not (isinstance(name, str) and re.match(r"^[A-Za-z0-9_-]{1,32}$", name)
+                and isinstance(host, str) and host and isinstance(order, list)
+                and all(isinstance(o, str) for o in order)):
+            ap.error(f"--devices {path}: {d!r} is not a name, a host and an order")
+        devices.append({"host": host, "name": name, "order": order})
+    if not devices:
+        ap.error(f"--devices {path}: no devices in it")
+    return devices
+
+
+def default_devices(ap):
+    """The devices of `$BITWALL_DEVICES` or ~/.bitwall/devices.json, else
+    this machine alone, named by its short host name."""
+    path = os.environ.get("BITWALL_DEVICES") or os.path.expanduser(DEVICES_FILE)
+    if os.path.exists(path):
+        return devices_file(ap, path)
+    import socket
+    name = re.sub(r"[^A-Za-z0-9_-]", "", socket.gethostname().split(".")[0])[:32]
+    return [{"host": "localhost", "name": name or "this", "order": []}]
+
+
+def git_ssh_first():
+    """Git's `ssh` ahead of Windows' own on the path, for this and every
+    program it starts: Windows' own never exits when its stdout is a pipe,
+    and every ssh run here has one (AGENTS.md, Traps)."""
+    found = shutil.which("ssh") or ""
+    if not os.path.isfile(os.path.join(GIT_SSH, "ssh.exe")):
+        print(f"bitwall-control: no Git ssh at {GIT_SSH}; using {found or 'no ssh'}, "
+              f"which may hang", flush=True)
+        return
+    if os.path.dirname(found).lower() != GIT_SSH.lower():
+        os.environ["PATH"] = GIT_SSH + os.pathsep + os.environ.get("PATH", "")
+        print(f"bitwall-control: Git's ssh first on the path, ahead of {found or 'none'}",
+              flush=True)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--host", action="append", default=[],
+                    help="an address to listen on, instead of 127.0.0.1 and the "
+                         "Tailscale address; anyone who can reach the page can "
+                         "change every wall")
+    ap.add_argument("--port", type=int, default=8910)
+    ap.add_argument("--device", action="append", default=[], metavar="NAME=HOST",
+                    help="a device to show instead of the devices file, and "
+                         "with it the sender hosts; may be given more than once")
+    ap.add_argument("--devices", metavar="FILE",
+                    help="the devices, a JSON list of {name, host, order} "
+                         "(default $BITWALL_DEVICES, else " + DEVICES_FILE +
+                         ", else this machine alone)")
+    a = ap.parse_args()
+    if WINDOWS:
+        # A log in a file is in the machine's code page, which has not
+        # every character a wall or a sender may say.
+        for stream in (sys.stdout, sys.stderr):
+            with contextlib.suppress(AttributeError, ValueError):
+                stream.reconfigure(errors="backslashreplace")
+        git_ssh_first()
+    # Stopped by a signal is stopped as by ^C: every session is closed
+    # either way.
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
+    hosts = a.host or ["127.0.0.1"] + [ip for ip in [tailscale_address()] if ip]
+    if a.devices and a.device:
+        ap.error("--devices or --device, not both")
+    if not a.device:
+        DEVICES[:] = devices_file(ap, a.devices) if a.devices else default_devices(ap)
+        SENDER_HOSTS[:] = list(dict.fromkeys(d["host"] for d in DEVICES))
+    if a.device:
+        devices = []
+        for spec in a.device:
+            name, eq, host = spec.partition("=")
+            if not eq or not re.match(r"^[A-Za-z0-9_-]{1,32}$", name) or not host:
+                ap.error(f"--device {spec}: not NAME=HOST")
+            devices.append({"host": host, "name": name})
+        DEVICES[:] = devices
+        SENDER_HOSTS[:] = list(dict.fromkeys(d["host"] for d in devices))
+    try:
+        asyncio.run(main_async(hosts, a.port))
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

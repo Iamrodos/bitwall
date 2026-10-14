@@ -1,0 +1,18 @@
+{
+  "label": "LED panel",
+  "description": "An LED matrix drawn as lamps, fed by its own effects or by any sACN, Art-Net or DDP software",
+  "start": "../leds/main.py",
+  "options": {
+    "font": {"type": "font", "label": "Font size",
+             "description": "Cell size on the wall", "default": 12, "min": 6, "max": 40},
+    "size": {"type": "choice", "label": "Matrix",
+             "description": "The panel's LEDs, across by down",
+             "choices": ["32x16", "64x32", "64x64", "96x48"], "default": "64x32"},
+    "layout": {"type": "choice", "label": "Wiring",
+               "description": "How the strip runs: rows, or every other row backwards",
+               "choices": ["rows", "serpentine"], "default": "rows"},
+    "play": {"type": "choice", "label": "Play",
+             "description": "What drives it: the effects in turn, one effect, the plasma, or none for outside LED software",
+             "choices": ["effects", "fire", "pacifica", "plasma", "none"], "default": "effects"}
+  }
+}

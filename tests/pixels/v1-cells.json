@@ -1,0 +1,21 @@
+{
+ "target": "pi.local:1",
+ "version": "46cbc97a1e83",
+ "env": {
+  "BITWALL_EVEN_CELLS": "1"
+ },
+ "glass": [
+  1920,
+  1080
+ ],
+ "font": 14,
+ "cell": [
+  8,
+  20
+ ],
+ "area": [
+  240,
+  54
+ ],
+ "taken": "2026-10-11"
+}

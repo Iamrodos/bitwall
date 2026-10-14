@@ -1,0 +1,997 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.14"
+# dependencies = ["aiohttp"]
+# ///
+"""The bitwall web receiver: walls whose glass is a browser tab.
+
+    bitwall/receivers/web/bitwall-web [--port 8901] [--host ADDR] [--run DIR] [name ...]
+
+Each name is a wall, `<run>/bitwall/<name>/`, with its door and its
+sessions as PROTOCOL.md has them, so a sender attaches to it as it attaches
+to a screen of a Pi and a controller finds it the same way:
+
+    senders/sysinfo/main.py localhost:kitchen
+    open http://localhost:8901/r/kitchen
+
+It listens on 127.0.0.1 unless given `--host`, since a tab drives its
+wall: another machine's browser reaches it through `tailscale serve` in
+front of it, or `--host` where the network is trusted.
+
+The server keeps each wall's door and sessions (the receiver core,
+`bitwall/receivers/core.py`) and carries what its layers draw to every
+tab showing it, over a websocket; the tabs stack
+the layers and paint them (`bitwall-screen.js`). One tab decides the wall:
+its box is the wall's glass, and it answers for what only the glass knows.
+
+Walls named on the command line are made at startup. After that they are
+made and removed through the receiver's own pair of fifos beside the walls,
+`bitwall-web.in` and `bitwall-web.out`, never by a page:
+
+    list                            wall <name> for each, then walls <n>
+    make <name> [presence=<name>]   made <name>
+    remove <name>                   removed <name>
+
+The wire to a tab
+-----------------
+Down: JSON text messages of the wall's state (`state`, `stats`, `frame`,
+`clear`, `look`, and the base's kitty graphics: `kimg`, `kgone`,
+`kplaces`) and binary messages. A binary message is the base's cells as
+the sender wrote them, commands and kitty strings taken out, unless a
+`frame` said a video frame follows, when it is that frame as sent, QOI,
+PNG or JPEG, with the box it is drawn to, or a
+`kimg` said a picture does, when it is the picture as the sender sent it,
+PNG or raw pixels.
+
+Up: JSON text messages: `box` (the tab's box in device pixels and the
+cell at every font), `presence`, `input`, `glass` (its own measures),
+`stats` (a viewer's key), and `look`, followed by the glass as QOI, or
+as JPEG where the `look` asked for one with `q`, its quality.
+"""
+import argparse
+import asyncio
+import codecs
+import errno
+import json
+import os
+import re
+import signal
+import sys
+import threading
+import time
+import urllib.parse
+from collections import deque
+
+from aiohttp import WSMsgType, web
+
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from bitwall import local, protocol, receivers                 # noqa: E402
+from bitwall.receivers import web as defaults                  # noqa: E402
+from bitwall.receivers import core as walls                     # noqa: E402
+from bitwall.session import WALL_TOKEN                         # noqa: E402
+
+#: A token as a presence's name or a command's id is.
+TOKEN = re.compile(r"^[A-Za-z0-9_-]{1,32}\Z")
+#: How many walls one server keeps.
+MAX_WALLS = 64
+#: The largest message a tab may send up: a box, a press, or a look at the
+#: glass, which is QOI of at most the glass.
+MAX_MSG = 64 << 20
+#: How far behind a tab may fall before what it holds is thrown away and
+#: it is given the wall as it stands instead.
+BEHIND = 8 << 20
+#: How long the deciding tab has to hand back a look at the glass.
+LOOK_WAIT = 3.0
+#: Deflate on the socket: a cells stream compresses hard, which is what
+#: makes a wall watchable over wifi. BITWALL_WEB_COMPRESS=0 spends the
+#: bandwidth and gives the server back the CPU.
+COMPRESS = os.environ.get("BITWALL_WEB_COMPRESS", "1") != "0"
+NO_CACHE = {"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"}
+
+
+def say(text):
+    """A line of the log: what someone would want when it has gone wrong."""
+    print(f"{time.strftime('%H:%M:%S')} {text}", flush=True)
+
+
+class Client:
+    """One tab on one wall, and what is waiting to be sent to it, in order."""
+
+    def __init__(self, ws, order):
+        self.ws = ws
+        self.order = order
+        self.queue = deque()
+        self.queued = 0
+        self.sending = False
+        #: What it last said of its box, whether it is in view and since
+        #: when, whether its page says it decides, and what it can pass on.
+        self.box = None
+        self.visible = True
+        self.seen = time.monotonic()
+        self.primary = False
+        self.can = ()
+        #: The look the next binary message answers, as (id, w, h, x, y,
+        #: whether it is a JPEG).
+        self.look = None
+        self.decides = False
+        #: The films its browser says it decodes, and of those the ones it
+        #: says it decodes in hardware.
+        self.codecs = ()
+        self.hw = ()
+
+
+class Tabs:
+    """The tabs showing one wall, and the wall's way to reach them. Every
+    call from the wall comes under its lock, from its own thread or this
+    loop's, and returns at once: the work is put on the loop."""
+
+    #: What a look at the glass may be: a tab makes either from its
+    #: canvases, QOI itself and JPEG by the browser's own encoder.
+    pictures = ("qoi", "jpeg")
+
+    def __init__(self, loop, name):
+        self.loop = loop
+        self.name = name
+        self.wall = None
+        self.clients = []
+        self.decider = None
+        self._order = 0
+        self._looks = {}
+        self._look_id = 0
+        self._state_owed = False
+        self._stats_owed = False
+
+    # -- from the wall ---------------------------------------------------
+
+    def cells(self, data):
+        self.loop.call_soon_threadsafe(self._all, ("cells", data))
+
+    def frame(self, z, head, data):
+        self.loop.call_soon_threadsafe(self._all, ("frame", z, head, data))
+
+    def clear(self, z):
+        self.loop.call_soon_threadsafe(self._all, ("text", json.dumps({"t": "clear", "z": z})))
+
+    def lgrid(self, z, cols, rows, font, wipe=False):
+        """A cells layer at `z`: its grid's size and font, made or made
+        again; `wipe` takes every cell it drew away."""
+        self.loop.call_soon_threadsafe(self._all, ("text", json.dumps(
+            {"t": "lgrid", "z": z, "cols": cols, "rows": rows, "font": font,
+             "wipe": bool(wipe)})))
+
+    def lcells(self, z, data):
+        """What a cells layer drew, as it sent it."""
+        self.loop.call_soon_threadsafe(self._all, ("lcells", z, data))
+
+    def lgone(self, z):
+        self.loop.call_soon_threadsafe(self._all, ("text", json.dumps({"t": "lgone", "z": z})))
+
+    # A film on a layer's `data`, which every tab decodes and plays on the
+    # wall's clock: its start, each frame as it comes, its end, the layer
+    # gone or moved. Nothing of a film is ever let go on the way to a tab,
+    # since each frame is decoded from those before it; a tab too far
+    # behind is caught up from the last key instead.
+
+    def vstart(self, z, head):
+        self.loop.call_soon_threadsafe(self._all, ("text", json.dumps(dict(head, t="vstart", z=z))))
+
+    def vchunk(self, z, head, data):
+        self.loop.call_soon_threadsafe(self._all, ("vchunk", dict(head, t="vchunk", z=z), data))
+
+    def valign(self, z, align):
+        self.loop.call_soon_threadsafe(self._all, ("text", json.dumps(
+            {"t": "valign", "z": z, "a": align})))
+
+    def vend(self, z, stream):
+        self.loop.call_soon_threadsafe(self._all, ("text", json.dumps(
+            {"t": "vend", "z": z, "s": stream})))
+
+    def vgone(self, z):
+        self.loop.call_soon_threadsafe(self._all, ("text", json.dumps({"t": "vgone", "z": z})))
+
+    def vmove(self, frm, to):
+        self.loop.call_soon_threadsafe(self._all, ("text", json.dumps(
+            {"t": "vmove", "z": frm, "to": to})))
+
+    def films(self):
+        """Whether any tab is there to decode a film."""
+        return bool(self.clients)
+
+    def backlog(self):
+        """The most any tab has waiting to be sent to it."""
+        return max((c.queued for c in self.clients), default=0)
+
+    def kitty(self, head, data):
+        """The base's kitty graphics: a picture and its bytes, or a line
+        about them. A picture is not counted against how far behind a tab
+        is, since it is sent once and not again."""
+        if data is None:
+            self.loop.call_soon_threadsafe(self._all, ("text", json.dumps(head)))
+        else:
+            self.loop.call_soon_threadsafe(self._all, ("kimg", data, json.dumps(head)))
+
+    def changed(self):
+        if not self._state_owed:
+            self._state_owed = True
+            self.loop.call_soon_threadsafe(self._state)
+
+    def stats(self):
+        if not self._stats_owed:
+            self._stats_owed = True
+            self.loop.call_soon_threadsafe(self._stats)
+
+    def look(self, w, h, back, quality=0):
+        """Ask the deciding tab for the glass at w by h, as QOI, or as
+        JPEG at `quality` where that is above 0; `back(bytes or None)`
+        when it answers or does not in time. False when no tab can be
+        asked."""
+        c = self.decider
+        if c is None or c.ws.closed:
+            return False
+        self._look_id += 1
+        key = self._look_id
+        self._looks[key] = back
+
+        def ask():
+            m = {"t": "look", "id": key, "w": w, "h": h}
+            if quality:
+                m["q"] = quality
+            self.put(c, ("text", json.dumps(m)))
+            self.loop.call_later(LOOK_WAIT, self.answered, key, None)
+        self.loop.call_soon_threadsafe(ask)
+        return True
+
+    def look_layer(self, z, back):
+        """Ask the deciding tab for what layer z shows, at its own size;
+        `back(bytes or None, x, y)` where it went on the glass."""
+        c = self.decider
+        if c is None or c.ws.closed:
+            return False
+        self._look_id += 1
+        key = self._look_id
+        self._looks[key] = back
+
+        def ask():
+            self.put(c, ("text", json.dumps({"t": "look", "id": key, "z": z})))
+            self.loop.call_later(LOOK_WAIT, self.answered, key, None)
+        self.loop.call_soon_threadsafe(ask)
+        return True
+
+    # -- to the tabs ------------------------------------------------------
+
+    def answered(self, key, data, *at):
+        back = self._looks.pop(key, None)
+        if back is not None:
+            back(data, *at)
+
+    def _all(self, item):
+        for c in list(self.clients):
+            self.put(c, item)
+
+    def put(self, c, item):
+        """Something for one tab, after whatever it is still being sent:
+        cells joined to cells waiting, a video frame in place of an older
+        one of the same layer not yet sent. A tab too far behind is given
+        the wall as it stands instead of what it missed."""
+        q = c.queue
+        if item[0] == "cells" and q and q[-1][0] == "cells":
+            q[-1] = ("cells", q[-1][1] + item[1])
+        elif item[0] == "frame":
+            for i, old in enumerate(q):
+                if old[0] == "frame" and old[1] == item[1]:
+                    del q[i]
+                    c.queued -= len(old[3])
+                    break
+            q.append(item)
+        else:
+            q.append(item)
+        c.queued += len(item[-1]) if isinstance(item[-1], (bytes, str)) else 0
+        if c.queued > BEHIND:
+            q.clear()
+            c.queued = 0
+            self.catch_up(c)
+        if not c.sending:
+            c.sending = True
+            asyncio.ensure_future(self._drain(c))
+
+    async def _drain(self, c):
+        try:
+            while c.queue:
+                item = c.queue.popleft()
+                c.queued -= len(item[-1]) if isinstance(item[-1], (bytes, str)) else 0
+                if item[0] == "text":
+                    await c.ws.send_str(item[1])
+                elif item[0] == "cells":
+                    await c.ws.send_bytes(bytes(item[1]))
+                elif item[0] == "frame":
+                    head = dict(item[2], t="frame", z=item[1])
+                    await c.ws.send_str(json.dumps(head))
+                    await c.ws.send_bytes(item[3])
+                elif item[0] == "kimg":
+                    await c.ws.send_str(item[2])
+                    await c.ws.send_bytes(item[1])
+                elif item[0] == "lcells":
+                    await c.ws.send_str(json.dumps({"t": "lcells", "z": item[1]}))
+                    await c.ws.send_bytes(bytes(item[2]))
+                elif item[0] == "vchunk":
+                    await c.ws.send_str(json.dumps(item[1]))
+                    await c.ws.send_bytes(item[2])
+        except Exception:                                   # noqa: BLE001
+            c.queue.clear()
+        finally:
+            c.sending = False
+            c.queued = max(0, c.queued)
+
+    def catch_up(self, c):
+        """The wall as it stands, for a tab arriving or one fallen behind."""
+        cells, frames = self.wall.catch_up()
+        self.put(c, ("text", json.dumps({"t": "wipe"})))
+        if cells:
+            self.put(c, ("cells", cells))
+        for z, head, data in frames:
+            self.put(c, ("frame", z, head, data))
+        for z, cols, rows, font, data in self.wall.layers_now():
+            self.put(c, ("text", json.dumps({"t": "lgrid", "z": z, "cols": cols, "rows": rows,
+                                             "font": font, "wipe": True})))
+            self.put(c, ("lcells", z, data))
+        images, places = self.wall.kitty_now()
+        for head, data in images:
+            self.put(c, ("kimg", data, json.dumps(head)))
+        if places is not None:
+            self.put(c, ("text", json.dumps(places)))
+        for z, head, gop in self.wall.films_now():
+            self.put(c, ("text", json.dumps(dict(head, t="vstart", z=z))))
+            for i, key, data in gop:
+                self.put(c, ("vchunk", {"t": "vchunk", "z": z, "s": head["s"], "i": i,
+                                        "key": key}, data))
+
+    def _state(self):
+        self._state_owed = False
+        view = self.wall.view()
+        for c in list(self.clients):
+            self.put(c, ("text", json.dumps(dict(view, t="state", decider=c is self.decider))))
+
+    def _stats(self):
+        self._stats_owed = False
+        text = json.dumps(dict(self.wall.overlay(), t="stats"))
+        for c in list(self.clients):
+            self.put(c, ("text", text))
+
+    # -- from the tabs ----------------------------------------------------
+
+    def add(self, ws):
+        self._order += 1
+        c = Client(ws, self._order)
+        self.clients.append(c)
+        self.put(c, ("text", json.dumps(dict(self.wall.view(), t="state", decider=False))))
+        self.catch_up(c)
+        if self.wall.stats["on"]:
+            self.stats()
+        self.decide()
+        return c
+
+    def remove(self, c):
+        if c in self.clients:
+            self.clients.remove(c)
+        c.queue.clear()
+        self.decide()
+
+    def decide(self):
+        """Which tab the wall is: the first whose page says it decides,
+        else the one in view most lately brought into view, else the first
+        to have said its box. A change of tab, or of that tab's box, is the
+        glass changing; how many are in view is `watching`."""
+        said = [c for c in self.clients if c.box is not None]
+        primary = [c for c in said if c.primary]
+        visible = [c for c in said if c.visible]
+        pick = primary[0] if primary else max(visible, key=lambda c: c.seen) \
+            if visible else said[0] if said else None
+        was, self.decider = self.decider, pick
+        if pick is not None and (pick is not was or pick.box is not getattr(self, "_box", None)):
+            self._box = pick.box
+            self.wall.set_box(pick.box)
+        if pick is not was:
+            self.changed()
+        if pick is not None:
+            self.wall.set_codecs(pick.codecs, pick.hw)
+        self.wall.set_visible(sum(1 for c in self.clients if c.visible))
+        self.wall.set_accepts({k for c in self.clients for k in c.can})
+
+    def heard(self, c, m):
+        kind = m.get("t")
+        if kind == "box":
+            box = clean_box(m)
+            if box is None:
+                return
+            c.box = box
+            c.primary = bool(m.get("primary"))
+            can = m.get("can") or {}
+            c.can = tuple(k for k in ("touch", "keyboard") if can.get(k) is True)
+            self.decide()
+        elif kind == "presence":
+            was = c.visible
+            c.visible = bool(m.get("visible", True))
+            if c.visible and not was:
+                c.seen = time.monotonic()
+            self.decide()
+        elif kind == "input":
+            got = clean_input(m)
+            if got is not None:
+                self.wall.press(*got)
+        elif kind == "glass":
+            if c is self.decider:
+                numbers = {}
+                for key in ("fps", "frame", "draw"):
+                    v = m.get(key)
+                    if isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v < 1e6:
+                        numbers[key] = float(v)
+                decode = m.get("decode")
+                if isinstance(decode, dict):
+                    numbers["decode"] = {str(k): float(v) for k, v in decode.items()
+                                         if isinstance(v, (int, float)) and 0 <= v < 1e6}
+                for key in ("shown", "late"):
+                    got = m.get(key)
+                    if isinstance(got, dict):
+                        numbers[key] = {int(k): int(v) for k, v in got.items()
+                                        if str(k).isdigit() and isinstance(v, int)
+                                        and 0 <= v < 100000}
+                self.wall.take_glass(numbers)
+        elif kind == "codecs":
+            if isinstance(m.get("list"), list):
+                c.codecs = tuple(x for x in m["list"] if x in ("h264", "hevc"))
+                hw = m.get("hw")
+                c.hw = tuple(x for x in hw if x in c.codecs) if isinstance(hw, list) else ()
+                self.decide()
+        elif kind == "verror":
+            if c is self.decider and isinstance(m.get("z"), int) and isinstance(m.get("s"), int):
+                self.wall.film_error(m["z"], m["s"])
+        elif kind == "stats":
+            self.wall.toggle_stats(bool(m.get("on")))
+        elif kind == "look":
+            if c is self.decider and isinstance(m.get("id"), int):
+                if m.get("none"):
+                    self.answered(m["id"], None)
+                else:
+                    c.look = (m["id"], m.get("w"), m.get("h"), m.get("x"), m.get("y"),
+                              m.get("f") == "jpeg")
+
+    def heard_bytes(self, c, data):
+        if c.look is None:
+            return
+        key, w, h, x, y, jpeg = c.look
+        c.look = None
+        ok = (jpeg_size(data) if jpeg else
+              len(data) >= 22 and data[:4] == b"qoif"
+              and (int.from_bytes(data[4:8], "big"), int.from_bytes(data[8:12], "big"))) \
+            == (w, h)
+        if isinstance(x, int) and isinstance(y, int):
+            self.answered(key, bytes(data) if ok else None, x, y)
+        else:
+            self.answered(key, bytes(data) if ok else None)
+
+
+def jpeg_size(data):
+    """(w, h) of a JPEG, from its first frame header, or None if it is
+    not one."""
+    if data[:2] != b"\xff\xd8":
+        return None
+    i = 2
+    while i + 4 <= len(data):
+        if data[i] != 0xFF:
+            return None
+        marker = data[i + 1]
+        if marker == 0xFF:
+            i += 1
+            continue
+        n = int.from_bytes(data[i + 2:i + 4], "big")
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            if i + 9 > len(data):
+                return None
+            return (int.from_bytes(data[i + 7:i + 9], "big"),
+                    int.from_bytes(data[i + 5:i + 7], "big"))
+        i += 2 + n
+    return None
+
+
+def clean_box(m):
+    """A tab's box as the wall takes it, or None if it is not one: the box
+    in device pixels, a cell's size at every font the wall has, the
+    viewer's zoom, and the grid the page fixes if it does."""
+    try:
+        w, h = int(m["w"]), int(m["h"])
+        cells = [(int(a), int(b)) for a, b in m["cells"]]
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not (1 <= w <= 16384 and 1 <= h <= 16384):
+        return None
+    if len(cells) != walls.FONT_HIGH - walls.FONT_LOW + 1 \
+            or not all(1 <= a <= 4096 and 1 <= b <= 4096 for a, b in cells):
+        return None
+    box = {"w": w, "h": h, "cells": cells}
+    zoom = m.get("zoom")
+    box["zoom"] = float(zoom) if isinstance(zoom, (int, float)) and 0.1 <= zoom <= 10 else 1.0
+    fixed = m.get("fixed")
+    if isinstance(fixed, list) and len(fixed) == 2 and all(
+            isinstance(v, int) and 1 <= v <= 1000 for v in fixed):
+        box["fixed"] = tuple(fixed)
+    font = m.get("font")
+    if isinstance(font, int) and walls.FONT_LOW <= font <= walls.FONT_HIGH:
+        box["font"] = font
+    return box
+
+
+def clean_input(m):
+    """A press as (kind, [(key, value)]), or None if it is not one."""
+    kind = m.get("kind")
+    if kind == "tap":
+        cell, area = m.get("cell"), m.get("area")
+        if not (isinstance(cell, list) and isinstance(area, list) and len(cell) == 2
+                and len(area) == 2 and all(isinstance(v, int) and 0 <= v <= 10000
+                                           for v in cell + area)):
+            return None
+        return "tap", [("cell", f"{cell[0]},{cell[1]}"), ("area", f"{area[0]},{area[1]}")]
+    if kind == "key":
+        key = m.get("key")
+        if not isinstance(key, str) or not protocol.TOKEN.match(key) or len(key) > 32:
+            return None
+        opts = [("key", key)]
+        mods = [x for x in m.get("mods") or () if x in ("ctrl", "alt", "shift", "meta")]
+        if mods:
+            opts.append(("mods", ",".join(mods)))
+        return "key", opts
+    if kind == "button":
+        n = m.get("n")
+        if not isinstance(n, int) or not 0 <= n <= 64:
+            return None
+        return "button", [("n", str(n))]
+    return None
+
+
+class Refused(Exception):
+    """A wall that cannot be made, and why."""
+
+
+class Server:
+    """The walls one web receiver keeps, and the pages that show them."""
+
+    def __init__(self, run, open_names=False, font=14, program="bitwall-web", reach=None,
+                 https=None):
+        self.run = run
+        self.font = font
+        #: The program keeping these walls, as each wall's report says it.
+        self.receiver = receivers.receiver_line(program, time.time())
+        #: How a tab reaches this server from elsewhere, `(port, bound)`,
+        #: or None where it cannot be told.
+        self.reach = reach
+        #: Where a tab reaches it over HTTPS, `(name, port)`, with a
+        #: certificate for that name -- `tailscale serve` in front of it --
+        #: or None. A browser decodes a film only on a secure page.
+        self.https = https
+        #: Whether a page naming a wall that is not there makes it: a demo
+        #: arranging walls by name wants that; a receiver anyone on the
+        #: network can reach does not.
+        self.open_names = open_names
+        self.walls = {}
+
+    def make(self, name, presence=None):
+        """The wall `name`, claimed now, its door read from now on."""
+        if not WALL_TOKEN.match(name) or name.isdigit():
+            raise Refused("not a wall's name")
+        if presence is not None and not TOKEN.match(presence):
+            raise Refused("presence is not a token")
+        if name in self.walls:
+            return self.walls[name]
+        if len(self.walls) >= MAX_WALLS:
+            raise Refused(f"{MAX_WALLS} walls already")
+        tabs = Tabs(asyncio.get_running_loop(), name)
+        reach = []
+        if self.reach:
+            port, bound = self.reach
+            reach.append(f"reach http port={port} bound={bound} path=/r/{name}")
+        if self.https:
+            host, port = self.https
+            reach.append(f"reach https port={port} name={host} path=/r/{name}")
+        wall = walls.Wall(self.run, name, tabs, presence=presence, font=self.font,
+                          receiver=self.receiver, reach=reach,
+                          colour=defaults.COLOUR, rate=defaults.RATE,
+                          glyphs=defaults.GLYPHS, above=("video", "cells"),
+                          data=("qoi", "mjpeg"), video_base=True)
+        tabs.wall = wall
+        try:
+            wall.start()
+        except walls.ClaimRefused as e:
+            raise Refused(str(e))
+        self.walls[name] = (wall, tabs)
+        say(f"made {name}: {wall.dir}" + (f", presence {presence}" if presence else ""))
+        return wall, tabs
+
+    def remove(self, name):
+        got = self.walls.pop(name, None)
+        if got is None:
+            return False
+        wall, tabs = got
+        for c in list(tabs.clients):
+            asyncio.ensure_future(c.ws.close())
+        wall.remove()
+        say(f"removed {name}")
+        return True
+
+    def close(self):
+        for name in list(self.walls):
+            self.remove(name)
+
+    def get(self, name):
+        got = self.walls.get(name)
+        if got is not None:
+            return got
+        if not self.open_names:
+            raise web.HTTPNotFound(text="no such wall\n")
+        try:
+            return self.make(name)
+        except Refused as e:
+            raise web.HTTPNotFound(text=f"{e}\n")
+
+    # -- routes -----------------------------------------------------------
+
+    async def index(self, request):
+        rows = "".join(
+            f'<li><a href="/r/{n}">{n}</a> <span>{w.cols}x{w.rows} cells, '
+            f'{len(t.clients)} tab(s)</span><br><code>{w.dir}</code></li>'
+            for n, (w, t) in sorted(self.walls.items()))
+        return web.Response(text=INDEX % (rows or "<li>none yet</li>"),
+                            content_type="text/html", headers=NO_CACHE)
+
+    async def page(self, request):
+        name = request.match_info["name"]
+        self.get(name)
+        with open(os.path.join(defaults.HERE, "page.html"), encoding="utf-8") as fh:
+            html = fh.read()
+        html = html.replace("__NAME__", name).replace("__FONT__", defaults.FONT)
+        return web.Response(text=html, content_type="text/html", headers=NO_CACHE)
+
+    async def script(self, request):
+        with open(os.path.join(defaults.HERE, "bitwall-screen.js"), encoding="utf-8") as fh:
+            return web.Response(text=fh.read(), content_type="application/javascript",
+                                headers=NO_CACHE)
+
+    async def font_file(self, request):
+        if not os.path.exists(defaults.FONT_FILE):
+            raise web.HTTPNotFound(text="no font installed\n")
+        return web.FileResponse(defaults.FONT_FILE, headers={
+            "Content-Type": "font/woff2", "Cache-Control": "public, max-age=86400"})
+
+    async def icons_file(self, request):
+        if not os.path.exists(defaults.ICONS_FILE):
+            raise web.HTTPNotFound(text="no icons installed\n")
+        return web.FileResponse(defaults.ICONS_FILE, headers={
+            "Content-Type": "font/woff2", "Cache-Control": "public, max-age=86400"})
+
+    async def socket(self, request):
+        if not same_origin(request):
+            raise web.HTTPForbidden(text="a page from another origin\n")
+        wall, tabs = self.get(request.match_info["name"])
+        ws = web.WebSocketResponse(heartbeat=20, max_msg_size=MAX_MSG, compress=COMPRESS)
+        await ws.prepare(request)
+        c = tabs.add(ws)
+        try:
+            async for msg in ws:
+                if msg.type is WSMsgType.BINARY:
+                    tabs.heard_bytes(c, msg.data)
+                    continue
+                if msg.type is not WSMsgType.TEXT:
+                    continue
+                try:
+                    m = json.loads(msg.data)
+                except ValueError:
+                    continue
+                if isinstance(m, dict):
+                    tabs.heard(c, m)
+        finally:
+            tabs.remove(c)
+        return ws
+
+
+def where(origin, scheme=None):
+    """`(host, port)` of an Origin, or of a Host header given the scheme
+    its port defaults by, lower case; the port None where it is not said
+    and nothing gives it."""
+    try:
+        u = urllib.parse.urlsplit(origin if scheme is None else "//" + origin)
+        port = u.port
+    except ValueError:
+        return None
+    scheme = scheme or u.scheme
+    if port is None:
+        port = {"http": 80, "https": 443, "ws": 80, "wss": 443}.get(scheme)
+    return ((u.hostname or "").lower(), port)
+
+
+def same_origin(request):
+    """Whether a websocket may be opened: a browser says the page's Origin,
+    and one naming another host or port than the request went to is a page
+    elsewhere using a browser here. No Origin is not a browser's page, and
+    is let in. The host the request went to is its Host, which `tailscale
+    serve` passes on as the browser said it, or X-Forwarded-Host where a
+    proxy says that instead; its port defaults by the Origin's scheme,
+    since a proxy in front may speak HTTPS where this server does not."""
+    origin = request.headers.get("Origin")
+    if origin is None:
+        return True
+    o = where(origin)
+    if o is None or not o[0]:
+        return False
+    for host in (request.headers.get("Host"), request.headers.get("X-Forwarded-Host")):
+        if host and where(host.split(",")[0].strip(), urllib.parse.urlsplit(origin).scheme) == o:
+            return True
+    return False
+
+
+INDEX = """<!doctype html><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>bitwall</title>
+<style>body{background:#111;color:#bbb;font:14px ui-monospace,Menlo,monospace;
+padding:2rem}a{color:#7ec8e3}li{margin:.8rem 0}code{color:#666}
+span{color:#777}</style>
+<h1>bitwall</h1><ul>%s</ul>
+"""
+
+
+class Control:
+    """The web receiver's own pair of fifos, beside the walls it keeps and
+    outside `bitwall/`: `bitwall-web.in` for commands and `bitwall-web.out`
+    for the answers. Walls are made and removed here and nowhere else, so
+    doing it takes what sending to a wall takes: a way into the host's run
+    directory. Each command may carry `id=<token>`, which comes back on
+    every line it causes, and every command is answered.
+
+    On Windows each is a named pipe at the same path (WINDOWS.md). A pipe
+    has one reader and is done when it goes, so `bitwall-web.out` is made
+    anew for the next reader once one has gone; a caller opens it before
+    it writes its command, as on a fifo, and hears the answer."""
+
+    def __init__(self, server, run):
+        self.server = server
+        self.path_in = os.path.join(run, "bitwall-web.in")
+        self.path_out = os.path.join(run, "bitwall-web.out")
+        self.lines = protocol.Lines()
+        self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self.closing = False
+        if local.PIPES:
+            # Windows: a pipe each, beside the walls (WINDOWS.md).
+            self.out_failed = False
+            self.fd_in = local.make_in(self.path_in)
+            self.fd_out = local.make_out(self.path_out)
+            return
+        os.makedirs(run, exist_ok=True)
+        for path in (self.path_in, self.path_out):
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            os.mkfifo(path, 0o600)
+        self.fd_in = os.open(self.path_in, os.O_RDWR)
+        self.fd_out = os.open(self.path_out, os.O_RDWR | os.O_NONBLOCK)
+
+    def start(self, loop):
+        threading.Thread(target=self._read, args=(loop,), daemon=True).start()
+
+    def _renew(self):
+        """`bitwall-web.out` made again once its reader has gone, on the
+        loop's thread, where it is written."""
+        if self.closing:
+            return
+        if self.fd_out is not None:
+            if not local.gone(self.fd_out):
+                return
+            local.close(self.fd_out)
+            self.fd_out = None
+        try:
+            self.fd_out = local.make_out(self.path_out)
+            self.out_failed = False
+        except OSError as e:
+            if not self.out_failed:
+                say(f"control: {self.path_out}: {e}")
+            self.out_failed = True
+
+    def _read(self, loop):
+        if local.PIPES:
+            while not self.closing:
+                try:
+                    loop.call_soon_threadsafe(self._renew)
+                except RuntimeError:
+                    return                  # the loop has closed
+                if not local.select([self.fd_in], 0.25):
+                    continue
+                try:
+                    data = local.read(self.fd_in, 65536)
+                except BlockingIOError:
+                    continue
+                if data and not self.closing:
+                    loop.call_soon_threadsafe(self._heard, data)
+            return
+        while not self.closing:
+            try:
+                data = os.read(self.fd_in, 65536)
+            except OSError as e:
+                if e.errno == errno.EINTR:
+                    continue
+                return
+            if data and not self.closing:
+                loop.call_soon_threadsafe(self._heard, data)
+        try:
+            os.close(self.fd_in)
+        except OSError:
+            pass
+
+    def _heard(self, data):
+        for said in self.lines.feed(self.decoder.decode(data)):
+            self._obey(said)
+
+    def _say(self, text, cid):
+        if local.PIPES:
+            self._renew()
+            if self.fd_out is None:
+                return
+        try:
+            local.write(self.fd_out, (text + (f" id={cid}" if cid else "") + "\n").encode())
+        except OSError:
+            pass
+
+    def _obey(self, said):
+        cid = said.opts.pop("id", None)
+        if cid is not None and not TOKEN.match(cid):
+            self._say(f"error {plain(said.name)} id: not a token", None)
+            return
+        name = said.name
+        wall = said.args[0] if said.args else None
+        if name == "list":
+            for n in sorted(self.server.walls):
+                self._say(f"wall {n}", cid)
+            self._say(f"walls {len(self.server.walls)}", cid)
+        elif name == "make":
+            if wall is None:
+                self._say("error make no name", cid)
+            elif wall in self.server.walls:
+                self._say(f"error make {plain(wall)}: already a wall", cid)
+            else:
+                try:
+                    self.server.make(wall, said.opts.get("presence"))
+                    self._say(f"made {wall}", cid)
+                except Refused as e:
+                    self._say(f"error make {plain(wall)}: {e}", cid)
+        elif name == "remove":
+            if wall is None:
+                self._say("error remove no name", cid)
+            elif self.server.remove(wall):
+                self._say(f"removed {wall}", cid)
+            else:
+                self._say(f"error remove {plain(wall)}: no such wall", cid)
+        else:
+            self._say(f"error {plain(name)} unknown command", cid)
+
+    def close(self):
+        self.closing = True
+        if local.PIPES:
+            local.close(self.fd_in)
+            local.close(self.fd_out)
+            return
+        try:
+            os.write(self.fd_in, b"\n")
+        except OSError:
+            pass
+        try:
+            os.close(self.fd_out)
+        except OSError:
+            pass
+        for path in (self.path_in, self.path_out):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+def plain(text):
+    """Text from outside, safe to say back on a line."""
+    return re.sub(r"[^\x21-\x7e]", "?", str(text))[:64]
+
+
+def build(run, names, open_names=False, font=14, program="bitwall-web", reach=None,
+          https=None):
+    """The walls named and the routes that show them, for this server or
+    for a program that embeds it -- a Mac window, a page of several walls.
+    Called with the loop running; the walls are `<run>/bitwall/<name>/`.
+    `program` is what each wall's report says keeps it, and `reach` the
+    port and the addresses a tab reaches the server on, `(port, bound)`,
+    where they are known."""
+    s = Server(run, open_names, font, program, reach, https)
+    for name in names:
+        s.make(name)
+    app = web.Application()
+    app.router.add_get("/", s.index)
+    app.router.add_get("/bitwall-screen.js", s.script)
+    app.router.add_get("/font.woff2", s.font_file)
+    app.router.add_get("/icons.woff2", s.icons_file)
+    app.router.add_get("/r/{name}", s.page)
+    app.router.add_get("/ws/{name}", s.socket)
+
+    async def shutdown(app):
+        s.close()
+    app.on_shutdown.append(shutdown)
+    return s, app
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("names", nargs="*", default=[], help="walls to make at startup")
+    ap.add_argument("--run", default=defaults.HOST_RUN,
+                    help="this host's run directory; the wall <name> is RUN/bitwall/<name>")
+    ap.add_argument("--presence", action="append", default=[], metavar="WALL=NAME",
+                    help="the presence a wall named at startup follows")
+    ap.add_argument("--font", type=int, default=14,
+                    help="the font a wall's cells are drawn at until one is asked for")
+    ap.add_argument("--port", type=int, default=defaults.PORT)
+    ap.add_argument("--host", action="append", metavar="ADDR", help=defaults.HOST_HELP)
+    ap.add_argument("--https", metavar="NAME:PORT",
+                    help="where a tab reaches it over HTTPS, as `tailscale serve` puts it "
+                         "in front of 127.0.0.1: said in each wall's report, since a "
+                         "browser decodes a film only on a secure page")
+    args = ap.parse_args()
+    https = None
+    if args.https:
+        name, _, port = args.https.rpartition(":")
+        if not name or not port.isdigit():
+            ap.error("--https NAME:PORT")
+        https = (name, int(port))
+    presence = {}
+    for pair in args.presence:
+        wall, _, name = pair.partition("=")
+        if wall not in args.names or not TOKEN.match(name):
+            ap.error(f"--presence {pair}: a wall named at startup, = a token")
+        presence[wall] = name
+
+    hosts = args.host or [defaults.HOST]
+
+    async def run():
+        bound = ",".join("*" if h in ("0.0.0.0", "::", "") else h for h in hosts)
+        server, app = build(args.run, [], font=args.font, reach=(args.port, bound), https=https)
+        for name in args.names:
+            try:
+                server.make(name, presence.get(name))
+            except Refused as e:
+                say(f"{name}: {e}")
+                return 1
+        control = Control(server, args.run)
+        loop = asyncio.get_running_loop()
+        stop = asyncio.Event()
+        for sig in (signal.SIGTERM, signal.SIGINT, getattr(signal, "SIGHUP", None)):
+            try:
+                loop.add_signal_handler(sig, stop.set)
+            except (NotImplementedError, TypeError):
+                pass            # Windows: Ctrl+C is a KeyboardInterrupt
+        runner = web.AppRunner(app)
+        try:
+            control.start(loop)
+            await runner.setup()
+            for host in hosts:
+                await web.TCPSite(runner, host, args.port).start()
+            say(f"bitwall-web {' '.join(f'http://[{h}]:{args.port}/' if ':' in h else f'http://{h}:{args.port}/' for h in hosts)} "
+                f"run={args.run} control={control.path_in}")
+            await stop.wait()
+        finally:
+            control.close()
+            server.close()
+            await runner.cleanup()
+        return 0
+
+    try:
+        return asyncio.run(run())
+    except KeyboardInterrupt:
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

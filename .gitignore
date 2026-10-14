@@ -1,0 +1,9 @@
+*.pyc
+__pycache__/
+.DS_Store
+bitwall/receivers/pi/bitwall-paint
+
+# What a build of the Python package leaves.
+dist/
+build/
+*.egg-info/

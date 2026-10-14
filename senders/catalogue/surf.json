@@ -1,0 +1,42 @@
+{
+  "label": "Surf",
+  "description": "Waves side on, simulated as a liquid, bursting against a cliff",
+  "start": "../surf/main.py",
+  "moves": true,
+  "options": {
+    "font": {
+      "type": "font",
+      "label": "Font size",
+      "description": "Cell size on the wall",
+      "default": 10,
+      "min": 6,
+      "max": 40
+    },
+    "palette": {
+      "type": "choice",
+      "label": "Palette",
+      "description": "One palette for the water, or a different one with each new coast",
+      "choices": [
+        "all",
+        "overcast",
+        "dusk",
+        "day",
+        "night"
+      ],
+      "default": "all"
+    },
+    "secs": {
+      "type": "choice",
+      "label": "Cycle",
+      "description": "Seconds before a new coast and palette",
+      "choices": [
+        "60",
+        "120",
+        "300",
+        "600",
+        "1800"
+      ],
+      "default": "120"
+    }
+  }
+}

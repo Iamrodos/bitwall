@@ -1,0 +1,35 @@
+#!/bin/sh
+# A GIF made from a recording, with one palette made for the whole of it.
+#
+#     demos/make-gif reel.mp4 reel.gif
+#     demos/make-gif --start 12 --length 25 --width 960 --fps 10 reel.mp4 hero.gif
+#
+# ffmpeg's palettegen over every frame, then paletteuse with a light
+# Bayer dither, which keeps flat panels flat and a film's gradients
+# from banding; only the rectangle that changed is stored for each
+# frame, so a wall that stands still costs little. Says the size made.
+set -eu
+
+start=0 length= width=960 fps=10 colours=256
+while [ $# -gt 2 ]; do
+    case "$1" in
+        --start) start=$2; shift 2 ;;
+        --length) length=$2; shift 2 ;;
+        --width) width=$2; shift 2 ;;
+        --fps) fps=$2; shift 2 ;;
+        --colours) colours=$2; shift 2 ;;
+        *) echo "make-gif: unknown option $1" >&2; exit 2 ;;
+    esac
+done
+[ $# -eq 2 ] || { echo "usage: make-gif [--start s] [--length s] [--width px] [--fps n] [--colours n] in out.gif" >&2; exit 2; }
+in=$1 out=$2
+
+cut="-ss $start"
+[ -n "$length" ] && cut="$cut -t $length"
+chain="fps=$fps,scale=$width:-2:flags=lanczos"
+
+# shellcheck disable=SC2086
+ffmpeg -loglevel error -y $cut -i "$in" -filter_complex \
+    "[0:v]$chain,split[a][b];[a]palettegen=max_colors=$colours:stats_mode=full[p];[b][p]paletteuse=dither=bayer:bayer_scale=4:diff_mode=rectangle" \
+    "$out"
+ls -l "$out" | awk '{printf "make-gif: %s, %.1f MB\n", $NF, $5 / 1048576}'

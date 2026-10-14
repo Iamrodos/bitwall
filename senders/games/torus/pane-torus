@@ -1,0 +1,117 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.14"
+# dependencies = ["numpy"]
+# ///
+"""A spinning donut in a terminal, or in a tmux pane.
+
+    senders/games/torus/pane-torus
+    senders/games/torus/pane-torus --shape knot --palette ice
+
+One of the two front ends on `torus.py`. It takes the area from the terminal
+itself, asks the scene for a grid, and writes the cells that changed since
+the last frame as ANSI. Diffing matters here for the same reason it matters
+on a wall: the solid covers a fraction of the pane and everything around it
+is background that has not moved.
+
+Colours go out as truecolor SGR, because the shading has more values in it
+than the 256 palette holds and banding is exactly what a gradient this
+small cannot afford.
+
+Autowrap is turned off because the grid is exactly as wide as the screen,
+and with wrap on the last cell of a line pushes the cursor onto the next.
+"""
+import argparse
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from torus import PALETTES, SHAPES, Scene                       # noqa: E402
+
+FPS = 25
+GAP = 4          # re-homing the cursor costs more than a few unchanged cells
+
+
+def sgr(g):
+    p = ["0"]
+    p += ["39"] if g.fg is None else ["38", "2", *_rgb(g.fg)]
+    p += ["49"] if g.bg is None else ["48", "2", *_rgb(g.bg)]
+    return "\033[" + ";".join(p) + "m"
+
+
+def _rgb(h):
+    return [str(int(h[i:i + 2], 16)) for i in (0, 2, 4)]
+
+
+def paint(grid, prev, cols, rows):
+    """ANSI for the cells that differ from the previous frame."""
+    out = []
+    cur = None
+    for y in range(rows):
+        row = grid[y]
+        old = prev[y] if prev is not None and y < len(prev) else None
+        x = 0
+        while x < cols:
+            if old is not None and row[x] == old[x]:
+                x += 1
+                continue
+            start, end, gap, probe = x, x + 1, 0, x + 1
+            while probe < cols:
+                if old is not None and row[probe] == old[probe]:
+                    gap += 1
+                    if gap > GAP:
+                        break
+                else:
+                    end = probe + 1
+                    gap = 0
+                probe += 1
+            out.append(f"\033[{y + 1};{start + 1}H")
+            for i in range(start, end):
+                g = row[i]
+                a = (g.fg, g.bg)
+                if a != cur:
+                    out.append(sgr(g))
+                    cur = a
+                out.append(g.ch)
+            x = end
+    if out:
+        out.append("\033[0m")
+    return "".join(out)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="pane-torus")
+    p.add_argument("--shape", default="torus", choices=list(SHAPES) + ["all"])
+    p.add_argument("--palette", default="ember", choices=sorted(PALETTES))
+    p.add_argument("--spin", type=float, default=1.0)
+    opts = p.parse_args()
+
+    scene = Scene(shape=opts.shape, palette=opts.palette, spin=opts.spin)
+    prev = None
+    area = None
+    sys.stdout.write("\033[?25l\033[?7l\033[0m\033[2J")
+    try:
+        while True:
+            cols, rows = os.get_terminal_size()
+            if (cols, rows) != area:
+                area, prev = (cols, rows), None
+                sys.stdout.write("\033[0m\033[2J")
+            grid = scene.frame(cols, rows)
+            data = paint(grid, prev, cols, rows)
+            prev = grid
+            if data:
+                sys.stdout.write(data)
+                sys.stdout.flush()
+            time.sleep(1.0 / FPS)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sys.stdout.write("\033[0m\033[?7h\033[?25h\033[2J\033[H")
+        sys.stdout.flush()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,136 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0a0a0c">
+<title>bitwall demos</title>
+
+<!--
+  One wall in the middle, its neighbours either side.
+
+  Every box is a receiver in its own right, with its own name, run directory
+  and sender. Only the three in view exist: moving along creates the one
+  arriving and destroys the one leaving, so a wall nobody is looking at has
+  nothing watching it and its sender has nothing to do.
+-->
+<style>
+  @font-face {
+    font-family: "bitwall wall";
+    src: url("/font.woff2") format("woff2");
+    font-display: block;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #0a0a0c; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+
+  .row { display: flex; align-items: center; justify-content: center;
+         gap: 3vw; width: 100%; min-width: 0; }
+
+  .slot { position: relative; background: #000; border-radius: 10px;
+          overflow: hidden; flex: 0 0 auto;
+          transition: height .28s ease, opacity .28s ease,
+                      box-shadow .28s ease, filter .28s ease; }
+  .slot bitwall-screen { position: absolute; inset: 0; display: block; }
+
+  /* Height is what is asked for and the shape decides the width -- but a
+     wide demo asked for 72vh is wider than the window, and shoulders its
+     neighbours off the screen. So width is capped too, and a wide one
+     simply comes out shorter. */
+  .side { height: 15vh; max-width: 13vw; opacity: .4; filter: brightness(.6);
+          cursor: pointer; box-shadow: 0 0 0 1px #1c1c22; }
+  .side:hover { opacity: .75; filter: brightness(1); }
+  .mid  { height: 68vh; max-width: 54vw;
+          box-shadow: 0 0 0 1px #2c2c33, 0 24px 60px rgba(0,0,0,.85); }
+
+  .arrow { position: fixed; top: 50%; transform: translateY(-50%);
+           width: 52px; height: 52px; border: 0; border-radius: 50%;
+           background: rgba(26,26,31,.85); color: #ddd; font: 24px/1 system-ui;
+           cursor: pointer; opacity: 0; transition: opacity .2s; z-index: 3; }
+  body:hover .arrow { opacity: 1; }
+  .arrow:hover { background: #2e2e37; }
+  #prev { left: 18px; }
+  #next { right: 18px; }
+
+  #label { position: fixed; left: 0; right: 0; bottom: 18px; text-align: center;
+           color: #6a6a72; font: 12px ui-monospace, Menlo, monospace;
+           letter-spacing: .08em; }
+</style>
+
+<button class="arrow" id="prev" aria-label="previous">&lsaquo;</button>
+<div class="row" id="row"></div>
+<button class="arrow" id="next" aria-label="next">&rsaquo;</button>
+<div id="label"></div>
+
+<script src="/bitwall-screen.js"></script>
+<script>
+(function () {
+  var DEMOS = {{DEMOS}};
+  var row = document.getElementById('row');
+  var label = document.getElementById('label');
+  var at = 0;
+
+  function shape(d) {
+    return (d.cols && d.rows) ? (d.cols + ' / ' + (d.rows * 2)) : '16 / 9';
+  }
+
+  /* Only the three in view exist. Moving along builds the one arriving and
+     throws away the one leaving, which closes its socket -- so a wall out
+     of sight has nobody watching it. */
+  function draw() {
+    var n = DEMOS.length;
+    var want = n === 1 ? [0] : n === 2 ? [at, (at + 1) % n]
+             : [(at - 1 + n) % n, at, (at + 1) % n];
+
+    row.textContent = '';
+    want.forEach(function (i, pos) {
+      var d = DEMOS[i];
+      var mid = (n === 1) || (n === 2 ? pos === 0 : pos === 1);
+      var slot = document.createElement('div');
+      slot.className = 'slot ' + (mid ? 'mid' : 'side');
+      slot.style.aspectRatio = shape(d);
+      if (!mid) slot.onclick = function () { at = i; draw(); };
+
+      var w = document.createElement('bitwall-screen');
+      w.setAttribute('name', d.name);
+      if (d.cols && d.rows) {
+        w.setAttribute('cols', d.cols);
+        w.setAttribute('rows', d.rows);
+      }
+      slot.appendChild(w);
+      row.appendChild(slot);
+    });
+    var d = DEMOS[at];
+    label.textContent = (d.label || d.name) +
+      (d.cols ? '   ' + d.cols + 'x' + d.rows : '');
+  }
+
+  function step(dir) { at = (at + dir + DEMOS.length) % DEMOS.length; draw(); }
+
+  /* Moving along by hand restarts the clock: somebody who has just
+     chosen a wall means to look at it, and being carried off it a
+     second later is the page arguing with them. */
+  var SECS = parseFloat(
+    new URLSearchParams(location.search).get('rotate') || '0');
+  var timer = null;
+  function wind() {
+    if (timer) clearInterval(timer);
+    if (SECS > 0) timer = setInterval(function () { step(1); }, SECS * 1000);
+  }
+  function go(dir) { step(dir); wind(); }
+
+  document.getElementById('prev').onclick = function () { go(-1); };
+  document.getElementById('next').onclick = function () { go(1); };
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'ArrowLeft') go(-1);
+    if (e.key === 'ArrowRight') go(1);
+    if (e.key === 'f' || e.key === 'F') {
+      /* The whole page rather than one wall: the label and the
+         neighbours either side are part of what this is. */
+      if (document.fullscreenElement) document.exitFullscreen();
+      else document.documentElement.requestFullscreen();
+    }
+  });
+  wind();
+
+  draw();
+})();
+</script>

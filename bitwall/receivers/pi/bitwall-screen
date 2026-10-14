@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""Runs the walls on this machine's screens: the painter, kept alive.
+
+    bitwall-screen [--font 14] [--font-file PATH] [--driver kmsdrm]
+                   [--presence WALL=NAME ...] [--rotate WALL=0|90|180|270 ...]
+                   [--workers N] [--decoder-threads N] [--decoder-nice N]
+
+`bitwall-paint` is the whole receiver. It claims a wall for each output it
+finds connected, `bitwall/<N>/` in the run directory, keeps each wall's
+door, opens a session for each caller and puts the frames on the glass
+through KMS directly, with no compositor and no terminal emulator in the
+path. What a sender sends is already cells.
+
+**It is kept alive.** A painter that dies takes its walls down, so it is
+started again after a pause; a sender that was on a wall finds the door
+again and reattaches on its own.
+"""
+import argparse
+import os
+import signal
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+RUN = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+
+#: How long to wait before starting something that has just died. Long
+#: enough that a fault which repeats cannot become a fork bomb, short
+#: enough that a wall is back before anybody walks over to look at it.
+REGRET = 2.0
+
+FONT = os.path.expanduser(
+    "~/.local/share/fonts/MesloLGSNerdFontMono-Regular.ttf")
+
+
+KEPT = {}
+
+
+def paint(font, font_file, driver, presence=(), rotate=(), knobs=()):
+    """The painter, started again whenever it exits. `knobs` are its thread
+    knobs, as (option, value), where given."""
+    while True:
+        argv = [os.path.join(HERE, "bitwall-paint"),
+                "--font", str(font), "--font-file", font_file,
+                "--driver", driver, "--run", RUN, "--walls", "auto"]
+        for pair in presence:
+            argv += ["--presence", pair]
+        for pair in rotate:
+            argv += ["--rotate", pair]
+        for option, value in knobs:
+            argv += [option, str(value)]
+        try:
+            proc = subprocess.Popen(argv, stdout=subprocess.PIPE, text=True)
+        except OSError as e:
+            print(f"bitwall-screen: paint: {e}", file=sys.stderr, flush=True)
+            time.sleep(REGRET)
+            continue
+        KEPT["paint"] = proc
+        for _ in proc.stdout:
+            pass                # drained, so the pipe cannot fill
+        code = proc.wait()
+        print(f"bitwall-screen: paint exited {code}, restarting",
+              file=sys.stderr, flush=True)
+        time.sleep(REGRET)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--font", type=int, default=14)
+    ap.add_argument("--font-file", default=FONT)
+    ap.add_argument("--driver", default="kmsdrm")
+    ap.add_argument("--presence", action="append", default=[],
+                    metavar="WALL=NAME",
+                    help="the presence a wall follows, handed to the painter")
+    ap.add_argument("--rotate", action="append", default=[],
+                    metavar="WALL=DEGREES",
+                    help="how far clockwise a wall's picture is turned, for a screen "
+                         "hung that way, handed to the painter")
+    for knob, says in (("workers", "threads decoding pictures and encoding snapshots"),
+                       ("decoder-threads", "ffmpeg's -threads for a stream on `data`"),
+                       ("decoder-nice", "how far ffmpeg is niced below the painter")):
+        ap.add_argument(f"--{knob}", type=int, metavar="N",
+                        help=f"{says}, handed to the painter (default: its own)")
+    a = ap.parse_args()
+    knobs = [(f"--{k}", v) for k, v in (("workers", a.workers),
+                                         ("decoder-threads", a.decoder_threads),
+                                         ("decoder-nice", a.decoder_nice)) if v is not None]
+
+    def stop(*_):
+        for proc in KEPT.values():
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        sys.exit(0)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, stop)
+
+    print(f"bitwall-screen: font {a.font}  {a.font_file}  {a.driver}"
+          + "".join(f"  presence {p}" for p in a.presence)
+          + "".join(f"  rotate {r}" for r in a.rotate)
+          + "".join(f"  {o.lstrip('-')} {v}" for o, v in knobs), flush=True)
+    paint(a.font, a.font_file, a.driver, a.presence, a.rotate, knobs)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,95 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.14"
+# dependencies = ["fonttools[woff]>=4.50"]
+# ///
+"""Cut the wall font down to what a wall draws, as woff2.
+
+    bitwall/receivers/web/make-font ~/Library/Fonts/MesloLGSNerdFontMono-Regular.ttf
+
+The web receiver serves `wall.woff2` and the page asks for it first. With
+no file there a browser falls back to whatever the machine has, which on a
+Mac is Menlo -- fine for text and the blocks, missing the braille, the
+katakana and the Nerd Font range. So the same stream looks different on a
+browser and on the Pi, and only the Pi's is what the sender meant.
+
+**Subset rather than shipped whole.** A patched Nerd Font is about three
+megabytes and most of it is icons for programming languages, which no wall
+draws. Taking the ranges senders actually use gets that down by an order
+of magnitude, and every range kept is one the browser can then be told
+about: a receiver serving a font it chose can answer the `glyphs` question
+honestly, where one falling back through the system cannot.
+
+The ranges below are what this repo's senders emit, and the comment on
+each says which. Add a range when a sender needs one.
+
+**The Nerd Font icons are a second file, `icons.woff2`**, the sets Nerd
+Fonts patches in, ten times the size of the rest. The page names it
+for their ranges alone (`unicode-range`), so a browser fetches it the
+first time a wall draws an icon and never for a wall that does not.
+"""
+import os
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+OUT = os.path.join(HERE, "wall.woff2")
+ICONS_OUT = os.path.join(HERE, "icons.woff2")
+
+#: What a wall draws, by who draws it. A range is here because something
+#: emits it, not because it seemed likely.
+RANGES = [
+    ("U+0020-007E", "ASCII: every sender"),
+    ("U+00A0-00FF", "Latin-1: degree and section signs"),
+    ("U+0100-017F", "Latin Extended-A: labels and film titles"),
+    ("U+2000-206F", "punctuation: dashes, bullets, ellipsis"),
+    ("U+2190-21FF", "arrows: the machine panel"),
+    ("U+2200-22FF", "operators: set and dot glyphs"),
+    ("U+2300-23FF", "technical: the house, the clock face"),
+    ("U+2500-257F", "box drawing: every panel border, wang tiles"),
+    ("U+2580-259F", "blocks: video, matrix, pipes, torus, leds"),
+    ("U+25A0-25FF", "geometric: the leds emitter, machine's dots"),
+    ("U+2600-27BF", "symbols and dingbats"),
+    ("U+2800-28FF", "braille: sub-cell rendering"),
+    ("U+FF61-FF9F", "halfwidth katakana: matrix rain"),
+    ("U+E0A0-E0A3,U+E0B0-E0D7", "powerline: anything hosted from a shell"),
+]
+
+#: The Nerd Font icon sets, as Nerd Fonts places them, cut to `icons.woff2`.
+#: The web receiver claims the same spans in `glyphs=` (`ICONS` there).
+ICONS = [
+    ("U+E300-E3E3", "Weather"),
+    ("U+EA60-EC1E", "Codicons"),
+    ("U+F000-F2E0", "Font Awesome"),
+    ("U+F400-F533", "Octicons"),
+    ("U+F0001-F1AF0", "Material Design"),
+]
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__.split("\n\n")[1].strip(), file=sys.stderr)
+        return 2
+    src = os.path.expanduser(sys.argv[1])
+    if not os.path.exists(src):
+        print(f"make-font: no such font: {src}", file=sys.stderr)
+        return 2
+    for out, ranges in ((OUT, RANGES), (ICONS_OUT, ICONS)):
+        cmd = ["pyftsubset", src,
+               f"--unicodes={','.join(r for r, _why in ranges)}",
+               "--layout-features=",          # a wall needs no shaping
+               "--no-hinting",                # the browser is not hinting these
+               "--desubroutinize",
+               "--flavor=woff2",
+               f"--output-file={out}"]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode:
+            print(r.stderr or r.stdout, file=sys.stderr)
+            return r.returncode
+        print(f"  {os.path.basename(src)}  {os.path.getsize(src) / 1024:.0f}K"
+              f"  ->  {os.path.basename(out)}  {os.path.getsize(out) / 1024:.0f}K",
+              flush=True)
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

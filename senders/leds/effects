@@ -1,0 +1,370 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.14"
+# ///
+"""The classic LED effects, sent as pixels.
+
+    senders/leds/effects --effect fire --size 64x64 127.0.0.1
+    senders/leds/effects --effect pacifica --size 96x48 --fps 30 127.0.0.1
+    senders/leds/effects --effect confetti,sinelon,juggle --secs 12 host
+    senders/leds/effects --list
+
+Nothing here is part of bitwall. It speaks DDP and sACN to whatever is
+listening, so `senders/leds/main.py` shows it and so would a real panel.
+
+**The effects are adapted from FastLED's examples**, which is where this
+canon comes from: `Fire2012` and `Pacifica` are Mark Kriegsman's, and the
+strip patterns are `DemoReel100`, taken out of the reel it shipped in.
+A reel is how one Arduino sketch was packaged, not something they
+share, and behind a parent they could not be asked for by name or take
+their turn fairly in a rotation.
+
+FastLED is MIT, and these are reimplementations in python of the published
+algorithms rather than translations of the code.
+
+They were written for a strip -- one dimension, a few hundred pixels -- so
+the interesting part of the port is what each one means on a grid. Fire
+becomes a column of heat per x, which is what it always wanted to be.
+Pacifica's layered waves become two-dimensional, which is nearly free
+because it was already summing phase-shifted fields. The strip patterns
+walk the wiring order, so on a matrix they sweep as the strip is wired --
+which is the honest rendering of what the original does.
+"""
+import argparse
+import colorsys
+import math
+import random
+import socket
+import struct
+import sys
+import time
+
+CHUNK = 1440          # a datagram that clears macOS's 9216 byte limit
+
+
+def wheel(h, s=1.0, v=1.0):
+    """A colour from a hue in turns, the way `CHSV` does it."""
+    r, g, b = colorsys.hsv_to_rgb(h % 1.0, s, max(0.0, min(1.0, v)))
+    return int(r * 255), int(g * 255), int(b * 255)
+
+
+def heat_colour(heat):
+    """Black through red and orange to white, as `HeatColor` does.
+
+    The ramp is the whole of why Fire2012 looks like fire: the hottest
+    third goes white rather than brighter red, which is what an eye reads
+    as a flame's core.
+    """
+    t = max(0, min(255, heat))
+    if t < 85:
+        return (t * 3, 0, 0)
+    if t < 170:
+        return (255, (t - 85) * 3, 0)
+    return (255, 255, (t - 170) * 3)
+
+
+class Fire:
+    """Fire2012, a column of heat per x.
+
+    Each column keeps a heat array. Every step it cools by a little more
+    than it is sparked, heat drifts upward by averaging with its
+    neighbours below, and new heat appears at random near the base. The
+    three numbers that matter are cooling, sparking and how tall the
+    column is -- on a taller grid the same cooling makes a shorter flame,
+    so it is scaled by the height.
+    """
+
+    name = "fire"
+
+    def __init__(self, w, h, rng):
+        self.w, self.h, self.rng = w, h, rng
+        self.heat = [[0] * h for _ in range(w)]
+        self.cooling = 55
+        self.sparking = 120
+
+    def step(self, t):
+        rng = self.rng
+        for x in range(self.w):
+            col = self.heat[x]
+            # Cool everything a little, more the higher it has risen.
+            for y in range(self.h):
+                col[y] = max(0, col[y]
+                             - rng.randrange(0, self.cooling * 10 // self.h + 2))
+            # Heat drifts up and diffuses into its neighbours.
+            for y in range(self.h - 1, 1, -1):
+                col[y] = (col[y - 1] + col[y - 2] + col[y - 2]) // 3
+            # And is born at the bottom, sometimes.
+            if rng.randrange(255) < self.sparking:
+                at = rng.randrange(min(7, self.h))
+                col[at] = min(255, col[at] + rng.randrange(160, 255))
+
+    def pixels(self):
+        out = []
+        for y in range(self.h):
+            # Row 0 is the top of the screen and the top of the flame, so
+            # the column is read from its far end.
+            up = self.h - 1 - y
+            for x in range(self.w):
+                out.append(heat_colour(self.heat[x][up]))
+        return out
+
+
+class Pacifica:
+    """Pacifica: four layers of wave, summed, then lit from above.
+
+    Kriegsman's original sums four phase-shifted and differently-scaled
+    sine layers along a strip, adds a slow brightness wander, and then
+    lightens whatever came out nearest the crests. Two dimensions cost
+    almost nothing because it was already a sum of fields; the second axis
+    just enters each layer's phase.
+    """
+
+    name = "pacifica"
+
+    #: Each layer's scale, speed and weight. Four rather than three so the
+    #: pattern does not visibly repeat, which is the whole trick.
+    LAYERS = ((0.18, 0.31, 0.45), (0.11, -0.22, 0.35),
+              (0.06, 0.13, 0.30), (0.29, -0.09, 0.20))
+
+    def __init__(self, w, h, rng):
+        self.w, self.h = w, h
+        self.t = 0.0
+
+    def step(self, t):
+        self.t = t
+
+    def pixels(self):
+        out = []
+        t = self.t
+        for y in range(self.h):
+            for x in range(self.w):
+                v = 0.0
+                for scale, speed, weight in self.LAYERS:
+                    v += weight * math.sin(x * scale + y * scale * 0.6
+                                           + t * speed * 6.0)
+                v = (v + 1.0) / 2.0
+                # Deep blue-green at rest, cyan in the swell, and white
+                # only where two crests meet -- which is what makes it
+                # read as water rather than as a gradient.
+                hue = 0.5 + 0.08 * v
+                sat = 1.0 - 0.75 * max(0.0, v - 0.72) / 0.28
+                val = 0.10 + 0.90 * v ** 2
+                out.append(wheel(hue, max(0.0, sat), val))
+        return out
+
+
+class Strip:
+    """A one-dimensional pattern, drawn along the wiring.
+
+    These were written for a strip, and they are left that way: on a
+    matrix they sweep in the order the strip is wired, which is what they
+    actually look like on the thing they were written for. Each keeps its
+    own buffer because several of them work by fading what they drew last
+    frame rather than by computing a whole picture.
+    """
+
+    def __init__(self, w, h, rng):
+        self.w, self.h, self.rng = w, h, rng
+        self.n = w * h
+        self.leds = [(0, 0, 0)] * self.n
+        self.hue = 0.0
+
+    def fade(self, share):
+        self.leds = [tuple(int(c * share) for c in p) for p in self.leds]
+
+    def step(self, t):
+        self.hue = (t * 0.06) % 1.0
+        self.draw(t)
+
+    def pixels(self):
+        return self.leds
+
+
+class Rainbow(Strip):
+    name = "rainbow"
+
+    def draw(self, t):
+        self.leds = [wheel(self.hue + i / self.n) for i in range(self.n)]
+
+
+class Glitter(Rainbow):
+    """The rainbow, with white sparks thrown over it."""
+
+    name = "glitter"
+
+    def draw(self, t):
+        super().draw(t)
+        for _ in range(self.n // 80 + 1):
+            if self.rng.randrange(100) < 30:
+                self.leds[self.rng.randrange(self.n)] = (255, 255, 255)
+
+
+class Confetti(Strip):
+    """Speckles that fade, each a little off the wandering hue."""
+
+    name = "confetti"
+
+    def draw(self, t):
+        self.fade(0.90)
+        self.leds[self.rng.randrange(self.n)] = \
+            wheel(self.hue + self.rng.random() * 0.18)
+
+
+class Sinelon(Strip):
+    """One dot sweeping back and forth, leaving a fading tail."""
+
+    name = "sinelon"
+
+    def draw(self, t):
+        self.fade(0.80)
+        self.leds[int((math.sin(t * 1.3) + 1) / 2 * (self.n - 1))] = \
+            wheel(self.hue)
+
+
+class Juggle(Strip):
+    """Eight dots at eight speeds, their colours adding where they cross."""
+
+    name = "juggle"
+
+    def draw(self, t):
+        self.fade(0.80)
+        for i in range(8):
+            at = int((math.sin(t * (0.7 + i * 0.13)) + 1) / 2 * (self.n - 1))
+            r, g, b = wheel(i / 8.0)
+            was = self.leds[at]
+            self.leds[at] = (min(255, was[0] + r), min(255, was[1] + g),
+                             min(255, was[2] + b))
+
+
+EFFECTS = {c.name: c for c in (Fire, Pacifica, Rainbow,
+                               Glitter, Confetti, Sinelon, Juggle)}
+
+
+def ddp(offset, payload, last):
+    head = bytearray(10)
+    head[0] = 0x41 if last else 0x40
+    head[2] = 0x0B
+    head[3] = 1
+    struct.pack_into(">I", head, 4, offset)
+    struct.pack_into(">H", head, 8, len(payload))
+    return bytes(head) + payload
+
+
+def send_ddp(sock, where, pixels):
+    flat = bytearray()
+    for rgb in pixels:
+        flat += bytes(rgb)
+    for at in range(0, len(flat), CHUNK):
+        part = flat[at:at + CHUNK]
+        sock.sendto(ddp(at, bytes(part), at + CHUNK >= len(flat)), where)
+
+
+def sacn_packet(universe, channels, seq):
+    data = bytearray(126 + len(channels))
+    struct.pack_into(">H", data, 0, 0x0010)
+    data[4:16] = b"ASC-E1.17\x00\x00\x00"
+    struct.pack_into(">I", data, 18, 4)
+    struct.pack_into(">I", data, 40, 2)
+    data[44:51] = b"bitwall"
+    data[108] = 100
+    data[111] = seq & 0xFF
+    struct.pack_into(">H", data, 113, universe)
+    data[117] = 0x02
+    data[118] = 0xA1
+    struct.pack_into(">H", data, 123, 1 + len(channels))
+    data[126:126 + len(channels)] = channels
+    return bytes(data)
+
+
+def send_sacn(sock, where, pixels, first, seq):
+    flat = bytearray()
+    for rgb in pixels:
+        flat += bytes(rgb)
+    for n, at in enumerate(range(0, len(flat), 510)):
+        sock.sendto(sacn_packet(first + n, flat[at:at + 510], seq), where)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("host", nargs="?", default="127.0.0.1")
+    ap.add_argument("--effect", default="all",
+                    help="one effect, several comma-separated, or all "
+                         "(default); --list names them")
+    ap.add_argument("--size", default="64x64")
+    ap.add_argument("--fps", type=float, default=30.0)
+    ap.add_argument("--secs", type=float, default=20.0,
+                    help="seconds an effect holds before the next")
+    ap.add_argument("--list", action="store_true",
+                    help="name the effects and exit")
+    ap.add_argument("--protocol", choices=("ddp", "sacn"), default="ddp")
+    ap.add_argument("--port", type=int, default=0,
+                    help="default: 4048 for ddp, 5568 for sacn")
+    ap.add_argument("--universe", type=int, default=1)
+    ap.add_argument("--seed", type=int, default=0)
+    args = ap.parse_args()
+
+    def spoke(what, value):
+        print(f"effects: {what}; using {value}", file=sys.stderr, flush=True)
+        return value
+
+    try:
+        w, h = (int(v) for v in args.size.lower().split("x"))
+        if not (0 < w <= 512 and 0 < h <= 512 and w * h <= 200_000):
+            raise ValueError
+    except ValueError:
+        w, h = spoke(f"{args.size!r} is not a size", (64, 64))
+    fps = args.fps if 0.1 <= args.fps <= 120 else spoke(
+        f"{args.fps} frames a second is not sensible", 30.0)
+    if args.list:
+        print(" ".join(EFFECTS))
+        return 0
+    order = list(EFFECTS) if args.effect == "all" else \
+        [n for n in args.effect.split(",") if n in EFFECTS]
+    if not order:
+        order = spoke(f"{args.effect!r} names no effect I have",
+                      list(EFFECTS))
+
+    port = args.port or (4048 if args.protocol == "ddp" else 5568)
+    rng = random.Random(args.seed or None)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # Not the port the wall listens on: two sockets bound to one UDP port
+    # on this machine means the packets go to whichever bound last, and
+    # the wall would quietly receive nothing.
+    if args.protocol == "sacn":
+        sock.bind(("", 5569))
+    where = (args.host, port)
+
+    print(f"effects -> {args.host}:{port}  {w}x{h} over "
+          f"{args.protocol}  {'+'.join(order)}  {fps:g}fps  "
+          f"(ctrl-c to stop)", flush=True)
+
+    start = time.monotonic()
+    at = 0
+    show = EFFECTS[order[0]](w, h, rng)
+    swapped = start
+    seq = 0
+    try:
+        while True:
+            now = time.monotonic()
+            t = now - start
+            if now - swapped >= args.secs:
+                swapped = now
+                if len(order) > 1:
+                    at = (at + 1) % len(order)
+                    show = EFFECTS[order[at]](w, h, rng)
+                    print(f"  {show.name}", flush=True)
+            show.step(t)
+            pixels = show.pixels()
+            if args.protocol == "ddp":
+                send_ddp(sock, where, pixels)
+            else:
+                send_sacn(sock, where, pixels, args.universe, seq)
+            seq += 1
+            time.sleep(max(0.0, 1.0 / fps - (time.monotonic() - now)))
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

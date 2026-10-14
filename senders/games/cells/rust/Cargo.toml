@@ -1,0 +1,10 @@
+[package]
+name = "cells"
+version = "1.0.0"
+edition = "2024"
+description = "cells, in Rust, on bitwall's Rust library: the same organisms as life.py"
+publish = false
+
+[dependencies]
+bitwall = { path = "../../../../bitwall/rust" }
+rayon = "1.12.0"

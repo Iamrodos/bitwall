@@ -1,0 +1,176 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# dependencies = ["numpy"]
+# ///
+"""Video in a terminal, or in a tmux pane.
+
+    senders/games/cellfilm/pane-video FILE
+    senders/games/cellfilm/pane-video --mode fine --fps 24 FILE
+    senders/games/cellfilm/pane-video --shuffle --stats DIRECTORY
+    senders/games/cellfilm/pane-video --bench FILE
+
+One of the two front ends on `player.py`. It takes the area from the
+terminal itself, asks the player for a grid, and writes it as ANSI.
+
+Every cell goes out every frame -- a film changes all of them -- so what
+earns its keep is the run encoding below rather than a comparison against
+the last frame: one SGR covers a run of cells that share a colour pair, and
+the flat regions of a picture are long runs.
+
+`--stats` prints the frame rate and the bytes per frame to stderr, and
+`--bench` times every mode against the same file, which is how the rates
+were measured rather than assumed.
+"""
+import os
+import sys
+import time
+import zlib
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from player import MODES, OPTIONS, Player, parse_args             # noqa: E402
+
+USAGE = ("usage: pane-video [options] FILE|DIRECTORY ...\n" + OPTIONS +
+         "\n  --stats        frame and byte rates to stderr"
+         "\n  --bench        time every mode on this file and exit")
+
+
+class Ansi(dict):
+    """The escape that sets a glyph's colours, made once per colour pair."""
+
+    def __missing__(self, key):
+        if len(self) > 200000:
+            self.clear()
+        fg, bg = key
+        p = ["0"]
+        p += ["39"] if fg is None else \
+            ["38", "2", str(int(fg[0:2], 16)), str(int(fg[2:4], 16)),
+             str(int(fg[4:6], 16))]
+        p += ["49"] if bg is None else \
+            ["48", "2", str(int(bg[0:2], 16)), str(int(bg[2:4], 16)),
+             str(int(bg[4:6], 16))]
+        v = "\033[" + ";".join(p) + "m"
+        self[key] = v
+        return v
+
+
+SGR = Ansi()
+
+
+def paint(grid, cols, rows):
+    """ANSI for a whole frame, one SGR per run of matching colours."""
+    out = ["\033[H"]
+    cur = None
+    sgr = SGR.__getitem__
+    for y in range(rows):
+        if y:
+            out.append("\033[%d;1H" % (y + 1))
+        for g in grid[y]:
+            a = (g.fg, g.bg)
+            if a != cur:
+                out.append(sgr(a))
+                cur = a
+            out.append(g.ch)
+    out.append("\033[0m")
+    return "".join(out)
+
+
+def bench(paths, opts, cols, rows, n=90):
+    """What each mode costs on the same footage, at the same area.
+
+    Paced flat out rather than to the frame cap: what a bench answers is
+    what the mode can do, not what the clock lets it do. The deflate figure
+    is one stream rather than a frame at a time, because that is how
+    `ssh -C` sees it.
+    """
+    print("%dx%d cells, %d frames of %s"
+          % (cols, rows, n, os.path.basename(paths[0])))
+    for mode in MODES:
+        p = Player(paths, **dict(opts, mode=mode))
+        p.frame(cols, rows)
+        for _ in range(20):                     # let the queue fill
+            p.next_frame = 0
+            p.frame(cols, rows)
+        build = enc = 0.0
+        raw = comp = 0
+        z = zlib.compressobj(6)
+        t0 = time.perf_counter()
+        for _ in range(n):
+            p.next_frame = 0
+            a = time.perf_counter()
+            grid = p.frame(cols, rows)
+            b = time.perf_counter()
+            data = paint(grid, cols, rows).encode()
+            c = time.perf_counter()
+            build += b - a
+            enc += c - b
+            raw += len(data)
+            comp += len(z.compress(data)) + len(z.flush(zlib.Z_SYNC_FLUSH))
+        el = time.perf_counter() - t0
+        tw, th = p.tile
+        print("  %-8s %3dx%-3d px  %6.1f fps  build %5.1f ms  encode %4.1f ms"
+              "  raw %6.0f B  deflate %5.0f B/frame"
+              % (mode, cols * tw, rows * th, n / el, build / n * 1000,
+                 enc / n * 1000, raw / n, comp / n))
+        p.close()
+
+
+def main():
+    args = sys.argv[1:]
+    stats = "--stats" in args
+    want_bench = "--bench" in args
+    args = [a for a in args if a not in ("--stats", "--bench")]
+    rest, opts = parse_args(args, USAGE)
+
+    try:
+        cols, rows = os.get_terminal_size()
+    except OSError:
+        cols, rows = 174, 42
+    if want_bench:
+        bench(rest, opts, cols, rows)
+        return 0
+
+    player = Player(rest, **opts)
+    area = None
+    sent = frames = 0
+    t0 = time.monotonic()
+    sys.stdout.write("\033[?25l\033[?7l\033[0m\033[2J")
+    try:
+        while True:
+            cols, rows = os.get_terminal_size()
+            if (cols, rows) != area:
+                area = (cols, rows)
+                sys.stdout.write("\033[0m\033[2J")
+            t = time.perf_counter()
+            grid = player.frame(cols, rows)
+            data = paint(grid, cols, rows)
+            sys.stdout.write(data)
+            sys.stdout.flush()
+            sent += len(data.encode("utf-8"))
+            frames += 1
+            if stats and frames % opts["fps"] == 0:
+                el = time.monotonic() - t0
+                tw, th = player.tile
+                sys.stderr.write(
+                    "\r%s %dx%d px %dx%d  %5.1f fps  %7d B/frame  "
+                    "%6.0f KiB/s  %5.1f ms  %s @%.0fs " %
+                    (player.mode, cols, rows, cols * tw, rows * th,
+                     frames / el, sent / frames, sent / el / 1024,
+                     (time.perf_counter() - t) * 1000,
+                     os.path.basename(player.path)[:28], player.position))
+                sys.stderr.flush()
+            time.sleep(max(0.0, player.next_frame - time.monotonic()))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        player.close()
+        sys.stdout.write("\033[0m\033[?7h\033[?25h\033[2J\033[H")
+        sys.stdout.flush()
+        el = max(1e-6, time.monotonic() - t0)
+        sys.stderr.write("\n%d frames, %.1f fps, %d bytes, %.0f KiB/s\n"
+                         % (frames, frames / el, sent, sent / el / 1024))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

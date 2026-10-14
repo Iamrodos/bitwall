@@ -1,0 +1,18 @@
+{
+  "label": "Films",
+  "description": "Films from the media directory, one after another, drawn in cells",
+  "start": "../games/cellfilm/main.py",
+  "options": {
+    "font": {"type": "font", "label": "Font size",
+             "description": "Cell size on the wall", "default": 14, "min": 6, "max": 40},
+    "film": {"type": "choice", "label": "Film",
+             "description": "One film, held; all plays them in turn",
+             "choices": ["all", "tears-of-steel"],
+             "default": "all"},
+    "shuffle": {"type": "bool", "label": "Shuffle",
+                "description": "Play the films in a random order", "default": false},
+    "mode": {"type": "choice", "label": "Picture mode",
+             "description": "How a cell is made of pixels: half is colour, fine is detail",
+             "choices": ["half", "quad", "braille", "ascii", "fine"], "default": "half"}
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "label": "Cell art",
+  "description": "Generative art made of cells: Truchet tiles, Wang tiles, Langton's ant",
+  "start": "../art/main.py",
+  "options": {
+    "font": {"type": "font", "label": "Font size",
+             "description": "Cell size on the wall", "default": 14, "min": 6, "max": 40},
+    "piece": {"type": "choice", "label": "Piece",
+              "description": "One piece, or all of them in turn",
+              "choices": ["all", "truchet", "wang", "ant"], "default": "all"}
+  }
+}

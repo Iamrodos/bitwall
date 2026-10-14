@@ -1,0 +1,45 @@
+{
+  "label": "Fluid",
+  "description": "A fluid stirred by wandering jets: coloured dye, or particles drifting on the flow",
+  "start": "../fluid/main.py",
+  "options": {
+    "font": {
+      "type": "font",
+      "label": "Font size",
+      "description": "Cell size on the wall",
+      "default": 14,
+      "min": 6,
+      "max": 40
+    },
+    "mode": {
+      "type": "choice",
+      "label": "Mode",
+      "description": "Dye, particles, or both in turn",
+      "choices": [
+        "all",
+        "dye",
+        "particles"
+      ],
+      "default": "all"
+    },
+    "secs": {
+      "type": "choice",
+      "label": "Cycle",
+      "description": "Seconds before the fluid starts again with new colours (and for particles a new density), and in all the next mode",
+      "choices": [
+        "60",
+        "120",
+        "300",
+        "600",
+        "1800"
+      ],
+      "default": "60"
+    },
+    "notes": {
+      "type": "bool",
+      "label": "Notes",
+      "description": "A black bar along the bottom naming what is showing, with a live figure, in LED lettering",
+      "default": true
+    }
+  }
+}

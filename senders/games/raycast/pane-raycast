@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""The raycaster in a terminal, or in a tmux pane.
+
+    senders/raycast/pane-raycast
+    senders/raycast/pane-raycast --stats
+    senders/raycast/pane-raycast --bench 120
+
+One of the two front ends on `game.py`. It takes the area from the terminal
+itself, asks the engine for a grid, and writes it as ANSI.
+
+Every cell goes out every frame, here and on the wall. A raycast frame
+changes all of them, so what earns its keep is the run encoding below rather
+than a comparison against the last one: colours are quantised into a dozen
+shades, which makes a slab of wall or a band of floor a long row of
+identical cells that one SGR covers.
+
+`--stats` prints the frame time and the bytes per frame to stderr, which is
+how the 12fps budget was measured rather than assumed.
+"""
+import os
+import sys
+import time
+import zlib
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from game import Game                                           # noqa: E402
+
+
+def sgr(g):
+    p = ["0"]
+    if g.bold:
+        p.append("1")
+    p += ["39"] if g.fg is None else ["38", "5", str(g.fg)]
+    p += ["49"] if g.bg is None else ["48", "5", str(g.bg)]
+    return "\033[" + ";".join(p) + "m"
+
+
+def paint(grid, cols, rows):
+    """ANSI for a whole frame, one SGR per run of matching attributes."""
+    out = ["\033[H"]
+    cur = None
+    for y in range(rows):
+        if y:
+            out.append("\033[%d;1H" % (y + 1))
+        for g in grid[y]:
+            a = (g.fg, g.bg, g.bold)
+            if a != cur:
+                out.append(sgr(g))
+                cur = a
+            out.append(g.ch)
+    out.append("\033[0m")
+    return "".join(out)
+
+
+def bench(game, n, cols, rows):
+    """What a run of this really costs, at the rate it really runs.
+
+    Paced to the frame cap rather than run flat out. Lifting the cap makes
+    the elapsed time per frame almost nothing, the walker barely moves, and
+    the stream compresses against a scene that is not changing -- which
+    flatters the byte count by an order of magnitude. The number worth
+    knowing is the one a moving camera produces.
+    """
+    build = paint_t = total = 0.0
+    # ssh -C deflates the stream, and escape sequences and repeated
+    # attributes are most of what this sends, so the raw size is not the
+    # size on the wire. One stream, not a frame at a time, because that is
+    # how the link sees it.
+    z = zlib.compressobj(6)
+    comp = 0
+    game.frame(cols, rows)
+    t_start = time.monotonic()
+    for _ in range(n):
+        t0 = time.perf_counter()
+        grid = game.frame(cols, rows)
+        t1 = time.perf_counter()
+        data = paint(grid, cols, rows)
+        t2 = time.perf_counter()
+        raw = data.encode("utf-8")
+        build += t1 - t0
+        paint_t += t2 - t1
+        total += len(raw)
+        comp += len(z.compress(raw)) + len(z.flush(zlib.Z_SYNC_FLUSH))
+        time.sleep(max(0.0, game.next_frame - time.monotonic()))
+    el = max(1e-6, time.monotonic() - t_start)
+    print("%dx%d  framebuffer %dx%d  %d frames at %.1f fps"
+          % (cols, rows, cols, rows * 2, n, n / el))
+    print("  build   %6.2f ms/frame    encode %6.2f ms/frame    %.0f%% of a core"
+          % (build / n * 1000, paint_t / n * 1000, (build + paint_t) / el * 100))
+    print("  raw     %6.0f B/frame    %5.0f KiB/s" % (total / n, total / el / 1024))
+    print("  deflate %6.0f B/frame    %5.0f KiB/s   as ssh -C sends it"
+          % (comp / n, comp / el / 1024))
+
+
+def main():
+    args = sys.argv[1:]
+    stats = "--stats" in args
+    if "--bench" in args:
+        i = args.index("--bench")
+        n = int(args[i + 1]) if len(args) > i + 1 else 60
+        try:
+            cols, rows = os.get_terminal_size()
+        except OSError:
+            cols, rows = 194, 53
+        for i, area in enumerate(((cols, rows), (194, 53), (95, 23))):
+            bench(Game(seed=i + 1), n, *area)
+        return 0
+
+    game = Game()
+    area = None
+    sent = frames = 0
+    t0 = time.monotonic()
+    sys.stdout.write("\033[?25l\033[?7l\033[0m\033[2J")
+    try:
+        while True:
+            cols, rows = os.get_terminal_size()
+            if (cols, rows) != area:
+                area = (cols, rows)
+                sys.stdout.write("\033[0m\033[2J")
+            t = time.perf_counter()
+            grid = game.frame(cols, rows)
+            data = paint(grid, cols, rows)
+            sys.stdout.write(data)
+            sys.stdout.flush()
+            sent += len(data.encode("utf-8"))
+            frames += 1
+            if stats and frames % Game.FPS == 0:
+                el = time.monotonic() - t0
+                sys.stderr.write(
+                    "\r%dx%d %5.1f fps  %6d B/frame  %5.0f KiB/s  "
+                    "%4.1f ms build+encode " %
+                    (cols, rows, frames / el, sent / frames,
+                     sent / el / 1024, (time.perf_counter() - t) * 1000))
+                sys.stderr.flush()
+            time.sleep(max(0.0, game.next_frame - time.monotonic()))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sys.stdout.write("\033[0m\033[?7h\033[?25h\033[2J\033[H")
+        sys.stdout.flush()
+        el = max(1e-6, time.monotonic() - t0)
+        sys.stderr.write("%d frames, %.1f fps, %d bytes, %.0f KiB/s\n"
+                         % (frames, frames / el, sent, sent / el / 1024))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

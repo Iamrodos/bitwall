@@ -1,0 +1,8 @@
+#!/bin/sh
+# Whether HDMI in can run here: a USB capture device, found where main.py's
+# find_device() looks for one.
+for dev in /dev/v4l/by-id/usb-*-video-index0; do
+    [ -e "$dev" ] && exit 0
+done
+echo "no USB capture device"
+exit 1

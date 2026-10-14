@@ -1,0 +1,16 @@
+{
+  "label": "Solids",
+  "description": "A lit solid turning in space: a torus, a knot, a sphere or a cube",
+  "start": "../games/torus/main.py",
+  "moves": true,
+  "options": {
+    "font": {"type": "font", "label": "Font size",
+             "description": "Cell size on the wall", "default": 14, "min": 6, "max": 40},
+    "shape": {"type": "choice", "label": "Shape",
+              "description": "What turns; all takes each in turn",
+              "choices": ["torus", "knot", "sphere", "cube", "all"], "default": "torus"},
+    "palette": {"type": "choice", "label": "Palette",
+                "description": "The colours it is shaded in",
+                "choices": ["ember", "ice", "jade"], "default": "ember"}
+  }
+}

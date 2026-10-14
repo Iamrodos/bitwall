@@ -1,0 +1,10 @@
+{
+  "label": "Raycaster",
+  "description": "A first-person raycaster exploring a dungeon on its own",
+  "start": "../games/raycast/main.py",
+  "moves": true,
+  "options": {
+    "font": {"type": "font", "label": "Font size",
+             "description": "Cell size on the wall", "default": 14, "min": 6, "max": 40}
+  }
+}

@@ -1,0 +1,921 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.14"
+# dependencies = ["numpy", "pillow"]
+# ///
+"""The painter's pixels, on this machine's own GPU.
+
+    tests/painter-pixels [words ...]
+    tests/painter-pixels --capture pi.local:1 [NAME=VALUE ...]
+
+The painter is built for this machine (tests/gpupainter.py) and run with
+no screen; what it composed is read back with `picture glass` and the
+glass stream, and held to what it should be:
+
+    twice          one scene composed twice is the same pixels, exactly
+    the stream     the I420 stream is the glass in BT.709 at studio range
+    streams        several at once, each the glass at its own size, and
+                   the overlay only in the one that asks for it
+    align          a frame against the top, the middle or the bottom
+    blending       QOI, PNG and JPEG frames over cells, alpha and all
+    resized        the glass resized 200 times under a base, a layer
+                   and two streams, each picture right, nothing growing
+    against v1     cells and the characters drawn as geometry, against
+                   v1's `picture glass` of the same scene on a Pi
+
+The last needs the reference in tests/pixels, which `--capture
+HOST:WALL` takes from a v1 painter: it attaches to the wall's base, shows
+the scene, takes a picture of the glass, and detaches. Ask the wall's
+`sessions` first: attaching displaces whoever holds the base. NAME=VALUE
+is the painter's environment there that changes what it draws, kept with
+the reference and given to the painter here: the Pis' painters run with
+BITWALL_EVEN_CELLS=1, which rounds a cell to an even width and a height
+of a multiple of four. The reference is the whole glass, neither cut nor
+scaled, so the scene sits in its top rows and the rest compresses to
+nothing.
+
+Where no GPU painter builds (anything but a Mac, or Windows with
+BITWALL_PAINT_EXE naming one), every check is skipped and says so.
+"""
+import json
+import os
+import struct
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+sys.path.insert(0, ROOT)
+sys.path.insert(0, HERE)
+
+import io                                                      # noqa: E402
+
+import numpy as np                                             # noqa: E402
+from PIL import Image                                          # noqa: E402
+
+import bitwall                                                 # noqa: E402
+import gpupainter                                              # noqa: E402
+from bitwall import cell, serialise                            # noqa: E402
+
+PIXELS = os.path.join(HERE, "pixels")
+V1 = os.path.join(PIXELS, "v1-cells.png")
+V1_SAID = os.path.join(PIXELS, "v1-cells.json")
+
+_checks = []
+
+
+def check(fn):
+    _checks.append(fn)
+    return fn
+
+
+# ------------------------------------------------------------- the scene
+#
+# One scene for the painter here and for v1 on a Pi: every class of
+# character the painter draws as geometry, in colours that change from
+# cell to cell, and a line of text from the font. Each class has rows of
+# its own, so each is compared with a tolerance of its own.
+
+def _fg(x, y):
+    return f"{(37 * x + 11 * y) % 256:02x}{(91 * x + 40 + 5 * y) % 256:02x}{(53 * x + 200) % 256:02x}"
+
+
+def _bg(x, y):
+    return f"{(13 * x + 3 * y) % 64:02x}{(7 * x) % 48:02x}{(29 * x + 9 * y) % 64:02x}"
+
+
+def _span(a, b, skip=()):
+    return "".join(chr(c) for c in range(a, b + 1) if c not in skip)
+
+
+#: Box lines drawn by the font, not as geometry: dashed and diagonal.
+FONT_BOX = set(range(0x2504, 0x250C)) | set(range(0x254C, 0x2550)) | {0x2571, 0x2572, 0x2573}
+
+#: The scene's rows: (class, row, text). A row's text starts at column 1.
+SCENE = [
+    ("text", 0, "bitwall painter pixels: The quick brown fox 0123456789 {}[]()<>=+-*/@#$%&"),
+    ("text", 1, "".join(chr(c) for c in sorted(FONT_BOX)) + " ÀÉÎõü ßøæ ←↑→↓ ⇐⇒ ■□▲▼●◆"),
+    ("blocks", 3, "█▀▄▌▐▁▂▃▄▅▆▇▉▊▋▍▎▏▔▕ ▖▗▘▝▙▚▛▜▞▟"),
+    ("blocks", 4, _span(0x1FB00, 0x1FB3B)),
+    ("blocks", 5, _span(0x1CD00, 0x1CD72)),
+    ("blocks", 6, _span(0x1CD73, 0x1CDE5)),
+    ("blocks", 7, _span(0x1FB70, 0x1FB8B) + _span(0x1FBE4, 0x1FBE7) + _span(0x1CEA0, 0x1CEAF)),
+    ("box", 9, "┌─┬─┐ ╔═╦═╗ ┏━┳━┓ ╭──╮ ┍┑┎┒ ╓╖╒╕ ┼╋╬╪╫"),
+    ("box", 10, "├─┼─┤ ╠═╬═╣ ┣━╋━┫ │  │ ┕┙┖┚ ╙╜╘╛ ╴╵╶╷╸╹╺╻╼╽╾╿"),
+    ("box", 11, "└─┴─┘ ╚═╩═╝ ┗━┻━┛ ╰──╯"),
+    ("box", 12, _span(0x2500, 0x257F, FONT_BOX)),
+    ("shapes", 14, "◢◣◤◥ ◢██◣ ░▒▓ ░░▒▒▓▓ ▪▪▪▪ ▪ ▪"),
+    ("shapes", 15, "◥██◤ ░▒▓█"),
+    ("braille", 17, _span(0x2800, 0x287F)),
+    ("braille", 18, _span(0x2880, 0x28FF)),
+]
+#: A row of grounds alone: the xterm colours and the default.
+FILL_ROW = 20
+ROWS_NEEDED = 22
+COLS_NEEDED = 130
+CLASSES = ("text", "blocks", "box", "shapes", "braille", "fill")
+
+
+def scene(cols, rows):
+    """The scene on a grid of `cols` by `rows`."""
+    g = [[cell(" ") for _ in range(cols)] for _ in range(rows)]
+    for _, y, text in SCENE:
+        for i, ch in enumerate(text[:cols - 1]):
+            x = i + 1
+            if ch == " ":
+                continue
+            g[y][x] = cell(ch, _fg(x, y), _bg(x, y), bold=(y == 0 and 30 <= x < 40))
+    for x in range(1, cols - 1):
+        g[FILL_ROW][x] = cell(" ", "default", (x - 1) % 256 if x < cols - 2 else "default")
+    return g
+
+
+def class_rows():
+    """Each class's rows, as (first, last) cell rows."""
+    out = {}
+    for name, y, _ in SCENE:
+        a, b = out.get(name, (y, y))
+        out[name] = (min(a, y), max(b, y))
+    out["fill"] = (FILL_ROW, FILL_ROW)
+    return out
+
+
+# ------------------------------------------------------------- pictures
+
+def rgb(data):
+    """A picture's bytes, QOI or PNG, as an (h, w, 3) array."""
+    return np.asarray(Image.open(io.BytesIO(data)).convert("RGB"))
+
+
+def glass_of(ctl):
+    """(w, h) of the glass, and (cw, ch) of a cell, from `screen`."""
+    ctl.command("report")
+    ctl.wait(lambda h: any(x.startswith("screen ") for x in h))
+    line = next(x for x in reversed(ctl.heard) if x.startswith("screen "))
+    opts = dict(w.split("=", 1) for w in line.split()[1:] if "=" in w)
+    pw, ph = map(int, opts["pixels"].split("x"))
+    cw, chh = map(int, opts["cell"].split("x"))
+    return (pw, ph), (cw, chh)
+
+
+def area_of(s):
+    line = next(x for x in reversed(s.heard) if x.startswith("area "))
+    cols, rows = map(int, line.split()[1].split("x"))
+    return cols, rows
+
+
+def show_scene(p, base, ctl, frame=None):
+    """The scene sent to the base whole, and the glass once it has been
+    drawn: a picture that comes back the same twice in a row."""
+    cols, rows = area_of(base)
+    base.write(serialise(frame or scene(cols, rows), None, True, cols, rows))
+    last = None
+    for _ in range(40):
+        time.sleep(0.05)
+        got = rgb(ctl.picture()[1])
+        if last is not None and np.array_equal(got, last):
+            return got
+        last = got
+    raise AssertionError("the glass never settled")
+
+
+def connected_base(p, name="base"):
+    base = p.session(name, "layer", z=0, type="cells", take=1)
+    base.command("report")
+    if not base.wait(lambda h: any(x.startswith("area ") for x in h)):
+        raise AssertionError(f"no area: {base.heard}")
+    return base
+
+
+# ---------------------------------------------------------------- checks
+
+@check
+def one_scene_composed_twice_is_the_same_pixels():
+    """The scene drawn, then drawn again whole, then a picture with
+    nothing changed: three pictures, every pixel the same. A frame that
+    composes differently the second time -- state left from the first, a
+    buffer reused before it was finished with -- shows here."""
+    with gpupainter.Painter((1280, 720)) as p:
+        base, ctl = connected_base(p), p.session("ctl", "controller")
+        once = show_scene(p, base, ctl)
+        twice = show_scene(p, base, ctl)
+        again = rgb(ctl.picture()[1])
+        assert once.any(), "the glass is black"
+        for name, got in (("drawn twice", twice), ("asked again", again)):
+            diff = np.argwhere((got != once).any(axis=2))
+            assert not len(diff), f"{name}: {len(diff)} pixels differ, first at {diff[0]}"
+        return f"1280x720, {np.count_nonzero(once.any(axis=2))} lit pixels identical three times"
+
+
+def i420_frames(ctl, path, n, timeout=5.0):
+    """The next `n` whole frames on a glass stream: (header, y, u, v)."""
+    fd = gpupainter.Reader(path)
+    buf, out = b"", []
+    until = time.monotonic() + timeout
+    try:
+        while len(out) < n and time.monotonic() < until:
+            ctl.pump()
+            try:
+                buf += fd.read(1 << 22)
+            except BlockingIOError:
+                time.sleep(0.005)
+            while len(buf) >= 32:
+                magic, w, h, num, us, length = struct.unpack("<4sIIQQI", buf[:32])
+                assert magic == b"BWG1", buf[:32]
+                if len(buf) < 32 + length:
+                    break
+                body = np.frombuffer(buf[32:32 + length], np.uint8)
+                y = body[:w * h].reshape(h, w)
+                u = body[w * h:w * h * 5 // 4].reshape(h // 2, w // 2)
+                v = body[w * h * 5 // 4:].reshape(h // 2, w // 2)
+                out.append(((w, h, num, us), y, u, v))
+                buf = buf[32 + length:]
+    finally:
+        fd.close()
+    assert len(out) >= n, f"{len(out)} frames of {n}"
+    return out
+
+
+def bt709(px):
+    """Y, U, V of RGB pixels as the painter's stream makes them: BT.709 at
+    studio range, U and V of each 2x2 block's mean."""
+    f = px.astype(np.float64) / 255
+    y = 16 + 219 * (f @ np.array([0.2126, 0.7152, 0.0722]))
+    h, w = f.shape[:2]
+    blocks = f.reshape(h // 2, 2, w // 2, 2, 3).mean(axis=(1, 3))
+    u = 128 + 224 * (blocks @ np.array([-0.1146, -0.3854, 0.5]))
+    v = 128 + 224 * (blocks @ np.array([0.5, -0.4542, -0.0458]))
+    return y, u, v
+
+
+@check
+def the_stream_is_the_glass_in_its_colours():
+    """`mirror glass stream=i420` at the glass's own size, against `picture
+    glass` turned to I420 here: Y within 1 of every pixel's, U and V within
+    1 of each 2x2 block's mean, which is the rounding of one 8-bit value
+    and nothing else."""
+    with gpupainter.Painter((1280, 720)) as p:
+        base, ctl = connected_base(p), p.session("ctl", "controller")
+        glass = show_scene(p, base, ctl)
+        ctl.command("mirror glass stream=i420 size=1280x720 fps=10")
+        path = os.path.join(ctl.dir, "glass")
+        assert gpupainter.wait_for(lambda: gpupainter.there(path), 3), f"no stream: {ctl.heard}"
+        # A frame is read back a frame later: the third is long past the scene.
+        (w, h, _, _), y, u, v = i420_frames(ctl, path, 3)[-1]
+        ctl.command("mirror glass off")
+        assert (w, h) == (1280, 720), (w, h)
+        wy, wu, wv = bt709(glass)
+        worst = {}
+        for name, got, want in (("Y", y, wy), ("U", u, wu), ("V", v, wv)):
+            d = np.abs(got.astype(np.float64) - want)
+            worst[name] = d.max()
+            assert d.max() <= 1.0, (f"{name} is {d.max():.1f} out at "
+                                    f"{np.unravel_index(d.argmax(), d.shape)}; "
+                                    f"{np.count_nonzero(d > 1)} values more than 1")
+        return "max error " + ", ".join(f"{k} {x:.2f}" for k, x in worst.items())
+
+
+def streams_of(ctl, asks, n=3, timeout=8.0):
+    """Several glass streams asked of `ctl` at once, by name, and the
+    last of the next `n` whole frames of each: {name: (header, y, u, v)}.
+    Each fifo is read by its own thread, as a mirror's are."""
+    import threading
+    for name, (w, h, fps, extra) in asks.items():
+        ctl.command(f"mirror glass stream=i420 size={w}x{h} fps={fps} name={name} {extra}".strip())
+    got, errors = {}, []
+
+    def one(name):
+        path = os.path.join(ctl.dir, f"glass-{name}")
+        if not gpupainter.wait_for(lambda: gpupainter.there(path), 3):
+            errors.append(f"no stream {name}")
+            return
+        try:
+            got[name] = i420_frames(_Quiet(), path, n, timeout)[-1]
+        except AssertionError as e:
+            errors.append(f"{name}: {e}")
+    threads = [threading.Thread(target=one, args=(k,)) for k in asks]
+    for th in threads:
+        th.start()
+    while any(th.is_alive() for th in threads):
+        ctl.pump()
+        time.sleep(0.01)
+    for name in asks:
+        ctl.command(f"mirror glass off name={name}")
+    assert not errors, f"{errors}; heard {ctl.heard[-4:]}"
+    return got
+
+
+class _Quiet:
+    """A session for i420_frames to pump that is pumped elsewhere."""
+
+    def pump(self):
+        pass
+
+
+def planes_against(glass, y, u, v, box=None):
+    """The worst difference of a frame's planes from `glass`, a picture of
+    the glass at the size the frame shows it, turned to I420 here: Y over
+    the box the glass fills and U and V where its blocks fall whole on the
+    picture's; and of the frame round the box, from black."""
+    bx, by, bw, bh = box or (0, 0, y.shape[1], y.shape[0])
+    wy = 16 + 219 * (glass.astype(np.float64) / 255 @ np.array([0.2126, 0.7152, 0.0722]))
+    worst = {"Y": np.abs(y[by:by + bh, bx:bx + bw].astype(np.float64) - wy).max()}
+    if not (bx % 2 or by % 2 or bw % 2 or bh % 2):
+        _, wu, wv = bt709(glass)
+        cy, cx = by // 2, bx // 2
+        worst["U"] = np.abs(u[cy:cy + bh // 2, cx:cx + bw // 2].astype(np.float64) - wu).max()
+        worst["V"] = np.abs(v[cy:cy + bh // 2, cx:cx + bw // 2].astype(np.float64) - wv).max()
+    mask = np.ones(y.shape, bool)
+    mask[by:by + bh, bx:bx + bw] = False
+    if mask.any():
+        worst["pad"] = np.abs(y[mask].astype(np.float64) - 16).max()
+    return worst
+
+
+def area_weights(n, m):
+    """The (m, n) matrix shrinking n samples to m by area: each of the m
+    the mean of the n it covers, a part sample counted by its part."""
+    k = n / m
+    w = np.zeros((m, n))
+    for i in range(m):
+        a, b = i * k, (i + 1) * k
+        for j in range(int(a), min(n, int(np.ceil(b)))):
+            w[i, j] = (min(b, j + 1) - max(a, j)) / k
+    return w
+
+
+def area_shrink(px, w, h):
+    """`px`, an (H, W, 3) picture, shrunk to w by h by area: what a pixel
+    of a smaller glass would be if it took exactly the light that falls
+    on it."""
+    f = px.astype(np.float64)
+    wy, wx = area_weights(f.shape[0], h), area_weights(f.shape[1], w)
+    return np.stack([wy @ f[:, :, ch] @ wx.T for ch in range(3)], axis=2)
+
+
+#: How far a stream's Y may be from the glass shrunk by area, in levels:
+#: (mean, 99th percentile, most), on this scene of text, box lines and
+#: blocks, which is as hard as a glass gets. At the glass's own size, a
+#: half and a quarter the stream's looks fall where they take exactly the
+#: area, and only rounding is left (measured 0.05, 0.5, 0.5). Between, a
+#: look takes the light near a pixel's middle a little more than at its
+#: edges, which shows on hairlines: measured at 854x480 and 400x225 of
+#: 1280x720 at most 0.39, 10.8 and 59, where `picture glass`, a box of
+#: sixteen looks, is 0.38, 9.8 and 28 at 854x480. The limits are those,
+#: rounded up.
+STREAM_AREA_TOLERANCE = {1.0: (0.1, 0.6, 0.6), 2.0: (0.1, 0.6, 0.6), 4.0: (0.1, 0.6, 0.6),
+                         None: (0.45, 12.0, 64.0)}
+
+
+@check
+def each_stream_is_the_glass_at_its_own_size():
+    """Five streams at once from one glass, each at a size and rate of its
+    own, against the glass shrunk by area to the size each shows it: Y
+    within STREAM_AREA_TOLERANCE of it, exactly where the size is the
+    glass's, a half or a quarter; U and V within 1 at the glass's size and
+    a half; and a stream
+    of another shape the glass in the middle with black round it. What
+    `picture glass` at that size is from the same is said beside it."""
+    with gpupainter.Painter((1280, 720)) as p:
+        base, ctl = connected_base(p), p.session("ctl", "controller")
+        full = show_scene(p, base, ctl)
+        asks = {"full": (1280, 720, 10, ""), "half": (640, 360, 5, ""),
+                "small": (320, 180, 15, ""), "third": (854, 480, 10, ""),
+                "square": (400, 400, 10, "")}
+        got = streams_of(ctl, asks)
+        notes = []
+
+        def box(w, h):
+            k = min(w / 1280, h / 720)
+            bw, bh = round(1280 * k), round(720 * k)
+            return bw, bh, (w - bw) // 2, (h - bh) // 2
+        # Every picture asked before the sums, which take seconds on a
+        # slow machine and would leave the wall's ping unanswered.
+        pictures = {name: ctl.picture("glass size={}x{}".format(*box(w, h)[:2]))
+                    for name, (w, h, _, _) in asks.items()}
+        for name, (w, h, fps, _) in asks.items():
+            (fw, fh, _, _), y, u, v = got[name]
+            assert (fw, fh) == (w, h), (name, fw, fh)
+            bw, bh, bx, by = box(w, h)
+            truth = area_shrink(full, bw, bh)
+            wy = 16 + 219 * (truth / 255 @ np.array([0.2126, 0.7152, 0.0722]))
+            d = np.abs(y[by:by + bh, bx:bx + bw].astype(np.float64) - wy)
+            said = (d.mean(), np.percentile(d, 99), d.max())
+            ratio = 1280 / bw
+            exact = next((r for r in (1.0, 2.0, 4.0) if abs(ratio - r) < 1e-9), None)
+            most = STREAM_AREA_TOLERANCE[exact]
+            words, data = pictures[name]
+            pic = rgb(data).astype(np.float64)
+            py = 16 + 219 * (pic / 255 @ np.array([0.2126, 0.7152, 0.0722]))
+            pd = np.abs(py - wy)
+            assert all(a <= b for a, b in zip(said, most)), \
+                (f"{name} {w}x{h}: Y from the area mean {said[0]:.2f}, p99 {said[1]:.1f}, "
+                 f"most {said[2]:.1f}; allowed {most}; picture glass {pd.mean():.2f}, "
+                 f"{np.percentile(pd, 99):.1f}, {pd.max():.1f}")
+            mask = np.ones(y.shape, bool)
+            mask[by:by + bh, bx:bx + bw] = False
+            assert not mask.any() or np.abs(y[mask].astype(np.float64) - 16).max() <= 0.5, \
+                f"{name}: not black round the glass"
+            if exact in (1.0, 2.0) and not (bx % 2 or by % 2 or bw % 2 or bh % 2):
+                _, tu, tv = bt709(truth.round().clip(0, 255))
+                cu = np.abs(u[by // 2:(by + bh) // 2, bx // 2:(bx + bw) // 2] - tu).max()
+                cv = np.abs(v[by // 2:(by + bh) // 2, bx // 2:(bx + bw) // 2] - tv).max()
+                assert max(cu, cv) <= 1.0, f"{name}: U {cu:.1f} V {cv:.1f}"
+            notes.append(f"{w}x{h} Y {said[0]:.2f}/{said[1]:.1f}/{said[2]:.0f} "
+                         f"(picture {pd.mean():.2f}/{np.percentile(pd, 99):.1f}/{pd.max():.0f})")
+        return "mean/p99/most from the area mean: " + ", ".join(notes)
+
+
+@check
+def a_stream_carries_the_overlay_only_where_asked():
+    """With the overlay up, a stream asked with `overlay=1` shows it over
+    the glass and one asked without does not, from the one composition:
+    the second is `picture glass`, which never shows it, and the first
+    differs from it only in the overlay's box."""
+    with gpupainter.Painter((1280, 720)) as p:
+        base, ctl = connected_base(p), p.session("ctl", "controller")
+        ctl.command("stats 1 at=nw show=fps,in")
+        glass = show_scene(p, base, ctl)
+        time.sleep(1.2)                 # the overlay's first numbers
+        got = streams_of(ctl, {"plain": (1280, 720, 10, ""),
+                               "lit": (1280, 720, 10, "overlay=1")})
+        _, y, u, v = got["plain"]
+        worst = planes_against(glass, y, u, v)
+        assert max(worst.values()) <= 1.0, f"without the overlay: {worst}"
+        _, ly, _, _ = got["lit"]
+        wy, _, _ = bt709(glass)
+        rows, cols = np.nonzero(np.abs(ly.astype(np.float64) - wy) > 1.0)
+        assert len(rows), "the overlay is not in the stream that asked for it"
+        top, left, bottom, right = rows.min(), cols.min(), rows.max(), cols.max()
+        assert top < 100 and left < 100 and bottom < 400 and right < 700, \
+            f"the overlay's stream differs outside the top left: {left},{top} to {right},{bottom}"
+        return f"overlay over {right - left + 1}x{bottom - top + 1} at {left},{top}; " \
+               f"without it max error {max(worst.values()):.1f}"
+
+
+def qoi(w, h, rgba):
+    """A QOI image of `w` by `h`, every pixel `rgba`."""
+    return bitwall.video.qoi(np.tile(np.array(rgba, np.uint8), (h, w, 1)))
+
+
+def encoded(fmt, w, h, rgba, **kw):
+    im = Image.new("RGBA" if fmt == "PNG" else "RGB", (w, h),
+                   tuple(rgba) if fmt == "PNG" else tuple(rgba[:3]))
+    out = io.BytesIO()
+    im.save(out, fmt, **kw)
+    return out.getvalue()
+
+
+def frame_bytes(data, extra=""):
+    codec = bitwall.protocol.image_of(data)
+    w, h = bitwall.protocol.image_size(codec, data)
+    return (gpupainter.APC + f"bitwall frame {codec} {w}x{h} at=0,0 {extra} {len(data)}"
+            + gpupainter.ST).encode() + data
+
+
+@check
+def a_frame_sits_on_the_glass_where_align_says():
+    """A frame far wider than the glass's shape, on a data stream, put
+    against the top, the bottom and the middle with `align`: the rows it
+    lights on the glass are exactly those, and nothing else is lit."""
+    gw, gh = 640, 360
+    with gpupainter.Painter((gw, gh)) as p:
+        base, ctl = connected_base(p), p.session("ctl", "controller")
+        show_scene(p, base, ctl, frame=[[cell(" ")] * area_of(base)[0]
+                                        for _ in range(area_of(base)[1])])
+        v = p.session("v", "layer", z="above", type="video", data=1, codec="qoi")
+        fd = gpupainter.writer(os.path.join(v.dir, "data"))
+        fw, fh = 64, 4
+        dh = round(fh * gw / fw)
+        want = {"top": 0, "centre": (gh - dh) // 2, "bottom": gh - dh}
+        try:
+            for where in ("top", "bottom", "centre"):
+                v.command(f"align {where}")
+                time.sleep(0.05)
+                os.write(fd, qoi(fw, fh, (200, 40, 40, 255)))
+
+                def lit():
+                    g = rgb(ctl.picture()[1])
+                    rows = np.flatnonzero((g == (200, 40, 40)).all(axis=2).all(axis=1))
+                    others = np.count_nonzero(g.any(axis=2)) - len(rows) * gw
+                    return (int(rows[0]), int(rows[-1]) + 1, others) if len(rows) else None
+                got = gpupainter.wait_for(lambda: lit() == (want[where], want[where] + dh, 0), 3)
+                assert got, f"align {where}: lit {lit()}, want rows {want[where]}-" \
+                            f"{want[where] + dh} and nothing else"
+        finally:
+            os.close(fd)
+        return f"{fw}x{fh} on {gw}x{gh}: rows {dh} high at {sorted(want.values())}"
+
+
+@check
+def frames_with_alpha_blend_over_the_cells():
+    """A ground of one colour in cells, and over it a frame the glass's
+    size in another, as QOI and PNG at several alphas and as JPEG, which
+    has none: each pixel is the frame's colour over the ground's, mixed
+    by its alpha, within 1; the JPEG within 2 of the colour it decodes to
+    here, since two JPEG decoders may round a flat colour differently."""
+    gw, gh = 320, 180
+    ground = (32, 64, 96)
+    with gpupainter.Painter((gw, gh)) as p:
+        base, ctl = connected_base(p), p.session("ctl", "controller")
+        cols, rows = area_of(base)
+        g = [[cell(" ", "default", "%02x%02x%02x" % ground) for _ in range(cols)]
+             for _ in range(rows)]
+        under = show_scene(p, base, ctl, frame=g)
+        cw, chh = cols * (gw // cols), rows * (gh // rows)
+        assert (under[:chh, :cw] == ground).all(), "the ground is not the colour asked"
+        v = p.session("v", "layer", z="above", type="video")
+        worst = {}
+        cases = []
+        for a in (255, 192, 128, 64, 1, 0):
+            cases.append((f"qoi a={a}", qoi(gw, gh, (200, 100, 50, a)), (200, 100, 50, a), 1))
+        for a in (255, 128, 0):
+            cases.append((f"png a={a}", encoded("PNG", gw, gh, (10, 220, 130, a)),
+                          (10, 220, 130, a), 1))
+        jpeg = encoded("JPEG", gw, gh, (240, 200, 20), quality=95)
+        cases.append(("jpeg", jpeg, tuple(int(c) for c in rgb(jpeg)[gh // 2, gw // 2]) + (255,), 2))
+        for name, data, (r, gr, b, a), tol in cases:
+            v.write(frame_bytes(data, "hold=still"))
+            want = np.array((r, gr, b)) * a / 255 + np.array(ground) * (1 - a / 255)
+
+            def err():
+                got = rgb(ctl.picture()[1])[:chh, :cw].astype(np.float64)
+                return np.abs(got - want).max()
+            ok = gpupainter.wait_for(lambda: err() <= tol, 3)
+            worst[name] = err()
+            assert ok, f"{name}: {worst[name]:.1f} from {want.round(1)} (tolerance {tol})"
+        v.command("clear")
+        return "max error " + ", ".join(f"{k} {x:.1f}" for k, x in worst.items())
+
+
+#: How far each class may be from v1's pixels: (largest channel
+#: difference, share of the class's pixels that may differ at all). What
+#: the painter draws as geometry is its own arithmetic and matches to the
+#: pixel. Text is FreeType's: 2.14 on the Mac and 2.13 on the Pis put one
+#: level of a glyph's edge one apart in about a quarter of a per cent of
+#: the text's pixels, and a glyph drawn at all wrong is far more than
+#: either bound.
+TOLERANCE = {
+    "blocks": (0, 0.0),
+    "box": (0, 0.0),
+    "shapes": (0, 0.0),
+    "braille": (0, 0.0),
+    "fill": (0, 0.0),
+    "text": (1, 0.01),
+}
+
+
+@check
+def cells_and_drawn_characters_match_v1():
+    """The scene on a glass the size of the Pi's that made the reference,
+    at its font, against v1's `picture glass` of it: every character the
+    painter draws as geometry exactly, class by class; the text, which
+    each machine's FreeType rasterises, to within TOLERANCE."""
+    if not os.path.exists(V1):
+        return f"skipped: no reference; take one with --capture HOST:WALL"
+    with open(V1_SAID) as fh:
+        said = json.load(fh)
+    want = rgb(open(V1, "rb").read())
+    with gpupainter.Painter(tuple(said["glass"]), font=said["font"], env=said["env"]) as p:
+        base, ctl = connected_base(p), p.session("ctl", "controller")
+        glass, cellsz = glass_of(ctl)
+        assert list(cellsz) == said["cell"], f"a cell is {cellsz} here, {said['cell']} on v1"
+        assert list(area_of(base)) == said["area"], f"{area_of(base)} here, {said['area']} on v1"
+        got = show_scene(p, base, ctl)
+    assert got.shape == want.shape, (got.shape, want.shape)
+    ch = said["cell"][1]
+    out, bad = [], []
+    for name, (a, b) in class_rows().items():
+        g = got[a * ch:(b + 1) * ch].astype(int)
+        w = want[a * ch:(b + 1) * ch].astype(int)
+        d = np.abs(g - w).max(axis=2)
+        most, share = TOLERANCE[name]
+        off = np.count_nonzero(d) / d.size
+        out.append(f"{name} {d.max()}/{off:.2%}")
+        if d.max() > most or off > share:
+            ys, xs = np.nonzero(d)
+            bad.append(f"{name}: {np.count_nonzero(d)} pixels differ, up to {d.max()}, "
+                       f"first at cell {xs[0] // said['cell'][0]},{a + ys[0] // ch}")
+    rest = np.abs(got.astype(int) - want.astype(int)).max(axis=2)
+    rest[:(FILL_ROW + 1) * ch] = 0
+    if rest.any():
+        bad.append(f"outside the scene: {np.count_nonzero(rest)} pixels differ")
+    assert not bad, "; ".join(bad)
+    return "largest difference/share differing: " + ", ".join(out)
+
+
+# --------------------------------------------------------------- capture
+
+# ------------------------------------------------------------- resizing
+
+def footprint(pid):
+    """What process `pid` holds, in bytes, as macOS's footprint says:
+    the whole (`phys_footprint`, which on a Mac's shared memory counts
+    what the GPU holds for it too), the part in the GPU's own categories
+    (IOAccelerator, and owned memory not mapped); and its RSS, as ps says.
+    On Windows: its private bytes, nothing of the GPU's part, and its
+    working set."""
+    import subprocess
+    if gpupainter.WINDOWS:
+        return _footprint_windows(pid)
+    out = subprocess.run(["footprint", "-p", str(pid), "-f", "bytes"],
+                         capture_output=True, text=True).stdout
+    whole = gpu = 0
+    for line in out.splitlines():
+        words = line.split()
+        if line.strip().startswith("phys_footprint:"):
+            whole = int(words[1])
+        elif len(words) >= 8 and words[1] == "B" and (
+                "IOAccelerator" in line or "Owned physical footprint" in line):
+            gpu += int(words[0])
+    rss = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True)
+    return whole, gpu, int(rss.stdout.strip() or 0) * 1024
+
+
+def _footprint_windows(pid):
+    import ctypes
+    import ctypes.wintypes as wt
+
+    class Counters(ctypes.Structure):
+        _fields_ = [("cb", wt.DWORD), ("faults", wt.DWORD)] + [
+            (n, ctypes.c_size_t) for n in ("peak_ws", "ws", "peak_pp", "pp", "peak_npp",
+                                           "npp", "pagefile", "peak_pagefile", "private")]
+    k32 = ctypes.windll.kernel32
+    h = k32.OpenProcess(0x1000 | 0x0010, False, pid)
+    c = Counters()
+    c.cb = ctypes.sizeof(c)
+    ctypes.windll.psapi.GetProcessMemoryInfo(h, ctypes.byref(c), c.cb)
+    k32.CloseHandle(h)
+    return c.private, 0, c.ws
+
+
+class _Reader:
+    """A glass stream read on a thread of its own as long as it runs:
+    how many frames came, each the size it was asked, numbers rising."""
+
+    def __init__(self, path, size):
+        import threading
+        self.path, self.size, self.frames, self.bad = path, size, 0, []
+        self.stop = False
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def run(self):
+        fd = gpupainter.Reader(self.path)
+        buf, last = b"", -1
+        try:
+            while not self.stop:
+                try:
+                    data = fd.read(1 << 22)
+                except BlockingIOError:
+                    data = None
+                if not data:
+                    time.sleep(0.003)
+                    continue
+                buf += data
+                while len(buf) >= 32:
+                    _, w, h, num, _, length = struct.unpack("<4sIIQQI", buf[:32])
+                    if len(buf) < 32 + length:
+                        break
+                    buf = buf[32 + length:]
+                    self.frames += 1
+                    if (w, h) != self.size or num <= last:
+                        self.bad.append((w, h, num, last))
+                    last = num
+        finally:
+            fd.close()
+
+
+def _measured(p, ctl):
+    """The painter's footprint with its glass at 1280x720, so what is
+    measured at two times is measured at the same size: a glass's own
+    pictures are as big as it is."""
+    ctl.command("glass 1280x720 id=m")
+    assert ctl.wait(lambda h: any(x.endswith(" id=m") for x in h), 5), ctl.heard[-3:]
+    _settled(ctl)
+    time.sleep(1)
+    return footprint(p.proc.pid)
+
+
+def _sizes(n):
+    """`n` sizes of glass across the range a wall has, wide and tall, in
+    an order that goes up and down by turns; the same every run. The
+    largest and the smallest come first, so that what a GPU keeps for the
+    biggest it has drawn is kept before memory is first measured."""
+    import random
+    r = random.Random(5)
+    return ([(1920, 1080), (320, 180)]
+            + [(r.randrange(320, 1921), r.randrange(180, 1081)) for _ in range(n - 2)])[:n]
+
+
+def _settled(ctl):
+    """The glass once a picture of it comes back the same twice in a row,
+    compared as it comes and decoded once, since a whole glass is a second
+    to decode."""
+    last = None
+    for _ in range(60):
+        time.sleep(0.03)
+        ctl.pictures = []
+        ctl.command("picture glass")
+        # Read as fast as it comes: a whole glass is megabytes, through a
+        # pipe that holds 64 KB.
+        if not gpupainter.wait_for(lambda: (ctl.pump(), ctl.pictures)[1], 5, step=0.0005):
+            raise AssertionError(f"no picture of the glass; heard {ctl.heard[-4:]}")
+        got = ctl.pictures[0][1]
+        if got == last:
+            return rgb(got)
+        last = got
+    raise AssertionError("the glass never settled")
+
+
+def _ground(x, y):
+    return (40 + (x * 7) % 200, 30 + (y * 13) % 200, (x * 3 + y * 5) % 256)
+
+
+@check
+def the_glass_resized_again_and_again_is_drawn_right_and_holds_its_memory():
+    """The glass asked for a new size by `glass WxH` again and again (200
+    times, or BITWALL_RESIZES), every tenth a drag of four sizes asked in
+    a row, with a cells base, a video layer and two streams running. After
+    each: the answer is the area at the size the glass now is, and nothing
+    between was said; `picture glass` is that size, every cell the colour
+    the base drew there, the margins black and the layer's frame where it
+    was put; the streams keep their own sizes, frames numbered in order, at
+    their rates. The painter's memory, and the GPU's part of it, measured
+    at one size after the first ten and at the end: what grows is a leak.
+    A Mac's GL keeps memory for the biggest glass it has drawn, so the
+    biggest is among the first ten; beyond that a few MB come and go."""
+    n = int(os.environ.get("BITWALL_RESIZES", "200"))
+    frame = qoi(48, 32, (255, 0, 255, 255))
+    with gpupainter.Painter((1280, 720)) as p:
+        base, ctl = connected_base(p), p.session("ctl", "controller")
+        v = p.session("v", "layer", z="above", type="video")
+        streams = {"a": (640, 360, 25), "b": (320, 240, 15)}
+        for name, (w, h, fps) in streams.items():
+            ctl.command(f"mirror glass stream=i420 size={w}x{h} fps={fps} name={name}")
+        paths = {k: os.path.join(ctl.dir, f"glass-{k}") for k in streams}
+        assert gpupainter.wait_for(lambda: all(map(gpupainter.there, paths.values())), 3), ctl.heard
+        readers = {k: _Reader(paths[k], streams[k][:2]) for k in streams}
+        sizes, before, t0, frames0, said = _sizes(n), None, None, None, 0
+        try:
+            for i, (gw, gh) in enumerate(sizes):
+                if i == 10:
+                    before = _measured(p, ctl)
+                    t0, frames0 = time.monotonic(), {k: r.frames for k, r in readers.items()}
+                base.heard, v.heard, ctl.heard = [], [], []
+                if i % 10 == 9:
+                    for k in range(3):     # a drag: sizes on the way, then the one it stops at
+                        ctl.command(f"glass {gw - 40 * (3 - k)}x{gh - 20 * (3 - k)}")
+                        time.sleep(0.03)
+                ctl.command(f"glass {gw}x{gh} id=g{i}")
+                assert ctl.wait(lambda h: any(x.endswith(f" id=g{i}") for x in h), 5), \
+                    f"resize {i} to {gw}x{gh}: no answer; heard {ctl.heard[-3:]}"
+                answer = next(x for x in ctl.heard if x.endswith(f" id=g{i}"))
+                assert answer.startswith("area "), answer
+                areas = [x for x in ctl.heard if x.startswith("area ")]
+                assert areas == [answer], f"resize {i}: said {areas}"
+                assert base.wait(lambda h: "repaint" in h, 3), base.heard
+                assert v.wait(lambda h: "repaint" in h, 3), v.heard
+                assert not any(x.startswith("area ") for x in v.heard), v.heard
+                screen = next(x for x in reversed(base.heard) if x.startswith("screen "))
+                opts = dict(w.split("=", 1) for w in screen.split()[1:] if "=" in w)
+                assert opts["pixels"] == f"{gw}x{gh}", (gw, gh, screen)
+                cw, chh = map(int, opts["cell"].split("x"))
+                cols, rows = area_of(base)
+                grid = [[cell(" ", "default", "%02x%02x%02x" % _ground(x, y))
+                         for x in range(cols)] for y in range(rows)]
+                v.write(frame_bytes(frame, "hold=still").replace(b"at=0,0", b"at=8,8"))
+                base.write(serialise(grid, None, True, cols, rows))
+                got = _settled(ctl)
+                said += 1
+                assert got.shape[:2] == (gh, gw), f"resize {i}: picture {got.shape} for {gw}x{gh}"
+                ox, oy = (gw - cols * cw) // 2, (gh - rows * chh) // 2
+                ys = oy + chh // 2 + chh * np.arange(rows)
+                xs = ox + cw // 2 + cw * np.arange(cols)
+                want = np.array([[_ground(x, y) for x in range(cols)] for y in range(rows)])
+                seen = got[ys][:, xs].astype(int)
+                under = (xs[None, :] < 8 + 48) & (ys[:, None] < 8 + 32)
+                wrong = np.argwhere((seen != want).any(axis=2) & ~under)
+                assert not len(wrong), f"resize {i} to {gw}x{gh}: {len(wrong)} cells wrong, " \
+                                       f"first {wrong[0]} {seen[tuple(wrong[0])]} for {want[tuple(wrong[0])]}"
+                assert (got[8:40, 8:56] == (255, 0, 255)).all(), f"resize {i}: the frame is not up"
+                margins = np.ones((gh, gw), bool)
+                margins[oy:oy + rows * chh, ox:ox + cols * cw] = False
+                margins[8:40, 8:56] = False
+                assert not got[margins].any(), f"resize {i}: the margins are not black"
+            took = time.monotonic() - t0
+            frames1 = {k: r.frames for k, r in readers.items()}
+            after = _measured(p, ctl)
+        finally:
+            for r in readers.values():
+                r.stop = True
+            for r in readers.values():
+                r.thread.join(2)
+        rates = {}
+        for k, r in readers.items():
+            assert not r.bad, f"stream {k}: {r.bad[:3]}"
+            rates[k] = (frames1[k] - frames0[k]) / took
+            assert rates[k] >= 0.8 * streams[k][2], \
+                f"stream {k}: {rates[k]:.1f} fps of {streams[k][2]}"
+        grew = (after[0] - before[0]) / 2**20, (after[1] - before[1]) / 2**20
+        assert grew[0] < 6 and grew[1] < 4, \
+            f"after {n - 10} resizes the painter grew {grew[0]:.1f} MB, the GPU's part {grew[1]:.1f} MB"
+        return (f"{said} resizes ({n // 10} drags) 320-1920 x 180-1080, every picture right; "
+                f"streams {rates['a']:.1f}/25 and {rates['b']:.1f}/15 fps; footprint "
+                f"{before[0] / 2**20:.1f} -> {after[0] / 2**20:.1f} MB, GPU "
+                f"{before[1] / 2**20:.1f} -> {after[1] / 2**20:.1f} MB, RSS "
+                f"{before[2] / 2**20:.1f} -> {after[2] / 2**20:.1f} MB")
+
+
+def capture(target, env):
+    """The scene on a v1 wall at font 14, and its glass kept in tests/pixels
+    as the reference, with the glass, cell and area it was taken at. The
+    base is attached for this and detached after.
+
+    The scene is written to the base's `in` by a `cat` of its own rather
+    than by the Wall, which composes nothing while nobody is in the room:
+    a wall that follows a presence is as likely as not dark."""
+    import subprocess
+    w = bitwall.attach(target)
+    try:
+        w.set_font_size(14)
+        cols, rows = w.area()
+        if cols < COLS_NEEDED or rows < ROWS_NEEDED:
+            raise SystemExit(f"{target} is {cols}x{rows} at 14; the scene needs "
+                             f"{COLS_NEEDED}x{ROWS_NEEDED}")
+        into = w._link.session_dir(w._session.name) + "/in"
+        subprocess.run(w._link.argv(f"cat > {into}"), check=True, timeout=30,
+                       input=serialise(scene(cols, rows), None, True, cols, rows).encode())
+        last = None
+        for _ in range(60):
+            time.sleep(0.5)
+            pic = w.picture("glass")
+            if last is not None and pic.data == last and rgb(last).any():
+                break
+            last = pic.data
+        else:
+            raise SystemExit(f"{target}: the glass never settled on the scene")
+        cw, chh = w.screen()["cell"]
+    finally:
+        w.detach()
+    report = subprocess.run([os.path.join(ROOT, "controllers", "bitwall-ctl"), target, "report"],
+                            capture_output=True, text=True, timeout=30).stdout
+    version = next((w.split("=", 1)[1] for line in report.splitlines()
+                    if line.startswith("receiver ") for w in line.split()
+                    if w.startswith("version=")), None)
+    os.makedirs(PIXELS, exist_ok=True)
+    im = Image.open(io.BytesIO(last)).convert("RGB")
+    im.save(V1, optimize=True)
+    meta = {"target": target, "version": version, "env": env, "glass": list(im.size), "font": 14, "cell": [cw, chh],
+            "area": [cols, rows], "taken": time.strftime("%Y-%m-%d")}
+    with open(V1_SAID, "w") as fh:
+        json.dump(meta, fh, indent=1)
+    print(f"{V1}: {im.size[0]}x{im.size[1]}, {os.path.getsize(V1)} bytes; {meta}")
+
+
+# -------------------------------------------------------------------- run
+
+def main(argv):
+    if argv[:1] == ["--capture"] and len(argv) >= 2:
+        capture(argv[1], dict(x.split("=", 1) for x in argv[2:]))
+        return 0
+    words = argv
+    chosen = [c for c in _checks if not words
+              or any(w in c.__name__.replace("_", " ") for w in words)]
+    why = gpupainter.why_not()
+    width = max(len(c.__name__) for c in chosen) + 2
+    failed = skipped = 0
+    for fn in chosen:
+        name = fn.__name__.replace("_", " ")
+        try:
+            if why:
+                raise _Skip(why)
+            note = fn()
+        except _Skip as e:
+            skipped += 1
+            print(f"  skip  {name:<{width}} skipped: {e}")
+            continue
+        except AssertionError as exc:
+            failed += 1
+            print(f"  FAIL  {name}\n        {exc}")
+            continue
+        except Exception as exc:                       # noqa: BLE001
+            failed += 1
+            print(f"  ERROR {name}\n        {type(exc).__name__}: {exc}")
+            continue
+        if note and note.startswith("skipped"):
+            skipped += 1
+            print(f"  skip  {name:<{width}} {note}")
+        else:
+            print(f"  ok    {name:<{width}} {note or ''}".rstrip())
+        sys.stdout.flush()
+    print(f"\n{len(chosen) - failed - skipped} passed, {failed} failed, {skipped} skipped")
+    return 1 if failed else 0
+
+
+class _Skip(Exception):
+    pass
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

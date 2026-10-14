@@ -1,0 +1,1601 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["pillow", "aiohttp"]
+# ///
+"""A reel that shows what bitwall does, saying so as it goes, on one wall,
+over and over.
+
+    demos/reel localhost:reel
+    demos/reel --once --repo github.com/someone/bitwall pi.local:1
+    demos/reel --scenes intro localhost:reel
+    demos/reel --scenes intro.secure,panes,swap localhost:reel
+
+It is a controller of its own: it starts the repo's senders on the wall,
+and on panes of it, as each scene wants them, stops them when the scene
+is over, and writes what the scene shows to a caption
+(`demos/caption`) along the bottom of the wall. Six scenes: the intro (a
+question typed, and a board that grows to private data the wall never
+holds), the idea (a sender, the wire, a wall), more (characters, fonts,
+panes, a layer, the terminal), pixels (a film, framed, text over it,
+subtitles, the native receivers), running walls (the stats overlay, the
+glass captured live), and building your own (a complete sender in Python
+and in Rust, and a closer typed out). Every sender is one anyone with the repo has; the film is Tears
+of Steel in `media/` (CC BY 3.0, the Blender Foundation,
+mango.blender.org), the Rust sender `bitwall/rust/examples/wave.rs`,
+built with cargo, and the control page is pictured by Chrome; a scene
+whose part is missing is skipped.
+
+The reel is scenes, chapters played in order, each a run of shots;
+`--scenes` takes a scene's name for all its shots, or `scene.shot`, or a
+shot's own name, for one.
+
+A base sender takes the base from whoever holds it, so each shot starts
+what it shows before it stops what it replaces, and the wall changes in
+one move. A film's video base is the exception: it is stopped first, and
+what follows takes the base it left. A sender is stopped with SIGTERM to
+its process group and SIGKILL five seconds later, as a controller does.
+Their logs are in `--logs`, a directory of its own each run.
+
+The panes are walls on this machine: in its run directory for a wall on
+this machine, and for a wall elsewhere in a run directory of the reel's
+own, so their names meet nobody's. The control page it pictures is one
+of its own too, on 127.0.0.1, shown those walls alone and given a home
+of its own, so it knows of no other device and no sender a controller
+started.
+
+The reel draws its title cards, its diagrams and its code with a sender
+of its own, this script given `--slides FILE`: a base sender whose slide
+is the first line of FILE and its words the rest, read as it changes.
+`--show` and `--pip` are its picture layers: an image over the whole
+wall, and the wall's own glass, live, in a corner of itself.
+"""
+import argparse
+import asyncio
+import base64
+import io
+import json
+import os
+import random
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+sys.path.insert(0, ROOT)
+import bitwall                                                  # noqa: E402
+from bitwall import letters                                     # noqa: E402
+from bitwall.session import Blob                                # noqa: E402
+
+FILM = os.path.join(ROOT, "media", "Tears of Steel (2012).mov")
+#: Its English subtitles, Blender's own, as SubRip:
+#: https://download.blender.org/demo/movies/ToS/subtitles/TOS-en.srt
+SUBTITLES = os.path.join(ROOT, "media", "Tears of Steel (2012).en.srt")
+#: Where in the film the reel joins it: Amsterdam's skyline, then the
+#: robot in the scope.
+FILM_SEEK = 329
+FILM_LENGTH = 734
+FILM_CREDIT = "Tears of Steel · (CC) Blender Foundation"
+#: The framed film's box, as shares of the glass: (left, top, width,
+#: height), the width at the film's own shape, 2.24 to 1, on a 16:9 glass.
+FRAME = (0.035, 0.11, 0.56, 0.56 * 16 / 9 / 2.24)
+#: The framed film is sent at half the box's pixels, for the wall to
+#: scale, and this many frames a second.
+FRAME_SCALE, FRAME_FPS = 0.5, 15
+#: Where the ticker's weather is for: Amsterdam, where the film was made.
+WHERE = ("Amsterdam", "52.37", "4.90")
+PYTHON_SENDER = "senders/wave.py"
+RUST_SENDER = "bitwall/rust/examples/wave.rs"
+RUST_BINARY = os.path.join(ROOT, "bitwall/rust/target/release/examples/wave")
+CHROME = ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+          "google-chrome", "chromium", "chromium-browser")
+CONTROL_PORT = 8977
+DEBUG_PORT = 9339
+#: The slides' look, the caption's accent kept.
+BG = "0b0e14"
+INK = "ffb454"
+TEXT = "e8e4da"
+DIM = "8a96a3"
+FAINT = "2a313b"
+COOL = "7fc8ff"
+#: The unlit segments and dots, as a real display shows them.
+GHOST = "1a2130"
+
+
+def log(*parts):
+    print(time.strftime("%H:%M:%S"), *parts, flush=True)
+
+
+class Stopped(Exception):
+    """The reel was told to stop."""
+
+
+def stop_on_signals():
+    stop = threading.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: stop.set())
+    return stop
+
+
+# ------------------------------------------------------------ the slides
+
+#: The eight fonts, each with what it shows, its colour and options.
+EIGHT = ((letters.BLOCK, "BLOCK", "ffb454", {}),
+         (letters.HALF, "HALF", "7fc8ff", {}),
+         (letters.DOTS, "Dots 5x7", "e8e4da", {"ghost": GHOST}),
+         (letters.TILE, "TILE", "ff7a90", {}),
+         (letters.SEGMENT, "SEGMENT", "7fe8ff", {"ghost": GHOST}),
+         (letters.SEGMENT_CUT, "CUT 14", "c39bff", {"ghost": GHOST}),
+         (letters.SEGMENT7, "12:45", "8cf08c", {"ghost": GHOST}),
+         (letters.SEGMENT7_CUT, "-0.25", "ffc04a", {"ghost": GHOST}))
+
+#: Code, coloured: what a token is, by the first group that matches.
+TOKENS = re.compile(r"""
+    (?P<comment>\#.*$|//.*$)
+  | (?P<string>[rbf]?"[^"\\]*(?:\\.[^"\\]*)*"|[rbf]?'[^'\\]*(?:\\.[^'\\]*)*')
+  | (?P<number>\b\d[\d_.]*\b)
+  | (?P<keyword>\b(?:import|from|def|return|for|in|with|as|if|else|lambda|
+                    fn|let|mut|use|pub|struct|impl|match|Some|None|
+                    while|True|False)\b)
+  | (?P<name>\b[A-Za-z_]\w*(?=\())
+""", re.X)
+CODE_COLOURS = {"comment": "6b7785", "string": "a8d98a", "number": "f5a97f",
+                "keyword": "c39bff", "name": "7fc8ff"}
+
+
+class Slides:
+    """The reel's own base sender: a slide drawn in cells, chosen by the
+    first line of a file and changed as the file is."""
+
+    def __init__(self, path, w):
+        self.path, self.w = path, w
+        self.lines = []
+        self.fits = {}
+
+    def read(self):
+        try:
+            with open(self.path, encoding="utf-8") as fh:
+                self.lines = fh.read().splitlines()
+        except OSError:
+            pass
+
+    def render(self, cols, rows):
+        grid = [[bitwall.cell(" ", TEXT, BG)] * cols for _ in range(rows)]
+        kind, args = (self.lines[0], self.lines[1:]) if self.lines else ("", [])
+        draw = getattr(self, "slide_" + kind, None)
+        if draw and cols >= 20 and rows >= 8:
+            draw(grid, cols, rows, args)
+        return grid
+
+    # -- drawing
+
+    def fit(self, text, cols, rows, fonts, **opts):
+        key = (text, cols, rows, tuple(fonts), tuple(sorted(opts.items())))
+        if key not in self.fits:
+            self.fits[key] = letters.fit(text, cols, rows, fonts=fonts,
+                                         wall=self.w, **opts)
+        return self.fits[key]
+
+    def big(self, grid, text, x, y, cols, rows, fg, fonts, align="centre", bg=BG, **opts):
+        """`text` as big as fits in the box, placed in it; (cols, rows)."""
+        if cols < 1 or rows < 1:
+            return (0, 0)
+        got = self.fit(text, cols, rows, fonts, **opts)
+        if not got:
+            return (0, 0)
+        c, r = letters.size(**{k: v for k, v in got.items()
+                               if k not in ("smooth", "depth", "ghost")})
+        dx = (cols - c) // 2 if align == "centre" else 0
+        letters.draw(grid, x=x + dx, y=y + (rows - r) // 2, fg=fg, bg=bg,
+                     wall=self.w, **got)
+        return (c, r)
+
+    @staticmethod
+    def text(grid, text, x, y, fg, bg=BG, bold=False):
+        if not 0 <= y < len(grid):
+            return
+        row = grid[y]
+        for i, ch in enumerate(text):
+            if 0 <= x + i < len(row):
+                row[x + i] = bitwall.cell(ch, fg, bg, bold=bold)
+
+    @classmethod
+    def box(cls, grid, x, y, w, h, fg, bg=BG, title="", source=""):
+        """A box with rounded corners, a title in its top edge and where
+        its contents came from in its bottom one."""
+        for j in range(y + 1, y + h - 1):
+            for i in range(x + 1, x + w - 1):
+                grid[j][i] = bitwall.cell(" ", TEXT, bg)
+        for i in range(x + 1, x + w - 1):
+            grid[y][i] = bitwall.cell("─", fg, BG)
+            grid[y + h - 1][i] = bitwall.cell("─", fg, BG)
+        for j in range(y + 1, y + h - 1):
+            grid[j][x] = bitwall.cell("│", fg, BG)
+            grid[j][x + w - 1] = bitwall.cell("│", fg, BG)
+        for (i, j), ch in (((x, y), "╭"), ((x + w - 1, y), "╮"),
+                           ((x, y + h - 1), "╰"), ((x + w - 1, y + h - 1), "╯")):
+            grid[j][i] = bitwall.cell(ch, fg, BG)
+        if title:
+            cls.text(grid, f" {title} ", x + 2, y, "c9d1d9", BG, bold=True)
+        if source:
+            cls.text(grid, f" {source} ", x + w - len(source) - 4, y + h - 1, DIM, BG)
+
+    # The caption takes the bottom of the wall: a slide keeps above its
+    # last sixth.
+
+    def slide_problem(self, grid, cols, rows, args):
+        """Lines of big text, the words in *stars* in the accent: the
+        reel's themes, as its captions mark them too."""
+        lines = args or ["NEED TO SHOW *SOMETHING*,", "*SOMEWHERE* ELSE?"]
+        plain = [line.replace("*", "") for line in lines]
+        high = int(rows * 0.7) // max(1, len(lines))
+        fonts = [letters.TILE, letters.HALF, letters.BLOCK]
+        fits = [self.fit(line, cols - 8, high - 2, fonts) for line in plain]
+        if not all(fits):
+            return
+        least = min(fits, key=lambda f: f.get("height") or 0)
+        how = {k: v for k, v in least.items() if k != "text"}
+        measure = {k: v for k, v in how.items() if k not in ("smooth", "depth", "ghost")}
+        gap = letters.size("I I", **measure)[0] - 2 * letters.size("I", **measure)[0]
+        top = rows // 10
+        for n, line in enumerate(lines):
+            words = line.split()
+            wide = letters.size(plain[n], **measure)
+            x = (cols - wide[0]) // 2
+            y = top + n * high + (high - wide[1]) // 2
+            for word in words:
+                lit = word.startswith("*")
+                word = word.replace("*", "")
+                letters.draw(grid, word.upper(), x=x, y=y, fg=INK if lit else TEXT,
+                             bg=BG, wall=self.w, **how)
+                x += letters.size(word.upper(), **measure)[0] + gap
+
+    # -- the board: the same room's board, plain, then styled, then
+    # holding what only its sender could know.
+
+    BOARD_FONT = 28
+    #: The board drawn in a window has a frame round it: a little smaller.
+    WINDOW_FONT = 22
+    #: Seconds a typed character takes, and how long it flickers through
+    #: other characters before it settles.
+    TYPE_EVERY, TYPE_SETTLE = 0.07, 0.25
+    #: The most lines, and the longest line, any typed pass has.
+    TYPE_LINES, TYPE_WIDE = 7, 28
+
+    def board(self, grid, cols, rows, stage):
+        plain = stage == 1
+        ink = "default" if plain else TEXT
+        if plain:
+            for row in grid:
+                row[:] = [bitwall.cell(" ")] * cols
+        # The caption's strip takes the bottom quarter: the board ends above.
+        usable = rows - -(-rows // 4) - 1
+        half = cols // 2
+        top_h = max(6, (usable - 4) // 2 - 1) if stage == 3 else usable - 4
+        top_h = min(top_h, 10) if stage == 3 else min(top_h, 12)
+        now = time.time()
+        clock = time.strftime("%H:%M:%S")
+        if plain:
+            self.text(grid, "Kitchen", 3, 1, "default", "default")
+        else:
+            band = "1b2230"
+            for y in range(3):
+                for x in range(cols):
+                    grid[y][x] = bitwall.cell(" ", TEXT, band)
+            grid[0] = [bitwall.cell("▄", band)] * cols
+            grid[2] = [bitwall.cell("▀", band)] * cols
+            for y, ch in ((0, "◢"), (2, "◥")):
+                grid[y][0] = bitwall.cell(ch, INK)
+            grid[1][0] = bitwall.cell("█", INK)
+            self.text(grid, "KITCHEN", 3, 1, INK, band, bold=True)
+            right = f"{clock}   {time.strftime('%a %-d %b')}"
+            if stage == 3:
+                right = "● live   " + right
+            self.text(grid, right, cols - len(right) - 3, 1, TEXT, band)
+            if stage == 3:
+                self.text(grid, "●", cols - len(right) - 3, 1, "8cf08c", band)
+        # Tonight, where the plain board's lines were.
+        lines = (("Bins out tonight", INK), ("Back at 6", COOL), ("Milk, eggs, coffee", TEXT))
+        if not plain:
+            self.box(grid, 2, 4, half - 3, top_h, FAINT, "10151d", "Tonight",
+                     "from the family calendar API" if stage == 3 else "")
+        for i, (line, colour) in enumerate(lines):
+            if plain:
+                self.text(grid, line, 6, 6 + i, "default", "default")
+            else:
+                self.text(grid, "●", 6, 6 + i, colour, "10151d")
+                self.text(grid, line, 8, 6 + i, TEXT, "10151d")
+        if plain:
+            return
+        # The second panel, styled: a list; holding data: the shop.
+        x2, w2 = half + 1, cols - half - 3
+        if stage == 2:
+            self.box(grid, x2, 4, w2, top_h, FAINT, "10151d", "Shopping")
+            for i, (mark, item, done) in enumerate((("■", "Coffee", True),
+                                                    ("□", "Milk", False),
+                                                    ("□", "Eggs", False),
+                                                    ("□", "Bread", False))):
+                self.text(grid, mark, x2 + 4, 6 + i, "8cf08c" if done else DIM, "10151d")
+                self.text(grid, item, x2 + 6, 6 + i, DIM if done else TEXT, "10151d")
+            return
+        orders = 128 + int(now / 4) % 9
+        self.box(grid, x2, 4, w2, top_h, FAINT, "10151d", "Orders today",
+                 "from the shop's database")
+        self.big(grid, str(orders), x2 + 3, 5, w2 // 3, top_h - 2, INK,
+                 [letters.HALF, letters.BLOCK], align="left", bg="10151d")
+        self.text(grid, f"£{orders * 33.7:,.2f} taken", x2 + w2 // 3 + 6, 6, TEXT, "10151d")
+        self.text(grid, f"{3 + int(now / 7) % 3} to ship by 5pm", x2 + w2 // 3 + 6, 7,
+                  DIM, "10151d")
+        self.text(grid, "Acme Example Shop", x2 + w2 // 3 + 6, 8, DIM, "10151d")
+        # The bottom row: a server and a bank, each from where it came.
+        y3 = 4 + top_h + 1
+        h3 = usable - y3
+        if h3 < 5:
+            return
+        third = (cols - 4) // 2
+        self.box(grid, 2, y3, third - 1, h3, FAINT, "10151d", "web-01.example.com",
+                 "from the monitoring API")
+        cpu = 23 + 9 * abs(((now / 3) % 2) - 1)
+        self.text(grid, "●", 6, y3 + 2, "8cf08c", "10151d")
+        self.text(grid, f"healthy   cpu {cpu:4.1f}%   up 41 days", 8, y3 + 2, TEXT, "10151d")
+        bars = "▁▂▃▄▅▆▇█"
+        spark = "".join(bars[int(4 + 3 * __import__("math").sin(now * 1.3 + i / 2.3))]
+                        for i in range(min(48, third - 10)))
+        self.text(grid, spark, 6, y3 + 4, COOL, "10151d")
+        xb = 2 + third + 1
+        self.box(grid, xb, y3, cols - xb - 2, h3, FAINT, "10151d", "Example Bank",
+                 "from the bank's API (fake)")
+        self.text(grid, "balance", xb + 4, y3 + 2, DIM, "10151d")
+        self.text(grid, "£ ●●,●●●.●●", xb + 14, y3 + 2, TEXT, "10151d", bold=True)
+        self.text(grid, "rent due Friday", xb + 4, y3 + 4, INK, "10151d")
+
+    def slide_text(self, grid, cols, rows, args):
+        self.windowed(grid, cols, rows, 1)
+
+    def slide_styled(self, grid, cols, rows, args):
+        self.windowed(grid, cols, rows, 2)
+
+    def slide_secure(self, grid, cols, rows, args):
+        self.windowed(grid, cols, rows, 3)
+
+    def window(self, grid, cols, rows, title):
+        """A window with rounded corners and the three dots in its corner,
+        above the caption's strip; where its inside is, (x, y, w, h)."""
+        win = "16181d"
+        top, h = 1, rows - rows // 4 - 2
+        self.box(grid, 3, top, cols - 6, h, DIM, win)
+        bar = top + 1
+        for i, colour in enumerate(("ff5f57", "febc2e", "28c840")):
+            self.text(grid, "●", 6 + 2 * i, bar, colour, win)
+        self.text(grid, title, (cols - len(title)) // 2, bar, DIM, win)
+        return 5, bar + 2, cols - 10, h - 4
+
+    def windowed(self, grid, cols, rows, stage):
+        """The kitchen board at a stage, drawn in a window: what a wall
+        shows is plainly a screen of its own."""
+        x, y, iw, ih = self.window(grid, cols, rows, "kitchen")
+        # The board leaves the bottom quarter of what it is given to the
+        # caption: give it a third more, and take the top.
+        inner = [[bitwall.cell(" ", TEXT, BG)] * iw for _ in range(ih + ih // 3)]
+        self.board(inner, iw, len(inner), stage)
+        for j in range(ih):
+            grid[y + j][x:x + iw] = inner[j]
+
+    def font_for(self, default):
+        """The font the slide is drawn at: the board's own, else `default`."""
+        kind = self.lines[0] if self.lines else ""
+        if kind in ("text", "styled", "secure", "terminal"):
+            return self.WINDOW_FONT
+        return self.BOARD_FONT if kind in ("glyphs", "platforms") else default
+
+    def slide_nowplaying(self, grid, cols, rows, args):
+        """A 'now playing' board around the framed film: a frame where
+        the film's layer shows, and beside it what it is and how far in.
+        The args are the Unix time the film was at `seek` seconds."""
+        try:
+            began, seek = float(args[0]), float(args[1])
+        except (IndexError, ValueError):
+            began, seek = time.time(), FILM_SEEK
+        into = max(0.0, seek + time.time() - began)
+        fx, fy, fw, fh = FRAME
+        x0, y0 = int(fx * cols) - 1, int(fy * rows) - 1
+        x1, y1 = -(-int((fx + fw) * cols * 1000) // 1000), -(-int((fy + fh) * rows * 1000) // 1000)
+        x1, y1 = min(cols - 1, x1 + 1), min(rows - 1, y1)
+        self.box(grid, x0, y0, x1 - x0 + 1, y1 - y0 + 1, INK, "000000")
+        self.text(grid, " NOW PLAYING ", x0 + 2, y0, INK, BG, bold=True)
+        # Under the film, its progress.
+        bar_y = y1 + 2
+        if bar_y < rows:
+            span = x1 - x0 - 1
+            done = round(span * into / FILM_LENGTH)
+            for i in range(span):
+                grid[bar_y][x0 + 1 + i] = bitwall.cell("━", INK if i < done else FAINT, BG)
+            stamp = f"{int(into) // 60}:{int(into) % 60:02d} / {FILM_LENGTH // 60}:{FILM_LENGTH % 60:02d}"
+            got = self.fit(stamp, x1 - x0 - 30, 3, [letters.HALF])
+            wide = letters.size(**{k: v for k, v in got.items()
+                                   if k not in ("smooth", "depth", "ghost")})[0] if got else 0
+            self.big(grid, stamp, x1 - wide, bar_y + 1, wide, 3, DIM, [letters.HALF],
+                     align="left")
+            self.big(grid, "PLAYING", x0 + 1, bar_y + 1, 30, 3, INK, [letters.HALF],
+                     align="left")
+        # Beside it, what it is.
+        px = x1 + 4
+        pw = cols - px - 3
+        if pw < 12:
+            return
+        y, high = y0 + 1, max(3, (y1 - y0) // 6)
+        for line, colour, h in (("TEARS OF", TEXT, high), ("STEEL", TEXT, high),
+                                ("BLENDER FOUNDATION", DIM, max(3, high // 2)),
+                                ("CC BY 3.0  2012", DIM, max(3, high // 2))):
+            self.big(grid, line, px, y, pw, h, colour, [letters.HALF, letters.DOTS],
+                     align="left")
+            y += h + 1
+
+    def slide_title(self, grid, cols, rows, args):
+        title = args[0] if args else "bitwall"
+        sub = args[1] if len(args) > 1 else ""
+        top = rows // 8
+        self.big(grid, title, 4, top, cols - 8, int(rows * 0.42), INK,
+                 [letters.TILE, letters.HALF, letters.BLOCK])
+        if sub:
+            self.big(grid, sub, 4, top + int(rows * 0.47), cols - 8, max(3, rows // 9),
+                     DIM, [letters.HALF, letters.DOTS])
+
+    def slide_glyphs(self, grid, cols, rows, args):
+        """What a cell can hold beyond letters: the characters walls draw
+        as shapes, a row of each kind."""
+        octs = "".join(chr(0x1CD00 + i) for i in range(0, 230, 11))
+        kinds = (("letters", "Aa Bb Cc 0123 ?!&@ {}[]", TEXT),
+                 ("blocks", "▀ ▄ █ ▌ ▐  ▖ ▗ ▘ ▝ ▚ ▞ ▙ ▛ ▜ ▟  ░ ▒ ▓", INK),
+                 ("eighths", "▁▂▃▄▅▆▇█  ▏▎▍▌▋▊▉", INK),
+                 ("box lines", "┌─┬─┐ ┏━┓ ╔═╗ ╭─╮ ┼ ╋ ╬ ╰─╯", COOL),
+                 ("braille", "⠁⠃⠇⡇⣇⣧⣷⣿  ⣀⣤⣶⣿  ⢸⡇⠿", COOL),
+                 ("octants", " ".join(octs), "a6e3a1"),
+                 ("shapes", "◢ ◣ ◤ ◥  ● ◆ ■ □ ▪  ▲ ▶ ▼ ◀", "ff7a90"))
+        usable = rows - rows // 4 - 1
+        gap = max(1, usable // (len(kinds) + 1))
+        for i, (name, sample, colour) in enumerate(kinds):
+            y = 1 + gap // 2 + i * gap
+            self.text(grid, name, 4, y, DIM)
+            self.text(grid, sample, 18, y, colour)
+
+    def slide_platforms(self, grid, cols, rows, args):
+        """The native receivers that paint cells and pixels both: a panel
+        for each place one runs."""
+        places = (("MAC", "a window, or no screen", COOL),
+                  ("WINDOWS", "a window, or no screen", COOL),
+                  ("LINUX", "a window, or no screen", COOL),
+                  ("PI", "a Raspberry Pi's screens, through KMS", INK))
+        usable = rows - rows // 4 - 1
+        w, h = (cols - 9) // 2, (usable - 3) // 2
+        for i, (name, what, colour) in enumerate(places):
+            x, y = 3 + (i % 2) * (w + 3), 1 + (i // 2) * (h + 1)
+            self.box(grid, x, y, w, h, FAINT)
+            self.big(grid, name, x + 2, y + max(1, h // 4), w - 4, max(3, h // 2), colour,
+                     [letters.HALF, letters.BLOCK])
+
+    def slide_terminal(self, grid, cols, rows, args):
+        """A terminal window painting the kitchen board as plain text: the
+        whole of what a wall has been sent so far is cells, and any
+        terminal draws cells."""
+        win = "16181d"
+        _, y, _, h = self.window(grid, cols, rows, "bitwall-term kitchen")
+        h += 4
+        self.text(grid, "$ bitwall-term kitchen", 6, y, "8fd18f", win)
+        if args and args[0] == "styled":
+            # The styled board, painted in the terminal as it is on a wall.
+            iw, ih = cols - 10, h - 5
+            inner = [[bitwall.cell(" ", TEXT, BG)] * iw for _ in range(ih + ih // 3)]
+            self.board(inner, iw, len(inner), 2)
+            for j in range(ih):
+                grid[y + 1 + j][5:5 + iw] = inner[j]
+            return
+        for line in ("", "Kitchen", "", "  Bins out tonight", "  Back at 6",
+                     "  Milk, eggs, coffee"):
+            y += 1
+            if line:
+                self.text(grid, line, 6, y, "c8c8c8", win)
+
+    def slide_beat(self, grid, cols, rows, args):
+        lines = args or ["BUT WAIT,", "THERE'S MORE..."]
+        high = int(rows * 0.3)
+        for i, line in enumerate(lines[:2]):
+            self.big(grid, line, 4, rows // 10 + i * (high + rows // 20), cols - 8, high,
+                     INK if i == 0 else TEXT, [letters.TILE, letters.HALF, letters.BLOCK])
+
+    def slide_clock(self, grid, cols, rows, args):
+        now = time.localtime()
+        self.big(grid, time.strftime("%H:%M", now), 4, int(rows * 0.16), cols - 8,
+                 int(rows * 0.45), TEXT, [letters.SEGMENT7, letters.HALF], ghost=GHOST)
+        self.big(grid, time.strftime("%A %-d %B", now).upper(), 4, int(rows * 0.66),
+                 cols - 8, max(3, rows // 10), DIM, [letters.HALF, letters.DOTS])
+
+    def slide_diagram(self, grid, cols, rows, args):
+        """The sender, then the ssh between, then the wall: `args[0]` is
+        how many of the three are up, `args[1]` what the wire says."""
+        step = int(args[0]) if args and args[0].isdigit() else 3
+        bw, bh = int(cols * 0.32), int(rows * 0.52)
+        top = int(rows * 0.12)
+        lx, rx = int(cols * 0.04), cols - int(cols * 0.04) - bw
+        self.box(grid, lx, top, bw, bh, COOL)
+        inner = bh - 4
+        self.big(grid, "YOUR MACHINE", lx + 2, top + 2, bw - 4, inner // 3, COOL,
+                 [letters.HALF, letters.BLOCK])
+        for i, word in enumerate(("DATA", "KEYS", "CODE")):
+            self.big(grid, word, lx + 2, top + 2 + inner // 3 + i * inner // 5,
+                     bw - 4, inner // 5, TEXT, [letters.HALF], scale=1)
+        if step < 2:
+            return
+        if step >= 3:
+            self.box(grid, rx, top, bw, bh, INK)
+            self.big(grid, "THE WALL", rx + 2, top + 2, bw - 4, inner // 3, INK,
+                 [letters.HALF, letters.BLOCK])
+            self.big(grid, "PAINTS", rx + 2, top + 2 + inner // 3 + inner // 5,
+                     bw - 4, inner // 5, TEXT, [letters.HALF], scale=1)
+        # The arrow between, cells running along it.
+        y = top + bh // 2
+        a0, a1 = lx + bw + 2, rx - 3
+        for x in range(a0, a1):
+            grid[y][x] = bitwall.cell("━", DIM, BG)
+        grid[y][a1] = bitwall.cell("▶", INK, BG)
+        step = int(time.monotonic() * 12)
+        for k in range(0, a1 - a0, 9):
+            x = a0 + (step + k) % (a1 - a0)
+            grid[y][x] = bitwall.cell("■", INK, BG)
+        label = max(3, rows // 9)
+        wire = args[1] if len(args) > 1 else "CELLS OVER SSH"
+        self.big(grid, wire, a0, y - label - 1, a1 - a0, label, DIM,
+                 [letters.HALF, letters.DOTS])
+
+    def slide_typing(self, grid, cols, rows, args):
+        """Lines typed onto a black screen as a terminal in a film types
+        them, in VT323, the VT320's own face: the newest character
+        flickers through others before it settles, and a cursor blinks
+        after the last. Every line is drawn at the scale the longest fits
+        at, so the type does not change size as it grows."""
+        if not args:
+            return
+        began, marked = float(args[0]), args[1:]
+        # Words between *stars* are the theme's, in amber: each line as
+        # its plain text and which of its characters are amber.
+        lines, amber = [], []
+        for line in marked:
+            plain, mask = "", []
+            for k, piece in enumerate(line.split("*")):
+                plain += piece
+                mask += [k % 2 == 1] * len(piece)
+            lines.append(plain)
+            amber.append(mask)
+        for row in grid:
+            row[:] = [bitwall.cell(" ", "default", "000000")] * cols
+        typed = (time.time() - began) / self.TYPE_EVERY
+        rng = random.Random(int(time.time() * 20))
+        # Every pass at one size and from one place, whatever its lines:
+        # the type fitted to the longest line and the most lines any pass
+        # has, and the prompt always where the last one was.
+        usable = rows - rows // 4 - 1
+        high = max(3, usable // (self.TYPE_LINES + 1))
+        left = max(2, cols // 10)
+        prompt = "> "
+        longest = prompt + "x" * self.TYPE_WIDE + "_"
+        got = self.fit(longest, cols - 2 * left, high, [letters.VT323, letters.HALF])
+        if not got:
+            return
+        # Lines as close as a terminal's: the type's own height and a
+        # little lead, whatever room the fit was given.
+        _, r = letters.size(**{k: v for k, v in got.items()
+                               if k not in ("smooth", "depth", "ghost")})
+        pitch = r + max(1, r // 4)
+        top = max(0, (usable - pitch * self.TYPE_LINES) // 2)
+        n, last = 0, None
+        shown = []
+        for line in lines:
+            k = max(0, min(len(line), int(typed - n)))
+            shown.append(line[:k])
+            if k:
+                last = (len(shown) - 1, (typed - n - k + 1) * self.TYPE_EVERY)
+            n += len(line) + 6               # a breath at the end of a line
+            if k < len(line):
+                break
+        if typed < 0:
+            shown = [""]
+        blink = int(time.time() * 2) % 2 == 0
+        green, gold = "35e07a", INK
+        for i, text in enumerate(shown):
+            colours = [gold if a else green for a in amber[i][:len(text)]]
+            if last and i == last[0] and last[1] < self.TYPE_SETTLE and text:
+                text = text[:-1] + rng.choice("0123456789#$%&+=<>?/|")
+            if i == 0:
+                text, colours = prompt + text, [green] * len(prompt) + colours
+            if i == len(shown) - 1 and blink:
+                text, colours = text + "_", colours + [green]
+            # Runs of one colour, each drawn after the last at one scale.
+            x, run, start = left, "", 0
+            for j in range(len(text) + 1):
+                if j == len(text) or (j > start and colours[j] != colours[start]):
+                    run = text[start:j]
+                    if run:
+                        letters.draw(grid, x=x, y=top + i * pitch, fg=colours[start],
+                                     bg="000000", wall=self.w, **dict(got, text=run))
+                        c, _ = letters.size(**{k: v for k, v in dict(got, text=run).items()
+                                               if k not in ("smooth", "depth", "ghost")})
+                        x += c
+                    start = j
+
+    def slide_fonts(self, grid, cols, rows, args):
+        usable = rows - rows // 6
+        cw, rh = cols // 2, usable // 4
+        for i, (font, word, fg, opts) in enumerate(EIGHT):
+            x, y = (i % 2) * cw, 1 + (i // 2) * rh
+            self.text(grid, font.upper(), x + 3, y, DIM)
+            self.big(grid, word, x + 3, y + 1, cw - 6, rh - 2, fg, [font], **opts)
+
+    def slide_receivers(self, grid, cols, rows, args):
+        usable = rows - rows // 6
+        half = cols // 2
+        head = max(3, usable // 9)
+        self.big(grid, "RECEIVERS", 6, 1, half - 10, head, DIM, [letters.HALF],
+                 align="left")
+        names = ("PI SCREENS", "MAC AND WINDOWS", "A BROWSER TAB",
+                 "A TERMINAL", "A PLAIN SHELL", "E-PAPER")
+        each = (usable - head - 2) // len(names)
+        for i, name in enumerate(names):
+            y = 2 + head + i * each
+            self.text(grid, "▪", 4, y + each // 2 - 1, INK)
+            self.big(grid, name, 6, y, half - 10, each - 1, TEXT, [letters.HALF],
+                     align="left")
+        for y in range(1, usable):
+            grid[y][half] = bitwall.cell("│", FAINT, BG)
+        promises = (("1", "TAKE A FONT"), ("2", "SAY YOUR AREA"), ("3", "PAINT THE STREAM"))
+        each = (usable - 2) // 3
+        for i, (n, words) in enumerate(promises):
+            y = 1 + i * each
+            c, _ = self.big(grid, n, half + 4, y, 10, each - 2, INK,
+                            [letters.TILE, letters.HALF], align="left")
+            x = half + 6 + max(c, 4)
+            self.big(grid, words, x, y, cols - x - 3, each - 2, TEXT,
+                     [letters.HALF, letters.BLOCK], align="left")
+
+    def slide_code(self, grid, cols, rows, args):
+        path = args[0] if args else ""
+        try:
+            with open(os.path.join(ROOT, path), encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            lines = [f"cannot read {path}"]
+        band = "161b24"
+        for x in range(cols):
+            grid[0][x] = bitwall.cell(" ", TEXT, band)
+        self.text(grid, " " + path, 1, 0, INK, band, bold=True)
+        for i, line in enumerate(lines[: rows - 2]):
+            y = i + 2
+            self.text(grid, f"{i + 1:3d}", 0, y, FAINT)
+            x0, last = 5, 0
+            for m in TOKENS.finditer(line):
+                self.text(grid, line[last:m.start()], x0 + last, y, TEXT)
+                self.text(grid, m.group(), x0 + m.start(), y, CODE_COLOURS[m.lastgroup])
+                last = m.end()
+            self.text(grid, line[last:], x0 + last, y, TEXT)
+
+
+def slides_main(path, target, font):
+    """A base sender showing the slide `path` names, as it changes."""
+    stop = stop_on_signals()
+    w = bitwall.attach(target, min_frame=1 / 10)
+    slides = Slides(path, w)
+    slides.read()
+    w.meta(name="Reel slides", description="The reel's title cards and drawings")
+    at = slides.font_for(font)
+    with w.transition():
+        w.set_font_size(at)
+        w.set_source(slides.render)
+    log(f"slides -> {target}, {w.area()[0]}x{w.area()[1]}: {slides.lines[:2]}")
+    seen = None
+    while not stop.wait(0.1):
+        try:
+            mt = os.stat(path).st_mtime_ns
+        except OSError:
+            continue
+        if mt != seen:
+            seen = mt
+            slides.read()
+            log(f"slide {slides.lines[:2]}")
+            if slides.font_for(font) != at:
+                at = slides.font_for(font)
+                with w.transition():
+                    w.set_font_size(at)
+                    w.set_source(slides.render)
+    w.detach()
+    return 0
+
+
+# ------------------------------------------------------ picture layers
+
+def open_layer(target, stop):
+    lay = bitwall.layer(target, place="above")
+    until = time.monotonic() + 8
+    while lay.pixels() is None and time.monotonic() < until and not stop.is_set():
+        time.sleep(0.05)
+    return lay
+
+
+def show_main(path, target):
+    """An image over the whole wall, on a layer, until stopped."""
+    stop = stop_on_signals()
+    lay = open_layer(target, stop)
+    glass = lay.pixels() or (1920, 1080)
+    with open(path, "rb") as fh:
+        data = fh.read()
+    lay.frame(data, at=(0, 0), size=glass, hold="still")
+    log(f"show {path} -> {target} at {glass[0]}x{glass[1]}")
+    stop.wait()
+    lay.close()
+    return 0
+
+
+def framed_main(target, began, seek):
+    """The film in the slides' frame: a video layer above the base, its
+    frames JPEGs placed at the frame's box, decoded here by ffmpeg at the
+    film's own clock from where it had got to."""
+    stop = stop_on_signals()
+    lay = open_layer(target, stop)
+    gw, gh = lay.pixels() or (1920, 1080)
+    fx, fy, fw, fh = FRAME
+    at, size = (round(fx * gw), round(fy * gh)), (round(fw * gw), round(fh * gh))
+    sw, sh = (round(size[0] * FRAME_SCALE) // 2 * 2, round(size[1] * FRAME_SCALE) // 2 * 2)
+    if not lay.takes("jpeg"):
+        log(f"{target} takes no JPEG: no framed film")
+        lay.close()
+        return 1
+    into = seek + max(0.0, time.time() - began)
+    enc = subprocess.Popen(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-ss", f"{into:.2f}",
+         "-re", "-i", FILM, "-an", "-vf", f"fps={FRAME_FPS},scale={sw}:{sh}",
+         "-f", "image2pipe", "-c:v", "mjpeg", "-q:v", "4", "-"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True)
+    log(f"framed -> {target}: {sw}x{sh} at {FRAME_FPS}fps into {size[0]}x{size[1]} "
+        f"at {at[0]},{at[1]}, from {into:.1f}s")
+    sent = [0]
+
+    def carry():
+        """Each JPEG ffmpeg writes, whole, to the layer at the box."""
+        buf = b""
+        while not stop.is_set():
+            chunk = enc.stdout.read1(1 << 16)
+            if not chunk:
+                break
+            buf += chunk
+            while (end := buf.find(b"\xff\xd9")) >= 0:
+                start = buf.find(b"\xff\xd8")
+                frame, buf = buf[max(0, start):end + 2], buf[end + 2:]
+                if start >= 0 and not stop.is_set():
+                    lay.frame(frame, at=at, size=size, hold=round(2000 / FRAME_FPS))
+                    sent[0] += 1
+        stop.set()
+
+    # The carrying on a thread of its own, so a stop is heard however
+    # long a read waits: ffmpeg is ended, which ends the read.
+    carrier = threading.Thread(target=carry, daemon=True)
+    carrier.start()
+    while not stop.wait(0.2):
+        pass
+    # Killed outright: ffmpeg told to stop finishes what it is writing,
+    # into a pipe nobody reads any more.
+    try:
+        os.killpg(enc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    enc.wait()
+    carrier.join(timeout=2)
+    log(f"framed: {sent[0]} frames sent")
+    lay.close()
+    return 0
+
+
+def pip_main(target):
+    """The wall's own glass, live, shrunk into its top right corner with
+    a border, from a mirror of it: the corner holds itself, smaller."""
+    from PIL import Image
+    stop = stop_on_signals()
+    lay = open_layer(target, stop)
+    gw, gh = lay.pixels() or (1920, 1080)
+    w, h = (gw // 3) & ~1, (gh // 3) & ~1
+    edge = max(4, gw // 320)
+    at = (gw - w - 2 * edge - gw // 30, gh // 18)
+    c = bitwall.Controller(target).open()
+    errors = [x.raw for x in c.ask(f"mirror glass every=150 size={w}x{h} "
+                                   f"format=jpeg quality=85", timeout=3)
+              if getattr(x, "name", None) == "error"]
+    if errors:
+        log(f"{target}: {errors[0]}")
+    log(f"pip -> {target}: {w}x{h} at {at[0]},{at[1]}")
+    while not stop.is_set() and c.state == "open":
+        said = c.read(timeout=0.5)
+        if not isinstance(said, Blob):
+            continue
+        try:
+            shot = Image.open(io.BytesIO(said.data)).convert("RGB")
+        except Exception:                                       # noqa: BLE001
+            continue
+        framed = Image.new("RGB", (w + 2 * edge, h + 2 * edge), "#" + INK)
+        framed.paste(shot.resize((w, h)), (edge, edge))
+        buf = io.BytesIO()
+        framed.save(buf, "JPEG", quality=88)
+        lay.frame(buf.getvalue(), at=at, size=framed.size, hold=1500)
+    c.send("mirror glass off")
+    c.close()
+    lay.close()
+    return 0
+
+
+# ---------------------------------------------------- the control page
+
+def chrome():
+    for name in CHROME:
+        found = name if os.path.isfile(name) else shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+async def _cdp_shot(url, out, settle):
+    import aiohttp
+    async with aiohttp.ClientSession() as http:
+        pages = []
+        for _ in range(100):
+            try:
+                async with http.get(f"http://127.0.0.1:{DEBUG_PORT}/json") as r:
+                    pages = [p for p in await r.json() if p.get("type") == "page"]
+                if pages:
+                    break
+            except aiohttp.ClientError:
+                pass
+            await asyncio.sleep(0.1)
+        if not pages:
+            raise RuntimeError("Chrome did not open a page")
+        async with http.ws_connect(pages[0]["webSocketDebuggerUrl"], max_msg_size=0) as ws:
+            n = 0
+
+            async def call(method, **params):
+                nonlocal n
+                n += 1
+                await ws.send_json({"id": n, "method": method, "params": params})
+                async for msg in ws:
+                    got = json.loads(msg.data)
+                    if got.get("id") == n:
+                        return got.get("result", {})
+            await call("Page.navigate", url=url)
+            await asyncio.sleep(settle)
+            # Every wall's picture, live: the page's own button for it.
+            await call("Runtime.evaluate", expression="""
+                [...document.querySelectorAll('button')]
+                  .filter(b => b.textContent.trim() === '250ms')[0]?.click()""")
+            await asyncio.sleep(settle)
+            got = await call("Page.captureScreenshot", format="png")
+            with open(out, "wb") as fh:
+                fh.write(base64.b64decode(got["data"]))
+
+
+def control_picture(out, env, logs, size=(1920, 1080), settle=2.0):
+    """The control page, its own, pictured by Chrome; whether it was."""
+    exe = chrome()
+    if exe is None:
+        log("no Chrome: no picture of the control page")
+        return False
+    home = os.path.join(logs, "control-home")
+    os.makedirs(home, exist_ok=True)
+    cenv = dict(env, HOME=home)
+    cenv.setdefault("UV_CACHE_DIR", os.path.expanduser("~/.cache/uv"))
+    with open(os.path.join(logs, "control.log"), "a") as lf:
+        page = subprocess.Popen(
+            [os.path.join(ROOT, "controllers/bitwall-control"), "--device",
+             "reel=localhost", "--host", "127.0.0.1", "--port", str(CONTROL_PORT)],
+            env=cenv, stdout=lf, stderr=subprocess.STDOUT, start_new_session=True)
+    browser = subprocess.Popen(
+        [exe, "--headless=new", "--disable-gpu", "--hide-scrollbars",
+         f"--remote-debugging-port={DEBUG_PORT}", f"--window-size={size[0]},{size[1]}",
+         f"--user-data-dir={os.path.join(logs, 'chrome')}", "about:blank"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    try:
+        for _ in range(100):
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{CONTROL_PORT}/", timeout=1)
+                break
+            except OSError:
+                time.sleep(0.1)
+        asyncio.run(_cdp_shot(f"http://127.0.0.1:{CONTROL_PORT}/", out, settle))
+        log(f"pictured the control page: {out}")
+        return True
+    except Exception as e:                                      # noqa: BLE001
+        log(f"no picture of the control page: {e}")
+        return False
+    finally:
+        for p in (browser, page):
+            try:
+                os.killpg(p.pid, signal.SIGTERM)
+                p.wait(5)
+            except (ProcessLookupError, subprocess.TimeoutExpired):
+                pass
+
+
+# ------------------------------------------------------- the processes
+
+def read_srt(path):
+    """A SubRip file's lines as (start, end, text) in seconds, its lines of
+    text joined into one; none where there is no file."""
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            text = fh.read().replace("\r", "")
+    except OSError:
+        return []
+    out = []
+    stamp = re.compile(r"(\d+):(\d+):(\d+)[,.](\d+)\s*-->\s*(\d+):(\d+):(\d+)[,.](\d+)")
+    for block in re.split(r"\n\s*\n", text.strip()):
+        rows = block.split("\n")
+        for i, row in enumerate(rows):
+            m = stamp.search(row)
+            if m:
+                v = [int(x) for x in m.groups()]
+                out.append((v[0] * 3600 + v[1] * 60 + v[2] + v[3] / 1000,
+                            v[4] * 3600 + v[5] * 60 + v[6] + v[7] / 1000,
+                            " ".join(r.strip() for r in rows[i + 1:] if r.strip())))
+                break
+    return out
+
+
+class Procs:
+    """The senders the reel runs, by name, each in a process group of its
+    own with its output in a log of its own."""
+
+    def __init__(self, logs, env):
+        self.logs, self.env = logs, env
+        self.running = {}
+        self.reapers = []
+        self.n = 0
+
+    def start(self, name, argv):
+        if name in self.running:
+            self.stop(name)
+        self.n += 1
+        out = open(os.path.join(self.logs, f"{self.n:03d}-{name}.log"), "w")
+        p = subprocess.Popen(argv, stdout=out, stderr=subprocess.STDOUT,
+                             stdin=subprocess.DEVNULL, env=self.env,
+                             start_new_session=True, cwd=ROOT)
+        out.close()
+        self.running[name] = p
+        log(f"started {name} ({p.pid}): {' '.join(argv[1:])}")
+        return p
+
+    def stop(self, *names):
+        """SIGTERM now, SIGKILL in five seconds, waited for elsewhere."""
+        for name in names:
+            p = self.running.pop(name, None)
+            if p is None:
+                continue
+            # The whole group, even where its first process has gone: what
+            # it started may still be running in it.
+            try:
+                os.killpg(p.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                continue
+            reaper = threading.Thread(target=self._reap, args=(p,), daemon=True)
+            reaper.start()
+            self.reapers.append(reaper)
+            log(f"stopped {name}")
+
+    @staticmethod
+    def _reap(p):
+        try:
+            p.wait(5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            p.wait()
+
+    def rename(self, old, new):
+        if old in self.running:
+            self.running[new] = self.running.pop(old)
+
+    def stop_all(self):
+        """Stop every sender, and wait until each has gone, SIGKILL and
+        all, so none outlives the reel."""
+        self.stop(*list(self.running))
+        for reaper in self.reapers:
+            reaper.join()
+
+    def check(self):
+        """Say once of any sender that has ended on its own."""
+        for name, p in list(self.running.items()):
+            if p.poll() is not None:
+                log(f"{name} ended by itself, exit {p.returncode}; see {self.logs}")
+                del self.running[name]
+
+
+# ------------------------------------------------------------ the reel
+
+class Reel:
+    """The reel's scenes, its chapters in order, each a run of shots, and
+    what each shot needs on the wall."""
+
+    SCENES = (("intro", ("logo", "problem", "text", "styled", "secure")),
+              ("idea", ("diagram", "beat")),
+              ("more", ("fluid", "fonts", "panes", "swap", "ticker", "terminal")),
+              ("pixels", ("receivers_more", "film", "framed", "rick", "subtitles", "native")),
+              ("running", ("stats", "pip")),
+              ("build", ("again", "python", "rust", "closer", "end")))
+
+    @classmethod
+    def shots(cls, names):
+        """The shots `names` asks for, in its order: a scene's name is all
+        its shots, `scene.shot` or a shot's own name is that shot."""
+        scenes = dict(cls.SCENES)
+        every = {shot: scene for scene, shots in cls.SCENES for shot in shots}
+        out = []
+        for name in names:
+            scene, dot, shot = name.partition(".")
+            if not dot and name in scenes:
+                out += [f"{name}.{s}" for s in scenes[name]]
+            elif dot and shot in scenes.get(scene, ()):
+                out.append(name)
+            elif not dot and name in every:
+                out.append(f"{every[name]}.{name}")
+            else:
+                raise ValueError(name)
+        return out
+    #: The four panes' second senders, which act three brings back.
+    SWAPPED = (("tl", "senders/games/snake/main.py"),
+               ("tr", "senders/maze/main.py"),
+               ("bl", "senders/games/torus/main.py"),
+               ("br", "senders/games/matrix/main.py"))
+
+    def __init__(self, a, procs, run, stop):
+        self.a, self.p, self.run, self.stop = a, procs, run, stop
+        self.target = a.target
+        self.host, _, wall = a.target.partition(":")
+        self.wall = wall or "0"
+        self.caption_file = os.path.join(a.logs, "caption")
+        self.slide_file = os.path.join(a.logs, "slide")
+        self.code_file = os.path.join(a.logs, "slide-code")
+        self.keep = os.path.join(a.logs, "panes")
+        self.shot = os.path.join(a.logs, "control.png")
+        self.base = set()           # the processes that are the base now
+        self.ctl = None
+        self.shooting = None
+        self.film_began = None      # when the film was at FILM_SEEK
+
+    # -- plumbing
+
+    def wait(self, secs):
+        until = time.monotonic() + secs
+        while (left := until - time.monotonic()) > 0:
+            if self.stop.wait(min(left, 0.25)):
+                raise Stopped
+            self.p.check()
+
+    @staticmethod
+    def write(path, text):
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(text + "\n")
+        os.replace(tmp, path)
+
+    def say(self, text, rise=None):
+        """The caption, and where the strip goes: `rise` is (share, seconds)
+        off its edge, or home where it is not said."""
+        self.write(self.caption_file, text + (f"\nrise {rise[0]} {rise[1]}" if rise else ""))
+        log(f"caption: {text!r}" + (f" rising {rise[0]} over {rise[1]} s" if rise else ""))
+
+    def start(self, name, rel, *args, target=None):
+        exe = rel if os.path.isabs(rel) else os.path.join(ROOT, rel)
+        return self.p.start(name, [exe, *args, target or self.target])
+
+    def take_base(self, names, start, settle=0.8):
+        """Start what is to be the base, then stop what was."""
+        old = self.base - set(names)
+        start()
+        self.base = set(names)
+        self.wait(settle)
+        self.p.stop(*old)
+
+    def slide(self, *lines):
+        """The full wall's slide, starting the slides where they are not
+        the base already."""
+        self.write(self.slide_file, "\n".join(lines))
+        if "slides" not in self.base:
+            self.take_base({"slides"}, lambda: self.start(
+                "slides", "demos/reel", "--slides", self.slide_file))
+
+    def controller(self):
+        if self.ctl is None or self.ctl.state != "open":
+            self.ctl = bitwall.Controller(self.target).open()
+        return self.ctl
+
+    # -- panes
+
+    def pane(self, name):
+        local = self.host in ("localhost", "127.0.0.1")
+        return f"{self.host if local else 'localhost'}:{self.wall}-{name}"
+
+    def pane_ready(self, name, secs=10):
+        door = os.path.join(self.run, "bitwall", f"{self.wall}-{name}", "door.in")
+        until = time.monotonic() + secs
+        while not os.path.exists(door):
+            if time.monotonic() > until:
+                log(f"pane {name}: no door at {door}")
+                return False
+            self.wait(0.05)
+        return True
+
+    def ctl_pane(self, name, command):
+        c = bitwall.Controller(self.pane(name)).open()
+        got = [x.raw for x in c.ask(command, timeout=3)]
+        c.close()
+        log(f"{name}: {command} -> {'; '.join(got) or 'nothing'}")
+
+    def in_pane(self, pane, rel, *args):
+        """A sender on a pane, asking for the font the pane has: a pane
+        answers any other with its own area, which a sender waits on."""
+        self.base.add(f"pane-{pane}")
+        return self.start(f"pane-{pane}", rel, "--font", str(self.a.pane_font), *args,
+                          target=self.pane(pane))
+
+    def split(self, name, way, new, rel, *args):
+        self.ctl_pane(name, f"split {way} {new}")
+        if self.pane_ready(new):
+            self.in_pane(new, rel, *args)
+
+    def panes(self, first, fresh=True):
+        """The wall cut into panes, from `first` or the layout kept."""
+        if fresh:
+            shutil.rmtree(self.keep, ignore_errors=True)
+        self.take_base({"panes"}, lambda: self.start(
+            "panes", "senders/panes/main.py", "--name", first,
+            "--font", str(self.a.pane_font)), settle=0.1)
+        if not self.pane_ready(first):
+            raise RuntimeError("panes did not make its first pane")
+
+    def swap(self, pane, rel, *args):
+        """A pane's sender replaced: the new one first, then the old."""
+        self.p.rename(f"pane-{pane}", f"old-{pane}")
+        self.in_pane(pane, rel, *args)
+        self.wait(1.0)
+        self.p.stop(f"old-{pane}")
+
+    def ticker(self):
+        self.start("ticker", "senders/ticker/main.py", "--at", "top", "--font", "44",
+                   "--where", WHERE[0], "--lat", WHERE[1], "--lon", WHERE[2])
+
+    # -- the opening: the problem, and a board that grows
+
+    def shot_logo(self):
+        self.say("")
+        self.slide("title", "bitwall", self.a.repo)
+        self.wait(4)
+
+    def shot_problem(self):
+        self.say("")
+        self.typed((("Need to show *something*,", "*somewhere* else?"),
+                    ("try bitwall", "sending bits to walls.")))
+
+    def shot_text(self):
+        self.slide("text")
+        self.say("A wall just shows what it's sent | such as plain text")
+        self.wait(5)
+
+    def shot_styled(self):
+        self.slide("styled")
+        self.say("...more text, styled")
+        self.wait(5)
+
+    def shot_secure(self):
+        self.slide("secure")
+        self.say("...even private data | the wall is not trusted with the keys")
+        self.wait(12)
+
+    # -- act one: the idea
+
+    def shot_wall(self):
+        self.slide("clock")
+        self.ticker()
+        self.say("This screen is a wall | it knows nothing")
+        self.wait(5)
+
+    def shot_nothing(self):
+        self.say("No passwords, no data, no code on it")
+        self.wait(4)
+
+    def shot_diagram(self):
+        self.p.stop("ticker")
+        self.slide("diagram", "1")
+        self.say("A sender runs where your *something* is | your data, your keys, your code")
+        self.wait(4)
+        self.slide("diagram", "2")
+        self.say("ssh carries your bits there | you just send the updates")
+        self.wait(4)
+        self.slide("diagram", "3")
+        self.say("...to a wall *somewhere* | a Pi, a browser, a terminal, e-paper")
+        self.wait(5)
+
+    def shot_fluid(self):
+        self.take_base({"fluid"}, lambda: self.start(
+            "fluid", "senders/fluid/main.py", "--font", "10", "--mode", "dye"))
+        self.say("It's just a grid of cells | so play with what you send")
+        self.wait(5)
+
+    def shot_beat(self):
+        self.say("")
+        self.slide("beat")
+        self.wait(2.5)
+
+    def shot_terminal(self):
+        self.p.stop("ticker")
+        self.slide("terminal")
+        self.say("This is all just text | bitwall can paint it in a terminal")
+        self.wait(4)
+        self.slide("terminal", "styled")
+        self.say("...plain or styled | any terminal draws cells")
+        self.wait(5)
+
+    def shot_receivers_more(self):
+        self.say("")
+        self.slide("blank")
+        self.wait(0.5)
+        self.say("A receiver that does more than text? | what if it can reach the pixels too?")
+        self.wait(4.5)
+        self.say("...then you get more | pictures, video, layers of pixels")
+        self.wait(4)
+
+    # -- act two: more
+
+    def shot_panes(self):
+        self.panes("tl")
+        self.in_pane("tl", "senders/fluid/main.py", "--mode", "dye")
+        self.say("Cut a wall into panes | each its own sender")
+        self.wait(1.0)
+        self.split("tl", "right", "tr", "senders/games/raycast/main.py")
+        self.wait(3.5)
+        self.split("tl", "down", "bl", "senders/sysinfo/main.py")
+        self.split("tr", "down", "br", "senders/letters/main.py", "--scene", "clock", "--hold")
+        self.wait(3.5)
+
+    def shot_swap(self):
+        self.say("Swap any pane | the rest keep running")
+        for pane, rel in self.SWAPPED:
+            self.swap(pane, rel)
+            self.wait(1.0)
+
+    def shot_ticker(self):
+        """Back to one sender on the whole wall, a band laid over it, and
+        what is beneath changed while the band runs on."""
+        self.one("raycast", "senders/games/raycast/main.py")
+        self.say("One wall again | one sender")
+        self.wait(2.5)
+        self.ticker()
+        self.wait(0.8)
+        self.say("Add a layer over the top | of whatever is there")
+        self.wait(4)
+        self.say("Its empty cells are transparent | what's beneath shows through")
+        self.wait(4)
+        self.say("Change what's underneath | the band keeps flowing")
+        self.wait(1)
+        self.one("snake", "senders/games/snake/main.py")
+        self.wait(3)
+        self.one("torus", "senders/games/torus/main.py")
+        self.wait(3.5)
+
+    def one(self, name, rel, *args):
+        """The whole wall one sender's again: it takes the base, and any
+        panes and their senders go."""
+        self.take_base({name}, lambda: self.start(name, rel, *args))
+        self.p.stop(*[n for n in list(self.p.running) if n.startswith(("pane-", "old-"))])
+
+    def shot_film(self):
+        if not os.path.exists(FILM):
+            log(f"no film at {FILM}: no film, and nothing framed")
+            return
+        self.p.stop("ticker")
+        self.film_began = time.time() + 1.0
+        self.take_base({"film"}, lambda: self.start(
+            "film", "senders/film/main.py", "--file", FILM, "--seek", str(FILM_SEEK),
+            "--ahead", "1.0"), settle=0.3)
+        self.start("credit", "demos/caption", "--style", "label", "--at", "top",
+                   "--align", "left", "--font", "18", "--place", "above",
+                   "--text", FILM_CREDIT)
+        self.say("Show a video | decoded by the wall itself")
+        self.wait(7.5)
+
+    def shot_framed(self):
+        if not os.path.exists(FILM):
+            return
+        # The film carries on from where the full-wall film had got to.
+        began, seek = self.film_began, FILM_SEEK
+        if began is None:
+            began, seek = time.time(), FILM_SEEK + 8
+        self.start("framed", "demos/reel", "--framed", f"{began:.3f}", str(seek))
+        self.wait(1.2)
+        # A cells base is not taken over a film's video base: the film
+        # goes, and the slides take the base it left.
+        self.p.stop("credit", *self.base)
+        self.base = set()
+        self.wait(0.4)
+        self.slide("nowplaying", f"{began:.3f}", str(seek))
+        self.say("Resize and place it as you need | mix it with text")
+        self.wait(7)
+
+    def shot_rick(self):
+        self.start("rick", "senders/ascii/main.py", "--name", "reel-rick", "--place", "above",
+                   "--font", "14", "--grid", "210x58", "--only",
+                   os.path.join(ROOT, "senders/ascii/whole") + " --centre=0.75 curl -sN ascii.live/rick")
+        self.wait(0.8)
+        self.say("And text over pixels | any layer, any order")
+        self.wait(7)
+        self.p.stop("rick")
+
+    def shot_native(self):
+        self.p.stop("subtitle", "framed")
+        self.slide("platforms")
+        self.say("Native receivers paint cells and pixels | on a Mac, Windows, Linux and a Pi")
+        self.wait(6)
+
+    def shot_subtitles(self):
+        """The Rick Roll gone, and a better use of text over a film: a
+        subtitle, on a label layer of its own, over the framed film."""
+        subs = os.path.join(self.a.logs, "subtitle")
+        self.write(subs, "")
+        lines = read_srt(SUBTITLES)
+        began = self.film_began or time.time()
+        self.start("subtitle", "demos/caption", "--style", "subtitle",
+                   "--box", ",".join(str(v) for v in FRAME), "--font", "24",
+                   "--place", "above", "--file", subs)
+        self.say("Ok, captions might be better | a better text overlay than a Rick Roll")
+        # The line the film is saying now, as it plays in its frame.
+        shown, until = None, time.monotonic() + 10
+        while time.monotonic() < until:
+            at = FILM_SEEK + time.time() - began
+            now = next((t for start, end, t in lines if start <= at < end), "")
+            if now != shown:
+                self.write(subs, now)
+                shown = now
+            self.wait(0.2)
+        self.p.stop("subtitle", "framed")
+        self.film_began = None
+
+    def shot_fonts(self):
+        # A cells base is not taken over a film's video base: the film
+        # goes first, and the slides take the base it left.
+        self.slide("glyphs")
+        self.say("A cell holds more than letters | blocks, lines, braille, octants, shapes")
+        self.wait(5)
+        self.slide("fonts")
+        self.say("Helpers build big text from them | eight fonts in bitwall.letters")
+        self.wait(6)
+
+    # -- act three: running walls
+
+    def playing(self):
+        """The 'now playing' board with the film in its frame, as the
+        running scene's wall: started where it is not up already."""
+        if "framed" in self.p.running or not os.path.exists(FILM):
+            return
+        began, seek = time.time(), FILM_SEEK + 40
+        self.start("framed", "demos/reel", "--framed", f"{began:.3f}", str(seek))
+        self.wait(1.2)
+        self.slide("nowplaying", f"{began:.3f}", str(seek))
+
+    def shot_stats(self):
+        self.playing()
+        self.wait(1.0)
+        self.controller().ask("stats 1 at=n size=34 show=wall,grid,fps,in,out,cpu,sender")
+        self.say("Every wall measures itself, live")
+        self.wait(6)
+        self.controller().ask("stats 0")
+
+    def shot_control(self):
+        if self.shooting is not None:
+            self.shooting.join(timeout=10)
+        self.controller().ask("stats 0")
+        if not os.path.exists(self.shot):
+            return
+        self.start("show", "demos/reel", "--show", self.shot)
+        self.wait(0.6)
+        self.say("One page sees and drives every wall")
+        self.wait(5.4)
+
+    def shot_pip(self):
+        self.start("pip", "demos/reel", "--pip")
+        self.wait(0.6)
+        self.p.stop("show")
+        self.say("Take a snapshot of any wall | or stream what it shows, live")
+        self.wait(6.5)
+
+    # -- act four: build your own
+
+    def shot_again(self):
+        """The diagram from the start again, asking what it takes to be
+        the box on the left."""
+        self.p.stop("pip", "show", "framed")
+        self.controller().ask("stats 0")
+        self.slide("diagram", "3", "CELLS AND PIXELS")
+        self.say("So how hard is it | to write a sender?")
+        self.wait(5)
+
+    def shot_python(self):
+        self.p.stop("pip", "show", "framed")
+        self.write(self.code_file, f"code\n{PYTHON_SENDER}")
+        self.panes("code")
+        self.base.add("pane-code")
+        self.start("pane-code", "demos/reel", "--slides", self.code_file,
+                   "--slide-font", str(self.a.pane_font), target=self.pane("code"))
+        self.ctl_pane("code", "split right run")
+        self.ctl_pane("code", "share 55")
+        if self.pane_ready("run"):
+            self.base.add("pane-run")
+            self.start("pane-run", PYTHON_SENDER, target=self.pane("run"))
+        with open(os.path.join(ROOT, PYTHON_SENDER), encoding="utf-8") as fh:
+            lines = sum(1 for line in fh if line.strip() and not line.startswith("#"))
+        self.say(f"This is a complete sender | {lines} lines of Python")
+        self.wait(8)
+
+    def shot_rust(self):
+        if not os.path.exists(RUST_BINARY):
+            log(f"no {RUST_BINARY}: no Rust scene")
+            return
+        if "pane-run" not in self.base:
+            self.shot_python()
+        self.write(self.code_file, f"code\n{RUST_SENDER}")
+        self.p.rename("pane-run", "old-run")
+        self.start("pane-run", RUST_BINARY, target=self.pane("run"))
+        self.wait(0.6)
+        self.p.stop("old-run")
+        self.say("...or Rust | where frame rate counts")
+        self.wait(6.4)
+
+    def shot_receivers(self):
+        self.slide("receivers")
+        self.say("A receiver is three promises | write your own")
+        self.wait(8)
+
+    #: The closer: seconds the prompt blinks alone, and each pass is held
+    #: once it is typed.
+    PROMPT, READ = 1.6, 4.0
+
+    def typed(self, passes):
+        """Passes of lines typed on a black screen, each from a blinking
+        prompt, each held the same while it is read."""
+        for lines in passes:
+            self.slide("typing", f"{time.time() + self.PROMPT:.3f}", *lines)
+            plain = sum(len(line.replace("*", "")) + 6 for line in lines)
+            self.wait(self.PROMPT + plain * Slides.TYPE_EVERY + self.READ)
+
+    def shot_closer(self):
+        """The whole of it typed out on a black screen, before the card:
+        no caption, the screen says it."""
+        self.p.stop(*[n for n in list(self.p.running) if n.startswith(("pane-", "old-"))])
+        self.say("")
+        self.typed((("bitwall", "send text and pixels", "wherever you want."),
+                      ("a small protocol", "with endless possibilities."),
+                      ("use it for", "status displays,", "dashboards,",
+                       "remote development,", "terminal walls,", "conferences,",
+                       "installations..."),
+                    ("what will you make, Neo?",)))
+        self.slide("blank")
+        self.wait(1.5)
+
+    def shot_end(self):
+        self.slide("title", "bitwall", self.a.repo)
+        self.say("Everything you just saw is bitwall | captured straight off a wall")
+        self.wait(8)
+
+    def play(self):
+        self.say("")
+        self.start("caption", "demos/caption", "--file", self.caption_file,
+                   "--font", str(self.a.caption_font), "--place", "top")
+        loops = 0
+        while True:
+            started = time.monotonic()
+            for name in self.a.shots:
+                at = time.monotonic()
+                getattr(self, "shot_" + name.partition(".")[2])()
+                log(f"shot {name}: {time.monotonic() - at:.1f} s")
+            loops += 1
+            log(f"reel {loops} played in {time.monotonic() - started:.1f} s")
+            if self.a.once:
+                return
+
+
+def build_rust():
+    """The Rust sender, built where cargo is and it is not yet."""
+    if os.path.exists(RUST_BINARY) or not shutil.which("cargo"):
+        return
+    log("building the Rust sender")
+    subprocess.run(["cargo", "build", "--release", "--quiet", "--example", "wave"],
+                   cwd=os.path.join(ROOT, "bitwall", "rust"))
+
+
+def parse(argv):
+    ap = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
+    ap.add_argument("--once", action="store_true", help="play the reel once and stop")
+    ap.add_argument("--repo", default="github.com/iamrodos/bitwall",
+                    help="where the repo is, as the end card says it")
+    ap.add_argument("--scenes", default=",".join(name for name, _ in Reel.SCENES),
+                    help="the scenes, or scene.shot, to play in order (default "
+                         "all: " + "; ".join(f"{n}: {','.join(s)}" for n, s in Reel.SCENES)
+                         + ")")
+    ap.add_argument("--pane-font", type=int, default=12,
+                    help="the wall's font while it is cut into panes (default 12)")
+    ap.add_argument("--caption-font", type=int, default=52,
+                    help="the caption strip's font size (default 52)")
+    ap.add_argument("--logs", default=None,
+                    help="where the senders' logs go (default a new directory)")
+    ap.add_argument("--slides", metavar="FILE", help=argparse.SUPPRESS)
+    ap.add_argument("--slide-font", type=int, default=10, help=argparse.SUPPRESS)
+    ap.add_argument("--show", metavar="IMAGE", help=argparse.SUPPRESS)
+    ap.add_argument("--pip", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--framed", nargs=2, type=float, metavar=("BEGAN", "SEEK"),
+                    help=argparse.SUPPRESS)
+    ap.add_argument("target", help="the wall, host:wall")
+    a = ap.parse_args(argv)
+    try:
+        a.shots = Reel.shots([s for s in a.scenes.split(",") if s])
+    except ValueError as e:
+        ap.error(f"no scene or shot {e}: "
+                 + "; ".join(f"{n}: {','.join(s)}" for n, s in Reel.SCENES))
+    return a
+
+
+def main():
+    a = parse(sys.argv[1:])
+    if a.slides:
+        return slides_main(a.slides, a.target, a.slide_font)
+    if a.show:
+        return show_main(a.show, a.target)
+    if a.pip:
+        return pip_main(a.target)
+    if a.framed:
+        return framed_main(a.target, *a.framed)
+    stop = stop_on_signals()
+    a.logs = os.path.abspath(a.logs or tempfile.mkdtemp(prefix="bitwall-reel-"))
+    os.makedirs(a.logs, exist_ok=True)
+    env = dict(os.environ)
+    host = a.target.partition(":")[0]
+    if os.environ.get("BITWALL_RUN"):
+        run = os.environ["BITWALL_RUN"]
+    elif host in ("localhost", "127.0.0.1"):
+        run = os.environ.get("XDG_RUNTIME_DIR") or os.path.expanduser("~/.bitwall/run")
+    else:
+        # The panes' walls in a run directory of the reel's own, so their
+        # names meet nobody's on this machine.
+        run = os.path.join(a.logs, "run")
+        os.makedirs(run, exist_ok=True)
+    env["XDG_RUNTIME_DIR"] = run
+    env["BITWALL_PANES_KEEP"] = os.path.join(a.logs, "panes")
+    # The reel asks its panes for their splits itself, where they are.
+    os.environ["XDG_RUNTIME_DIR"] = run
+    build_rust()
+    procs = Procs(a.logs, env)
+    log(f"reel on {a.target}; logs in {a.logs}; panes made in {run}")
+    reel = Reel(a, procs, run, stop)
+    try:
+        reel.play()
+    except Stopped:
+        log("stopping")
+    finally:
+        procs.stop_all()
+        if reel.ctl is not None:
+            reel.ctl.ask("stats 0")
+            reel.ctl.close()
+        time.sleep(0.5)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

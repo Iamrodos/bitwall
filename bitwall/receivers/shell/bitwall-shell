@@ -1,0 +1,175 @@
+#!/bin/sh
+# The least a receiver can be: a wall on this terminal, as PROTOCOL.md
+# has it. Makes `<run>/bitwall/<wall>/` and its door, opens the base for
+# whoever asks, says its area from `stty size`, and cats the base's stream
+# to the terminal, where the APC commands pass through unseen. One layer,
+# the base, and up to four controllers, each of which may ask `sessions`,
+# `report` and `ping`. The instance a base or a controller was opened with is kept in its
+# session's directory, as `.instance`, for `sessions` to say. The wall takes the terminal's alternate screen with the cursor
+# hidden, and gives both back when it ends; when the terminal is resized
+# the base is told its new area and asked to repaint.
+#
+#     bitwall/receivers/shell/bitwall-shell [wall]    wall 0 unless named
+#
+# BITWALL_RUN puts the walls elsewhere. BITWALL_FONT is the size the area
+# is said to be drawn at, 14 unless set, since a terminal cannot say.
+set -f
+run=${BITWALL_RUN:-${XDG_RUNTIME_DIR:-$HOME/.bitwall/run}}
+wall=$run/bitwall/${1:-0} tmp=$run/bitwall/.${1:-0}-$$ font=${BITWALL_FONT:-14}
+caps='caps area sessions report ping layers=1 types=cells controllers=4'
+# Which program keeps the wall, as a report says it: this script, its
+# version a hash of itself as bitwall/receivers/__init__.py works it out,
+# when it started and when its machine did.
+me=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+ver=$({ sha256sum "$me" || shasum -a 256 "$me"; } 2>/dev/null | cut -c1-12)
+booted=$(awk '/^btime /{print $2}' /proc/stat 2>/dev/null ||
+         sysctl -n kern.boottime 2>/dev/null | sed -n 's/^{ sec = \([0-9]*\).*/\1/p')
+rcv="receiver bitwall-shell version=${ver:--} started=$(date +%s)${booted:+ booted=$booted}"
+set -- $(stty size) && [ -n "$2" ] && rows=$1 cols=$2 || { echo "bitwall-shell: no terminal" >&2; exit 1; }
+# Whether the terminal it draws on -- its stdin and stdout, which are the
+# terminal `stty size` measured -- draws kitty graphics, which a sender then sends
+# through, untouched, for the terminal to draw: kitty's own question, a
+# one-pixel image asked about and not drawn, then the device attributes
+# every terminal answers, so the answer is known without a timeout. The
+# graphics reply before the attributes is a yes.
+kitty() {
+  old=$(stty -g) || return 1
+  stty raw -echo min 0 time 5
+  printf '\033_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\033\\\033[c'
+  said=$(dd bs=1 count=512 2>/dev/null)
+  stty "$old"
+  case $said in *'_Gi=31;OK'*) return 0 ;; esac
+  return 1
+}
+kitty && caps="$caps kitty"
+mkdir -p "$tmp/s" && mkfifo "$tmp/door.in" && exec 3<>"$tmp/door.in" || exit 1
+if [ -p "$wall/door.in" ]; then     # a wall whose door is read is another's
+  sh -c 'exec >"$1"' sh "$wall/door.in" 3>&- & sleep 1; kill $! 2>/dev/null
+  wait $! && { echo "bitwall-shell: $wall: its door is read" >&2; rm -rf "$tmp"; exit 1; }
+fi
+rm -rf "$wall" && mv "$tmp" "$wall" || exit 1
+
+# The area as the controller's `report` reads it, kept beside the door.
+keep() { echo "$cols $rows $font" >"$wall/.area"; }
+# The status page, while no sender is on the wall, as the painter's: what
+# this display is, where to send to, its area, and when a sender was last
+# seen, in the painter's colours, a block in the middle of the screen.
+host=$(hostname -s)
+addr=$(ipconfig getifaddr en0 2>/dev/null || hostname -I 2>/dev/null | cut -d' ' -f1)
+status() {
+  set -- $(cat "$wall/.area"); c=$1 r=$2 f=$3
+  seen=$(cat "$wall/.last" 2>/dev/null); seen=${seen:-never this boot}
+  x=$(( (c - 60) / 2 )); [ $x -gt 0 ] || x=0
+  y=$(( (r - 11) / 2 )); [ $y -gt 0 ] || y=0
+  printf '\033[0m\033[H\033[2J'
+  row() { y=$(( y + 1 )); printf '\033[%s;%sH%s' "$y" $(( x + 1 )) "$1"; }
+  pair() { row "$(printf '   \033[38;5;244m%-14s\033[22;39m %b%s\033[22;39m' "$1" "${3:-\033[38;5;250m}" "$2")"; }
+  row ""
+  row "$(printf '   \033[1;35m  bitwall\033[22;39m   \033[38;5;240mdisconnected\033[39m')"
+  row ""
+  pair "this display" "$host  $addr"
+  pair "wall" "${wall##*/}"
+  pair "send to" "$host:${wall##*/}"
+  pair "font size" "$f"
+  pair "area" "${c}x${r} cells"
+  pair "stream" "no sender connected" '\033[1;31m'
+  pair "last seen" "$seen"
+  row ""
+  row "$(printf '   \033[38;5;240m%s\033[39m' "$(date '+%a %d %b %H:%M')")"
+}
+# The terminal's size again; the base, if there is one, is told and repaints.
+resized() {
+  set -- $(stty size </dev/tty) && [ -n "$2" ] || return
+  rows=$1 cols=$2; keep; printf '\033[H\033[2J'
+  if [ -d "$held" ]; then printf 'area %sx%s %s\nrepaint\n' "$cols" "$rows" "$font" >"$held/out"
+  else status; fi
+}
+# A line every controller hears, as the base opens and closes.
+tell() { for f in $(find "$wall/s" -name .ctl); do printf '%s\n' "$1" >"${f%/.ctl}/out"; done; }
+leave() { trap '' HUP INT TERM; [ ! -d "$held" ] || kill -HUP $base; kill -TERM 0 2>/dev/null; rm -rf "$wall"; printf '\033[?25h\033[?1049l'; exit; }
+keep
+printf '\033[?1049h\033[?25l'; status
+exec 2>/dev/null                    # nothing but the wall reaches the terminal
+trap leave HUP INT TERM
+trap resized WINCH
+
+# A controller: its commands are APCs on `in`, split at each ESC, and its
+# answers lines on `out`, each carrying the command's id when it had one.
+controller() {
+  printf 'hello v1 line\nopened %s\n%s\n' "$1" "$caps" >&3
+  exec awk -v s="$wall/s" -v a="$wall/.area" -v caps="$caps" -v rcv="$rcv" 'BEGIN { RS = "\033" }
+    function say(t) { print t (id != "" ? " id=" id : ""); fflush() }
+    /^_bitwall / {
+      n = split(substr($0, 10), w, " "); verb = w[1]; id = ""
+      for (i = 2; i <= n; i++) if (w[i] ~ /^id=/) id = substr(w[i], 4)
+      if (verb == "sessions") {
+        c = 0; ls = "ls -1 \"" s "\""; RS = "\n"
+        while ((ls | getline x) > 0)
+          if (system("test -e \"" s "/" x "/.base\"") == 0) {
+            f = s "/" x "/.instance"; iv = ""; if ((getline iv < f) > 0) iv = " instance=" iv; close(f)
+            say("session " x " layer 0 cells" iv); c++
+          }
+          else if (system("test -e \"" s "/" x "/.ctl\"") == 0) {
+            f = s "/" x "/.instance"; iv = ""; if ((getline iv < f) > 0) iv = " instance=" iv; close(f)
+            say("session " x " controller - -" iv); c++
+          }
+        close(ls); RS = "\033"; say("sessions " c)
+      } else if (verb == "report") {
+        RS = "\n"; getline ar < a; close(a); RS = "\033"; split(ar, v, " ")
+        say("hello v1 line"); say(rcv); say(caps); say("area " v[1] "x" v[2] " " v[3])
+      } else if (verb == "ping") say("pong")
+      else if (verb == "close" || verb == "detach") exit
+      else if (verb != "pong") say("error " verb " unknown command")
+    }' "$2/in" >&3
+}
+
+while :; do
+  read -r verb name role opts <&3 || { [ $? -gt 128 ] && continue; break; }   # a resize interrupts the read
+  case "$verb $name" in "open "?*) ;; *) continue ;; esac
+  case $name in *[!A-Za-z0-9_-]*|glass) continue ;; esac
+  [ ${#name} -le 32 ] && [ ! -e "$wall/s/$name" ] || continue
+  for o in $opts; do case $o in ?*=?*) ;; *) continue 2 ;; esac; done
+  reason= take= full= inst=
+  case $role in
+    layer) for o in $opts; do case $o in
+        z=0|type=cells) ;; take=1) take=1 ;; z=*[!0-9]*) reason=${reason:-no-such-key} ;;
+        instance=*) inst=${o#instance=}; case $inst in
+            -*|*[!a-z0-9-]*) reason=${reason:-no-such-key} ;;
+            *) [ ${#inst} -le 64 ] || reason=${reason:-no-such-key} ;; esac ;;
+        z=*) full=full ;; type=*) reason=${reason:-no-such-type} ;; *) reason=${reason:-no-such-key} ;;
+      esac; done; reason=${reason:-$full}
+      [ -n "$reason" ] || [ ! -d "$held" ] || [ -n "$take" ] || reason=busy ;;
+    controller) for o in $opts; do case $o in
+        instance=*) inst=${o#instance=}; case $inst in
+            -*|*[!a-z0-9-]*) reason=${reason:-no-such-key} ;;
+            *) [ ${#inst} -le 64 ] || reason=${reason:-no-such-key} ;; esac ;;
+        *) reason=${reason:-no-such-key} ;;
+      esac; done
+      [ -n "$reason" ] || [ "$(find "$wall/s" -name .ctl | wc -l)" -lt 4 ] || reason=full ;;
+    *) reason=no-such-role ;;
+  esac
+  d=$wall/s/$name; mkdir "$d" && mkfifo "$d/in" "$d/out" || continue
+  [ -z "$reason" ] || { ( { printf 'hello v1 line\nerror open %s %s\n' "$name" "$reason" >"$d/out"; rm -rf "$d"; } &
+    sleep 10; kill $! 2>/dev/null; rm -rf "$d" ) 3>&- & continue; }
+  if [ "$role" = controller ]; then
+    touch "$d/.ctl"; [ -z "$inst" ] || printf '%s\n' "$inst" >"$d/.instance"
+    ( trap 'kill $a 2>/dev/null; exit' TERM
+      exec 3<>"$d/out"; controller "$name" "$d" & a=$!; wait $a
+      printf 'closed %s eof\n' "$name" >&3; rm -rf "$d" ) 3>&- & ctls="$ctls $!"
+    continue
+  fi
+  [ ! -d "$held" ] || kill $base 2>/dev/null
+  touch "$d/.base"; [ -z "$inst" ] || printf '%s\n' "$inst" >"$d/.instance"
+  ( trap 'kill $c 2>/dev/null; why=displaced' TERM; trap 'kill $c 2>/dev/null; exit' HUP
+    exec 3<>"$d/out"
+    printf 'hello v1 line\nopened %s z=0\n%s\narea %sx%s %s\n' "$name" "$caps" "$cols" "$rows" "$font" >&3
+    inst=$(cat "$d/.instance" 2>/dev/null)
+    tell "session opened $name layer 0 cells${inst:+ instance=$inst}"
+    cat "$d/in" 3>&- & c=$!
+    wait $c
+    printf 'closed %s %s\n' "$name" "${why:-eof}" >&3
+    rm -rf "$d"; tell "session closed $name ${why:-eof}"
+    [ -n "$why" ] || { date '+%a %d %b %H:%M:%S' >"$wall/.last"; status; }
+  ) 3>&- & base=$! held=$d
+done
+leave

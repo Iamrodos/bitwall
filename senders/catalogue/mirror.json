@@ -1,0 +1,33 @@
+{
+  "label": "Mirror",
+  "description": "This wall's glass shown on other walls as video, whatever is on it: encoded here, decoded there, in hardware where both ends have it",
+  "type": "video",
+  "place": "controller",
+  "start": "../mirror/main.py",
+  "options": {
+    "to": {"type": "walls", "label": "Shown on",
+           "description": "The walls that show this one, host or host:wall, by commas; host:wall@WxH/fps gives one its own largest size and frames a second",
+           "min": 1},
+    "size": {"type": "choice", "label": "Largest size",
+             "description": "The most a wall is sent, never more than its own glass; the source's shape is kept",
+             "choices": ["640x360", "960x540", "1280x720", "1920x1080"], "default": "1280x720"},
+    "fps": {"type": "choice", "label": "Frames a second",
+            "description": "How many frames a second the glass is sent at",
+            "choices": ["10", "15", "20", "25", "30"], "default": "25"},
+    "lead": {"type": "choice", "label": "Lead",
+             "description": "Seconds behind the source each frame is shown, on the walls' clocks; 0 shows each as soon as it is decoded; auto is the most any wall wants, given to all: 0.25, 0.5 from a Mac encoding on VideoToolbox or to a wall decoding on more than two threads, 0.8 above 720p on a Pi 3",
+             "choices": ["auto", "0", "0.1", "0.25", "0.5", "0.8", "1"], "default": "auto"},
+    "codec": {"type": "choice", "label": "Codec",
+              "description": "auto sends each wall what it decodes in hardware, and refuses one that decodes nothing this can send; h264 sends H.264 to any wall that takes it, decoded in software where it must be",
+              "choices": ["auto", "h264", "mjpeg"], "default": "auto"},
+    "bitrate": {"type": "choice", "label": "Bitrate",
+                "description": "Mb/s sent to each wall at the size and rate sent; auto is 3 at 720p25, scaled by the pixels a second",
+                "choices": ["auto", "1", "2", "3", "4", "6", "8", "12"], "default": "auto"},
+    "pull": {"type": "bool", "label": "Pull",
+             "description": "Run on the host it is started on, a destination's, and encode on the source's host through ssh, so only the encoded stream crosses the network: for a source that cannot reach this host",
+             "default": false},
+    "place": {"type": "choice", "label": "Where on them",
+              "description": "auto takes each wall's base where nobody holds it and goes above it where somebody does; above or top a layer over the base; 0 the base itself, taken from whoever holds it",
+              "choices": ["auto", "above", "top", "0"], "default": "auto"}
+  }
+}

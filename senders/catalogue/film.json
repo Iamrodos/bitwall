@@ -1,0 +1,18 @@
+{
+  "label": "Films, decoded on the wall",
+  "description": "Films from the media directory at the wall's own resolution, compressed on the way and decoded by the Pi itself; a layout of several walls, one film across them all, is started from the command line",
+  "type": "video",
+  "place": "base",
+  "start": "../film/main.py",
+  "options": {
+    "film": {"type": "choice", "label": "Film",
+             "description": "One film, over and over; all plays them in turn",
+             "choices": ["all", "tears-of-steel"],
+             "default": "all"},
+    "fit": {"type": "choice", "label": "Fit",
+            "description": "Cover the walls, cropping the film to their shape; letterbox it whole in black; or letterbox it against the top, all the black below",
+            "choices": ["cover", "letterbox", "top"], "default": "cover"},
+    "audio": {"type": "bool", "label": "Sound here",
+              "description": "Play the film's sound on the machine the sender runs on, on the walls' clock", "default": false}
+  }
+}

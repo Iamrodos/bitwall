@@ -1,0 +1,299 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.14"
+# dependencies = ["aiohttp"]
+# ///
+"""Several walls on one page, stacked down it.
+
+    demos/bitwall-stack [--port 8902] snake sysinfo
+
+Then open `http://localhost:8902/stack`, or from elsewhere with `--host`,
+and point a sender at each name:
+
+    BITWALL_RUN=$TMPDIR/bitwall-web senders/games/snake/main.py localhost:snake
+
+The order on the page is the order on the command line, so the first name
+is the top wall. Every wall is live at once -- unlike the carousel, which
+builds only what is in view, because here everything is in view.
+
+A page rather than a receiver. It embeds the web receiver, which does the
+walls, and adds the one route that arranges them -- so the receiver never
+learns that a stack exists, and a wall here is the same wall as one in a
+tab on its own.
+
+Heights are shares of the viewport rather than aspect ratios: two walls
+of different shapes still have to add up to one screen, and a wall that
+kept its own proportions would leave the other one a slot it cannot use.
+Each wall then takes the cells that fit the box it is given.
+"""
+import argparse
+import asyncio
+import json
+import os
+import sys
+
+from aiohttp import web
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+from bitwall.receivers import web as receiver                  # noqa: E402
+
+PAGE = """<!doctype html>
+<meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>%(title)s</title>
+<style>
+  html, body { margin: 0; height: 100%%; background: #000; }
+  body { display: flex; flex-direction: column; }
+  #bar { flex: 0 0 auto; display: flex; gap: 18px; align-items: center;
+         padding: 6px 10px; background: #111116; color: #8a8a94;
+         font: 12px ui-monospace, Menlo, monospace; flex-wrap: wrap; }
+  #bar .set { display: flex; gap: 6px; align-items: center; }
+  #bar b { color: #c8c8d0; font-weight: normal; }
+  #bar button { background: #22222a; color: #c8c8d0; border: 1px solid #33333d;
+                border-radius: 4px; font: inherit; padding: 3px 9px;
+                cursor: pointer; }
+  #bar button:active { background: #33333d; }
+  #bar .at { min-width: 8ch; color: #55555c; }
+  #bar .stats { color: #55555c; display: none; }
+  #bar.showing .stats { display: inline; }
+  .wall { flex: 1 1 0; min-height: 0; position: relative; }
+  bitwall-screen { position: absolute; inset: 0; }
+</style>
+<div id=bar>%(controls)s</div>
+%(walls)s
+<script type=module src="/bitwall-screen.js"></script>
+<script type=module>
+  /* The element already knows how to magnify what the sender asked for.
+     A wall on a page with others is the case that needs it most: two
+     dashboards built for different distances have to share one screen,
+     and only whoever is looking knows how that should fall. */
+  /* What a wall costs is per wall, so it belongs beside that wall's
+     controls rather than as one figure for the page. `s` toggles them,
+     the key the single-wall page uses for the same thing. */
+  const bar = document.getElementById('bar');
+  const rate = (b) => {
+    const kb = b / 1024;
+    return kb > 1100 ? (kb / 1024).toFixed(1) + 'MB/s'
+                     : kb.toFixed(0) + 'KB/s';
+  };
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 's' && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      e.preventDefault();
+      bar.classList.toggle('showing');
+    }
+  });
+
+  for (const set of document.querySelectorAll('#bar .set')) {
+    const wall = document.querySelector(
+      `bitwall-screen[name="${set.dataset.wall}"]`);
+    const at = set.querySelector('.at');
+    const stats = set.querySelector('.stats');
+    let want = 1;
+    const show = (e) => {
+      at.textContent = `${want.toFixed(2)}x` +
+        (wall.fontPx ? ` ${wall.cols}x${wall.rows}` : '');
+      const d = e && e.detail;
+      if (d) {
+        stats.textContent = ` @${d.font}px  ${d.fps.toFixed(1)}fps  ` +
+          `${d.paintMs.toFixed(2)}ms/paint  ${rate(d.rate)} uncompressed`;
+      }
+    };
+    const step = (by) => {
+      want = wall.zoom(by === 0 ? 1 : want * by);
+      show();
+    };
+    set.querySelector('.less').onclick = () => step(1 / 1.15);
+    set.querySelector('.more').onclick = () => step(1.15);
+    set.querySelector('.same').onclick = () => step(0);
+    wall.addEventListener('bitwall-stats', show);
+    show();
+  }
+</script>
+"""
+
+
+SWAP = """<!doctype html>
+<meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>%(title)s</title>
+<style>
+  html, body { margin: 0; height: 100%%; background: #000; }
+  body { display: flex; flex-direction: column; }
+  #bar { flex: 0 0 auto; display: flex; gap: 18px; align-items: center;
+         padding: 6px 10px; background: #111116; color: #8a8a94;
+         font: 12px ui-monospace, Menlo, monospace; flex-wrap: wrap; }
+  #bar .set { display: flex; gap: 6px; align-items: center; }
+  #bar .set.off { display: none; }
+  #bar b { color: #c8c8d0; font-weight: normal; }
+  #bar button { background: #22222a; color: #c8c8d0; border: 1px solid #33333d;
+                border-radius: 4px; font: inherit; padding: 3px 9px;
+                cursor: pointer; }
+  #bar button:active { background: #33333d; }
+  #bar .at { min-width: 8ch; color: #55555c; }
+  #bar .stats { color: #55555c; display: none; }
+  #bar.showing .stats { display: inline; }
+  .wall { flex: 1 1 0; min-height: 0; position: relative; }
+  .wall.off { display: none; }
+  bitwall-screen { position: absolute; inset: 0; }
+  :fullscreen #bar { opacity: 0.15; transition: opacity .2s; }
+  :fullscreen #bar:hover { opacity: 1; }
+</style>
+<div id=bar>%(controls)s
+  <span class=set style="display:flex">
+    <button id=prev>&lsaquo;</button><button id=next>&rsaquo;</button>
+    <button id=full>full screen</button>
+  </span>
+</div>
+%(walls)s
+<script type=module src="/bitwall-screen.js"></script>
+<script type=module>
+  /* One wall at a time, the whole of the page. Every wall is attached
+     the whole time rather than built as it comes round: there are two
+     of them, both are cheap to keep, and a sender that had to start
+     again on every swap would show the first seconds of itself over and
+     over instead of what it has been doing. */
+  const bar = document.getElementById('bar');
+  const walls = [...document.querySelectorAll('.wall')];
+  const sets = [...document.querySelectorAll('#bar .set[data-wall]')];
+  let at = 0;
+
+  const rate = (b) => {
+    const kb = b / 1024;
+    return kb > 1100 ? (kb / 1024).toFixed(1) + 'MB/s'
+                     : kb.toFixed(0) + 'KB/s';
+  };
+
+  function showing() {
+    walls.forEach((w, i) => w.classList.toggle('off', i !== at));
+    sets.forEach((c, i) => c.classList.toggle('off', i !== at));
+  }
+
+  /* Swapping by hand restarts the clock: somebody who has just chosen a
+     wall means to look at it, and being carried off it a second later
+     is the page arguing with them. */
+  const SECS = parseFloat(
+    new URLSearchParams(location.search).get('rotate') || '0');
+  let timer = null;
+  function wind() {
+    if (timer) clearInterval(timer);
+    if (SECS > 0) timer = setInterval(() => go(1), SECS * 1000);
+  }
+  function go(dir) {
+    at = (at + dir + walls.length) %% walls.length;
+    showing();
+    wind();
+  }
+
+  document.getElementById('prev').onclick = () => go(-1);
+  document.getElementById('next').onclick = () => go(1);
+  document.getElementById('full').onclick = () => {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else document.documentElement.requestFullscreen();
+  };
+  document.addEventListener('keydown', (e) => {
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key === 'ArrowLeft') go(-1);
+    if (e.key === 'ArrowRight') go(1);
+    if (e.key === 'f') document.getElementById('full').click();
+    if (e.key === 's') { e.preventDefault(); bar.classList.toggle('showing'); }
+  });
+
+  for (const set of sets) {
+    const wall = document.querySelector(
+      `bitwall-screen[name="${set.dataset.wall}"]`);
+    const spot = set.querySelector('.at');
+    const stats = set.querySelector('.stats');
+    let want = 1;
+    const show = (e) => {
+      spot.textContent = `${want.toFixed(2)}x` +
+        (wall.fontPx ? ` ${wall.cols}x${wall.rows}` : '');
+      const d = e && e.detail;
+      if (d) {
+        stats.textContent = ` @${d.font}px  ${d.fps.toFixed(1)}fps  ` +
+          `${d.paintMs.toFixed(2)}ms/paint  ${rate(d.rate)} uncompressed`;
+      }
+    };
+    const step = (by) => { want = wall.zoom(by === 0 ? 1 : want * by); show(); };
+    set.querySelector('.less').onclick = () => step(1 / 1.15);
+    set.querySelector('.more').onclick = () => step(1.15);
+    set.querySelector('.same').onclick = () => step(0);
+    wall.addEventListener('bitwall-stats', show);
+    show();
+  }
+
+  showing();
+  wind();
+</script>
+"""
+
+
+class Stack:
+    """The one route the receiver does not have."""
+
+    def __init__(self, server, names, template=None):
+        self.server = server
+        self.names = names
+        #: Which arrangement of the same walls this route serves. The
+        #: walls, the controls and the receiver are identical either
+        #: way; only where they are put on the page differs.
+        self.template = template or PAGE
+
+    async def page(self, request):
+        want = [n for n in request.query.get("names", "").split(",") if n] \
+            or self.names or sorted(self.server.walls)
+        for name in want:
+            self.server.get(name)
+        # The first tab to claim an area decides it, and every wall here
+        # is its own receiver, so each one is primary for itself.
+        walls = "".join(
+            f'<div class=wall>'
+            f'<bitwall-screen name="{name}" primary></bitwall-screen></div>'
+            for name in want)
+        controls = "".join(
+            f'<span class=set data-wall="{name}"><b>{name}</b>'
+            f'<button class=less>&minus;</button>'
+            f'<button class=more>&plus;</button>'
+            f'<button class=same>reset</button>'
+            f'<span class=at></span><span class=stats></span></span>'
+            for name in want)
+        return web.Response(
+            text=self.template % {"title": " / ".join(want), "walls": walls,
+                         "controls": controls},
+            content_type="text/html",
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate",
+                     "Pragma": "no-cache"})
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("names", nargs="*", default=[],
+                    help="walls to stack, top first")
+    ap.add_argument("--run", default=receiver.RUN,
+                    help="run dir; each wall is RUN/bitwall/<name>")
+    ap.add_argument("--port", type=int, default=receiver.PORT)
+    ap.add_argument("--host", action="append", metavar="ADDR", help=receiver.HOST_HELP)
+    args = ap.parse_args()
+
+    async def run():
+        server, app = receiver.server().build(args.run, args.names, open_names=True)
+        app.router.add_get("/stack", Stack(server, args.names).page)
+        app.router.add_get("/swap", Stack(server, args.names, SWAP).page)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        hosts = args.host or [receiver.HOST]
+        for host in hosts:
+            await web.TCPSite(runner, host, args.port).start()
+        print(f"bitwall-stack  http://{hosts[0]}:{args.port}/stack  "
+              f"run={args.run}", flush=True)
+        await asyncio.Event().wait()
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

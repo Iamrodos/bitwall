@@ -1,0 +1,2736 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.14"
+# ///
+"""What bitwall must keep being true.
+
+    tests/bitwall-tests [word ...] [--skip word ...]
+
+A word runs only the checks whose names hold it, and --skip leaves out
+those that do: `--skip contracts --skip gpu --skip windows` is what runs
+on a machine with no walls, as the GitHub workflow does.
+
+Not a test of how a wall looks -- nothing here can tell you whether snake
+is right or whether a film judders, and looking at the wall is still how
+that is decided. These cover the things that break silently instead: a
+contract two implementations depend on, and a boundary that stops a screen
+from telling a sender what to do.
+
+Eight groups:
+
+    the wire       what `serialise` emits, including the frame delimiter
+                   the receivers paint on
+    the boundary   what a sender believes from a receiver, and what it
+                   refuses
+    both ends      the python that writes the stream and the javascript
+                   that reads it, agreeing on a real frame
+    the painter    the Pi's C painter, built against fakes and run under
+                   the sanitizers; its own tests are in tests/paint
+    the catalogue  what a sender host says it can run, walked over a
+                   made-up catalogue of links, loops and bad files
+    the letters    bitwall.letters: sizes, spacing, turns, fit, smoothing,
+                   ghosts, cut edges, and the faint cell they travel in
+    the contracts  every receiver that runs here, and a real Wall against
+                   a fake one; its own checks are in tests/bitwall-contracts
+    the GPU painter
+                   the painter built for this machine and run on its own
+                   GPU with no screen: the contracts again, and its pixels
+                   (tests/painter-pixels), against v1's on a Pi among them
+
+Both ends needs node, the painter needs a C compiler, the contracts need
+uv, and the GPU painter a machine the Makefile builds one for, a Mac.
+Without one, that group is skipped and said to be.
+"""
+import json
+import os
+import random
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+sys.path.insert(0, ROOT)
+sys.path.insert(0, HERE)
+
+import bitwall                                                 # noqa: E402
+from bitwall import protocol                                   # noqa: E402
+from bitwall import BLANK, cell, compose, serialise            # noqa: E402
+
+RESET = "\x1b[0m"
+CUP = re.compile(r"\x1b\[(\d+);(\d+)H")
+
+_checks = []
+
+
+def check(fn):
+    _checks.append(fn)
+    return fn
+
+
+def grid_of(cols, rows, ch=" ", fg="default", bg="default"):
+    return [[cell(ch, fg, bg) for _ in range(cols)] for _ in range(rows)]
+
+
+# ------------------------------------------------------------------- wire
+
+@check
+def full_frame_is_wrapped_in_bare_resets():
+    """A bare reset opens a full repaint and closes any frame that drew.
+
+    Both receivers paint on this and nothing else marks a frame, so a
+    change that drops either reset puts the band back on the wall.
+    """
+    g = grid_of(10, 3, "x", "ff8800")
+    out = serialise(g, None, True, 10, 3)
+    assert out.startswith(RESET), "a full frame must open with a bare reset"
+    assert out.endswith(RESET), "a frame must close with a bare reset"
+
+
+@check
+def a_bare_reset_means_a_frame_boundary_and_nothing_else():
+    """Exactly two in a full frame, exactly one in a delta.
+
+    Every other SGR carries parameters, so a receiver can count these to
+    know where a frame ends -- which is only true while this holds.
+    """
+    g = grid_of(20, 4, "a", "00ff00", "000040")
+    full = serialise(g, None, True, 20, 4)
+    assert full.count(RESET) == 2, f"full frame has {full.count(RESET)}"
+
+    after = [row[:] for row in g]
+    after[1][5] = cell("Z", "ff0000")
+    delta = serialise(after, g, False, 20, 4)
+    assert delta.count(RESET) == 1, f"delta has {delta.count(RESET)}"
+
+
+@check
+def an_unchanged_grid_emits_nothing():
+    g = grid_of(12, 3, "q", "ffffff")
+    assert serialise(g, g, False, 12, 3) == ""
+
+
+@check
+def a_delta_carries_only_what_changed():
+    g = grid_of(40, 6, ".", "888888")
+    after = [row[:] for row in g]
+    after[3][7] = cell("!", "ff0000")
+    delta = serialise(after, g, False, 40, 6)
+    assert "!" in delta
+    assert delta.count(".") <= 8, "a one-cell change redrew the grid"
+    rows = {int(m.group(1)) for m in CUP.finditer(delta)}
+    assert rows == {4}, f"a change in one row addressed rows {rows}"
+
+
+@check
+def every_run_is_positioned_before_it_is_drawn():
+    """Nothing relies on where the cursor happened to be.
+
+    A receiver keeps a cursor and no other state, so a run that assumed
+    wrapping or a previous position would land in the wrong place.
+    """
+    g = grid_of(8, 2, "Z")
+    out = serialise(g, None, True, 8, 2)
+    body = out[len(RESET):]
+    first = CUP.search(body)
+    assert first is not None, "a frame drew nothing anywhere"
+    assert first.start() == 0, "text is drawn before the cursor is placed"
+
+
+@check
+def the_wire_carries_only_cursor_moves_and_attributes():
+    """No scrolling, no margins, no mode changes, no controls.
+
+    A receiver that only knows CUP and SGR is a correct receiver, and
+    stays one only while this is the whole vocabulary.
+    """
+    g = grid_of(16, 3, "w", 33, "004400")
+    g[1][2] = cell("█", "ff00ff")
+    out = serialise(g, None, True, 16, 3)
+    finals = re.findall(r"\x1b\[[\d;]*([A-Za-z])", out)
+    assert set(finals) <= {"H", "m"}, f"unexpected sequences: {set(finals)}"
+    stripped = re.sub(r"\x1b\[[\d;]*[A-Za-z]", "", out)
+    bad = [c for c in stripped if ord(c) < 32]
+    assert not bad, f"control characters in the payload: {bad!r}"
+
+
+
+@check
+def a_look_worked_out_once_is_the_look_worked_out_every_time():
+    """Remembering a cell's SGR changes the speed and never the bytes.
+
+    Every depth, every attribute, and colours of every kind a cell may
+    carry, against the same sequence worked out afresh.
+    """
+    from bitwall import stream
+    rng = random.Random(7)
+    colours = ["default", "red", 33, 196, 0, "004400", "ff00ff", "a4c2ff", "zzzzzz"]
+    def fresh(fg, bg, bold, italics, underscore, strike, reverse, depth):
+        p = ["0"] + [n for n, on in zip("13497", (bold, italics, underscore,
+                                                  strike, reverse)) if on]
+        p += stream._colour_params(fg, 30, depth)
+        p += stream._colour_params(bg, 40, depth)
+        return "\033[" + ";".join(p) + "m"
+    for _ in range(4000):
+        c = (rng.choice(colours) if rng.random() < 0.5
+             else "%06x" % rng.randrange(1 << 24))
+        c2 = (rng.choice(colours) if rng.random() < 0.5
+              else "%06x" % rng.randrange(1 << 24))
+        flags = [rng.random() < 0.3 for _ in range(5)]
+        look = cell("x", c, c2, *flags)
+        for depth in ("mono", "grey", "16", "256", "true"):
+            got = stream._sgr(look, depth)
+            want = fresh(*look[1:8], depth)
+            assert got == want, (look, depth, got, want)
+            assert stream._sgr(look, depth) == got, "a second asking differed"
+
+
+# ---------------------------------------------------------------- compose
+
+@check
+def only_a_source_that_offers_arrays_needs_numpy():
+    """bitwall, and every source that hands over cells, runs where numpy
+    is not installed; the arrays path imports it when a source uses it."""
+    run = subprocess.run(
+        [sys.executable, "-c",
+         "import sys; sys.path.insert(0, %r); import bitwall; "
+         "bitwall.serialise([[bitwall.BLANK]], None, True, 1, 1); "
+         "print('numpy' in sys.modules)" % ROOT],
+        capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.strip() == "False", "importing bitwall imported numpy"
+
+
+@check
+def compose_clips_what_does_not_fit_and_pads_what_does_not_fill():
+    big = grid_of(10, 4, "B")
+    out = compose(big, 6, 2)
+    assert len(out) == 2 and len(out[0]) == 6
+    assert all(c[0] == "B" for c in out[0])
+
+    small = grid_of(2, 1, "S")
+    out = compose(small, 5, 3)
+    assert out[0][0][0] == "S" and out[0][2] == BLANK
+    assert out[2][0] == BLANK, "rows beyond the source must be blank"
+
+
+@check
+def a_source_that_says_nothing_changed_costs_nothing():
+    """Returning None is not an empty grid; it means do not send."""
+    run = tempfile.mkdtemp(prefix="bitwall-test-")
+    try:
+        w = bitwall.Wall("localhost", run=run)
+        w.cols, w.rows = 20, 4
+        w._prev = grid_of(20, 4, "x")
+        # A frame is only built when something says it should be.
+        assert serialise(w._prev, w._prev, False, 20, 4) == ""
+    finally:
+        shutil.rmtree(run, ignore_errors=True)
+
+
+@check
+def a_repaint_is_asked_for_rather_than_waited_for():
+    """A receiver says `repaint`; the sender forces a full frame.
+
+    The alternative -- a full repaint on a timer -- costs every wall a
+    frame it has nothing to say in, forever. On a dashboard that was 83%
+    of everything sent.
+    """
+    run = tempfile.mkdtemp(prefix="bitwall-test-")
+    try:
+        w = bitwall.Wall("localhost", run=run)
+        w._force = False
+        w._prev = object()
+        w._told(protocol.parse("repaint"))
+        assert w._force and w._prev is None, "a repaint asked for was not forced"
+        # The backstop is long enough that it is not the mechanism.
+        assert w.resync >= 10, "resync is still doing the work"
+    finally:
+        shutil.rmtree(run, ignore_errors=True)
+
+
+# --------------------------------------------------------------- protocol
+
+@check
+def a_command_travels_in_the_frame_stream_without_being_painted():
+    """An APC string is what a terminal ignores, which is the point.
+
+    Commands share the stream with frames so that a receiver is still
+    anything that can read a pipe. If a terminal drew them the whole
+    arrangement would fall over.
+    """
+    stream = ("\x1b[1;1Hbefore"
+              + protocol.command("font", 14)
+              + "after\x1b[0m")
+    paint, said = protocol.Commands().feed(stream)
+    assert "\x1b_" not in paint, "a command was left in the paintable text"
+    assert paint == "\x1b[1;1Hbeforeafter\x1b[0m"
+    assert said == [protocol.Message("font", ("14",))]
+
+
+@check
+def a_command_cut_in_half_by_the_pipe_is_held_until_it_arrives():
+    whole = "A" + protocol.command("blank", 1) + "B"
+    for cut in range(1, len(whole)):
+        r = protocol.Commands()
+        paint1, said1 = r.feed(whole[:cut])
+        paint2, said2 = r.feed(whole[cut:])
+        assert paint1 + paint2 == "AB", f"cut at {cut}: {paint1 + paint2!r}"
+        assert said1 + said2 == [protocol.Message("blank", ("1",))], \
+            f"cut at {cut} lost the command"
+
+
+@check
+def a_glyph_cut_in_half_by_the_pipe_reaches_the_tab_whole():
+    """What a receiver forwards must be the bytes that were sent.
+
+    A wall of block and braille glyphs is a wall of multi-byte characters,
+    and a pipe cuts wherever it fills. Decoding each read on its own turns
+    the half that came first into U+FFFD, and the cells carrying it stay
+    wrong until the sender's next full repaint -- which is what a viewer
+    sees as a band of stale picture.
+    """
+    import codecs
+    grid = grid_of(12, 3, ch="\u2580", fg="ff0000")
+    raw = serialise(grid, None, True, 12, 3).encode("utf-8")
+    for cut in range(1, len(raw)):
+        dec = codecs.getincrementaldecoder("utf-8")("replace")
+        held = protocol.Commands()
+        out = "".join(held.feed(dec.decode(raw[a:b]))[0]
+                      for a, b in ((0, cut), (cut, len(raw))))
+        assert out.encode("utf-8") == raw, f"cut at {cut} corrupted the frame"
+
+
+@check
+def an_apc_that_never_ends_is_painted_rather_than_held_forever():
+    """A command being assembled is bounded; anything longer is not one.
+
+    Holding it costs a buffer that grows for as long as the stream runs
+    and a rescan of all of it every time more arrives -- and a wall that
+    quietly stopped painting says nothing about which end is at fault.
+    """
+    parser = protocol.Commands()
+    painted = 0
+    for _ in range(100):
+        text, said = parser.feed("\x1b_never" + "x" * 500)
+        painted += len(text)
+        assert said == []
+        assert len(parser.rest) <= protocol.MAX_MESSAGE, "held without bound"
+    assert painted > 0, "an escape that never ends must reach the screen"
+
+
+@check
+def an_apc_that_is_not_ours_is_dropped_rather_than_painted():
+    paint, said = protocol.Commands().feed("a\x1b_somebody else\x1b\\b")
+    assert paint == "ab"
+    assert said == []
+
+
+@check
+def the_packages_major_version_is_the_protocols():
+    """A sender pinned to bitwall 1.x speaks the protocol a wall calls v1,
+    so the two numbers move together or a pin means nothing. The Rust
+    crates carry the same version and check it in their own tests."""
+    major = int(bitwall.__version__.split(".")[0])
+    assert major == protocol.VERSION, (bitwall.__version__, protocol.VERSION)
+    assert protocol.TAG == f"v{major}", protocol.TAG
+    for crate in ("bitwall/rust", "bitwall/receivers/core-rs", "bitwall/receivers/term",
+                  "bitwall/receivers/eink", "senders/games/cells/rust"):
+        with open(os.path.join(ROOT, crate, "Cargo.toml"), encoding="utf-8") as fh:
+            said = re.search(r'^version = "([^"]+)"', fh.read(), re.M).group(1)
+        assert said == bitwall.__version__, (crate, said, bitwall.__version__)
+
+
+@check
+def hello_says_how_to_read_everything_after_it():
+    first = protocol.parse(protocol.hello())
+    assert first.name == "hello"
+    assert first.args == (protocol.TAG, protocol.GRAMMAR)
+    assert protocol.TAG == "v1", "the version spelling is frozen"
+    assert protocol.version_of(first) == protocol.VERSION
+
+    # Tolerant of a receiver written before the prefix existed.
+    assert protocol.version_of(protocol.parse("hello 1 line")) == 1
+    assert protocol.version_of(protocol.parse("hello line")) is None
+    assert protocol.version_of(protocol.parse("area 10x10 14")) is None
+
+
+@check
+def a_message_survives_a_round_trip():
+    for name, args, opts in (("area", ("174x42", "14"), {}),
+                             ("input", ("key",), {"key": "Return",
+                                                  "mods": "ctrl"}),
+                             ("caps", ("area", "touch"), {"version": "1"}),
+                             ("repaint", (), {})):
+        line = protocol.render(name, *args, **opts)
+        back = protocol.parse(line)
+        assert back == protocol.Message(name, args, opts), \
+            f"{line!r} came back as {back!r}"
+
+
+@check
+def a_malformed_line_is_dropped_rather_than_raising():
+    """This reads a pipe anybody can write to."""
+    for bad in ("", "   ", "\x1b[2J", "a" * 5000, "name " + "x " * 200,
+                "name key=", "name =value", "name a\x00b"):
+        assert protocol.parse(bad) is None, f"{bad[:24]!r} was accepted"
+
+
+@check
+def a_value_with_a_space_travels_as_one_word():
+    """An argument or a value holding what a word cannot -- whitespace, a
+    control, `=`, `%` -- is percent-encoded and comes back as it went; a
+    name or a key that is not a word, or an empty value, is refused."""
+    for value in ("Back room", "a=b", "50%", "tab\there", "line\nbreak",
+                  "Café ⣿", "%20 literal", "plain"):
+        line = protocol.render("label", value, title=value)
+        assert len(line.split()) == 3, line
+        back = protocol.parse(line)
+        assert back.args == (value,) and back.get("title") == value, (value, back)
+    assert protocol.render("label", "plain") == "label plain"
+    assert protocol.render("label", "Back room") == "label Back%20room"
+    # A % that is no escape, as a sender wrote before values were encoded.
+    assert protocol.parse("stats at=50% show=%zz").opts == {"at": "50%", "show": "%zz"}
+    for bad in (lambda: protocol.render("two words"),
+                lambda: protocol.render("name", **{"": "v"}),
+                lambda: protocol.render("name", "")):
+        try:
+            bad()
+        except ValueError:
+            continue
+        raise AssertionError("refused nothing")
+
+
+@check
+def lines_arrive_whole_however_the_pipe_cuts_them():
+    said = [protocol.announce("hello", 1, "line"),
+            protocol.announce("area", "174x42", "14"),
+            protocol.announce("watching", 1)]
+    whole = "".join(said)
+    for size in (1, 3, 7, 40, 500):
+        r = protocol.Lines()
+        got = []
+        for i in range(0, len(whole), size):
+            got += r.feed(whole[i:i + size])
+        assert [m.name for m in got] == ["hello", "area", "watching"], \
+            f"chunks of {size} gave {[m.name for m in got]}"
+
+
+@check
+def an_option_is_read_as_a_number_only_when_it_is_one():
+    m = protocol.parse("area cols=174 rows=42 font=huge")
+    assert m.int("cols", 1, 1000) == 174
+    assert m.int("rows", 1, 1000) == 42
+    assert m.int("font", 1, 400) is None, "a word was read as a number"
+    assert m.int("cols", 1, 100) is None, "out of range was accepted"
+    assert m.int("missing", 1, 10, default=7) == 7
+
+
+@check
+def an_announced_area_is_bounded_like_a_published_one():
+    """The pipe is not more trusted than the file was."""
+    good = protocol.parse("area 174x42 14")
+    assert bitwall.Wall._area_from(good) == (174, 42)
+    for bad in ("area 99999x99999 14", "area 0x0 14", "area -5x-5 14",
+                "area abcxdef 14", "area 1900x900 14", "area"):
+        assert bitwall.Wall._area_from(protocol.parse(bad)) is None, bad
+
+
+@check
+def an_announced_press_becomes_the_same_dict_a_file_gave():
+    """A sender cannot tell which way the press reached it."""
+    said = protocol.parse("input key key=Return mods=ctrl")
+    assert bitwall.clean_input(bitwall._as_press(said)) == {
+        "kind": "key", "key": "Return", "mods": ["ctrl"]}
+
+    said = protocol.parse("input tap cell=3,4 area=174,42")
+    assert bitwall.clean_input(bitwall._as_press(said)) == {
+        "kind": "tap", "cell": [3, 4], "area": [174, 42]}
+
+    for bad in ("input key key=rm -rf", "input tap cell=9,9 area=2,2",
+                "input exec cmd=whoami", "input"):
+        said = protocol.parse(bad)
+        got = bitwall.clean_input(bitwall._as_press(said)) if said else None
+        assert got is None, f"{bad!r} was accepted as {got}"
+
+
+# --------------------------------------------------------------- boundary
+
+@check
+def a_key_is_one_printable_character_or_a_name_we_know():
+    ok = ("a", "Z", "7", "-", "é", "Return", "Escape", "space", "F12")
+    for k in ok:
+        got = bitwall.clean_input({"kind": "key", "key": k})
+        assert got == {"kind": "key", "key": k}, f"{k!r} was refused"
+
+    refused = ("rm -rf ~", "a\x1b[2J", "\x03", "\n", "A" * 500, "",
+               "Retrun", "ctrl-c", None, 42, ["a"])
+    for k in refused:
+        got = bitwall.clean_input({"kind": "key", "key": k})
+        assert got is None, f"{k!r} was accepted as {got}"
+
+
+@check
+def modifiers_are_only_the_ones_that_exist():
+    got = bitwall.clean_input({"kind": "key", "key": "Return",
+                               "mods": ["ctrl", "; reboot", "hyper", "alt"]})
+    assert got == {"kind": "key", "key": "Return", "mods": ["alt", "ctrl"]}
+
+
+@check
+def a_press_is_rebuilt_not_forwarded():
+    """A sender never meets a field the receiver invented."""
+    got = bitwall.clean_input({"kind": "key", "key": "a",
+                               "payload": {"anything": "at all"},
+                               "__class__": "nonsense"})
+    assert got == {"kind": "key", "key": "a"}, got
+
+
+@check
+def a_tap_lands_inside_the_grid_it_was_taken_against():
+    good = {"kind": "tap", "cell": [5, 5], "area": [80, 24]}
+    assert bitwall.clean_input(good) == good
+
+    for bad in ({"kind": "tap", "cell": [10 ** 9, 2], "area": [80, 24]},
+                {"kind": "tap", "cell": [5, 5], "area": [2, 2]},
+                {"kind": "tap", "cell": [-1, 0], "area": [80, 24]},
+                {"kind": "tap", "cell": ["3", 4], "area": [80, 24]},
+                {"kind": "tap", "cell": [3], "area": [80, 24]},
+                {"kind": "tap", "area": [80, 24]}):
+        assert bitwall.clean_input(bad) is None, f"{bad} was accepted"
+
+
+@check
+def an_invented_kind_is_not_a_press():
+    for bad in ({"kind": "exec", "cmd": "whoami"}, {"kind": None},
+                {}, "not a dict", None, 42, []):
+        assert bitwall.clean_input(bad) is None
+
+
+@check
+def capabilities_are_only_names_we_know():
+    got = bitwall.clean_caps({"touch": True, "keyboard": False, "buttons": 4,
+                              "surprise": {"deep": [1, 2]},
+                              "can": {"touch": True, "nonsense": True}})
+    assert got == {"touch": True, "keyboard": False, "buttons": 4,
+                   "can": {"touch": True}}, got
+
+    assert bitwall.clean_caps({"touch": "yes", "buttons": 10 ** 9}) == {}
+    assert bitwall.clean_caps(["not", "a", "dict"]) == {}
+    assert bitwall.clean_caps(None) == {}
+
+
+@check
+def an_area_a_receiver_claims_is_bounded():
+    """The area a receiver announces decides what the sender allocates."""
+    run = tempfile.mkdtemp(prefix="bitwall-test-")
+    try:
+        w = bitwall.Wall("localhost", run=run)
+
+        def size(text):
+            said = protocol.parse(f"area {text}") if text else None
+            if said is None:
+                w._said.pop("area", None)
+            else:
+                w._said["area"] = said
+            return w._read_report()
+
+        assert size("120x34 14") == (120, 34, "14")
+        assert size("99999x99999 14") is None, "an absurd area was believed"
+        assert size(f"{bitwall.MAX_COLS + 1}x10 14") is None
+        assert size("1900x900 14") is None, "over MAX_CELLS believed"
+        assert size("0x0 14") is None
+        assert size("-5x-5 14") is None
+        assert size("abcxdef 14") is None
+        assert size("") is None
+        odd = size("120x34 " + "9" * 40)
+        assert odd[2] == "?", "an absurd font was passed on"
+    finally:
+        shutil.rmtree(run, ignore_errors=True)
+
+
+@check
+def a_font_size_is_a_number_before_it_is_a_command():
+    run = tempfile.mkdtemp(prefix="bitwall-test-")
+    try:
+        w = bitwall.Wall("localhost", run=run)
+        for bad in ("14; touch /tmp/bitwall-pwned", "14", 0, -1,
+                    bitwall.MAX_FONT + 1, 3.5, True, None):
+            try:
+                w.set_font_size(bad, wait=False)
+            except ValueError:
+                continue
+            raise AssertionError(f"{bad!r} was accepted as a font size")
+        assert not os.path.exists("/tmp/bitwall-pwned")
+    finally:
+        shutil.rmtree(run, ignore_errors=True)
+
+
+@check
+def a_watcher_count_is_a_small_number_or_nothing():
+    run = tempfile.mkdtemp(prefix="bitwall-test-")
+    try:
+        w = bitwall.Wall("localhost", run=run)
+
+        def watching(text):
+            said = protocol.parse(f"watching {text}")
+            if said is None:
+                w._said.pop("watching", None)
+            else:
+                w._said["watching"] = said
+            return w.watching()
+
+        assert watching("2") == 2
+        assert watching("0") == 0
+        assert watching("9" * 400) is None
+        assert watching("-1") is None
+        assert watching("two") is None
+    finally:
+        shutil.rmtree(run, ignore_errors=True)
+
+
+@check
+def a_number_a_receiver_sends_is_one_python_will_take():
+    """Deciding a word is a number and turning it into one must agree.
+
+    `str.isdigit` is true of superscripts and of digits from other
+    scripts, which `int` refuses. A guard written with one and a
+    conversion written with the other lets a ValueError out of `input()`,
+    `capabilities()` or `watching()` into the loop that called them --
+    which is the sender's own, so one word from a receiver stops the wall.
+    """
+    for text in ("\u00b2", "--5", "9" * 200, "\uff11", " 5", "5 ", "+5", ""):
+        assert protocol.number(text) is None, f"{text!r} is not a number"
+    assert protocol.number("5") == 5
+    assert protocol.number("-5") == -5
+
+    run = tempfile.mkdtemp(prefix="bitwall-test-")
+    try:
+        w = bitwall.Wall("localhost", run=run)
+        w._told(protocol.parse("hello v1 line"))
+        for line in ("watching \u00b2", "watching " + "9" * 200):
+            w._told(protocol.parse(line))
+            assert w.watching() is None, line
+        w._told(protocol.parse("accepts touch=--1"))
+        assert w.capabilities().get("touch") is not True
+        tap = bitwall._as_press(
+            protocol.parse("input tap cell=\u00b2,1 area=9,9"))
+        assert tap.get("cell") is None
+        assert bitwall._as_press(
+            protocol.parse("input button n=--1")).get("n") is None
+    finally:
+        shutil.rmtree(run, ignore_errors=True)
+
+
+@check
+def a_press_of_a_kind_nobody_asked_for_is_not_carried():
+    """A sender acts on the input it asked for, not on what arrives.
+
+    A receiver reports what it likes, and the reporting is honest --
+    somebody did press a key. Whether this sender is in the business of
+    keys is its own question, and the answer cannot come from the same
+    place the press did.
+    """
+    run = tempfile.mkdtemp(prefix="bitwall-test-")
+    try:
+        w = bitwall.Wall("localhost", run=run)
+        w._told(protocol.parse("hello v1 line"))
+
+        def press(line):
+            w._told(protocol.parse(line))
+            return w.input()
+
+        assert press("input key key=a") is None, "asked for nothing"
+        assert press("input tap cell=1,1 area=9,9") is None, "asked for nothing"
+
+        w.want(keyboard=True)
+        assert press("input key key=a") == {"kind": "key", "key": "a"}
+        assert press("input tap cell=1,1 area=9,9") is None, "keys only"
+
+        w.want(touch=True)
+        assert press("input tap cell=1,1 area=9,9") is not None
+
+        w.want(keyboard=False)
+        assert press("input key key=a") is None, "turned off"
+    finally:
+        shutil.rmtree(run, ignore_errors=True)
+
+
+@check
+def a_screen_that_cannot_show_a_colour_is_not_sent_one():
+    """Reducing on the way out is the point of announcing it.
+
+    A receiver has to quantise anyway to paint at all, so an announcement
+    that only informed the receiver would buy nothing. It buys something
+    here: the cells that survive repeat, so they run together and the
+    frame both shrinks and diffs smaller against the last.
+    """
+    grid = [[cell("#", "%02x%02x%02x" % (x * 2 % 256, y * 7 % 256, x % 256),
+                  "default") for x in range(60)] for y in range(20)]
+    sizes = {d: len(serialise(grid, None, True, 60, 20, d))
+             for d in ("true", "256", "grey", "mono")}
+    assert sizes["mono"] < sizes["true"] * 0.7, sizes
+    assert sizes["256"] < sizes["true"], sizes
+    # Two colours means two colours, whatever was composed.
+    out = serialise(grid, None, True, 60, 20, "mono")
+    assert "38;2;" not in out, "truecolour reached a one-ink screen"
+    # A depth nobody defined is not a licence to mangle the picture.
+    assert serialise(grid, None, True, 60, 20, "nonsense") == \
+        serialise(grid, None, True, 60, 20, "true")
+
+
+@check
+def a_screen_may_slow_a_sender_but_never_hurry_one():
+    """The rate is a ceiling the sender is held to, not a target.
+
+    A sender drawing four frames a second has its own reason, and a screen
+    willing to take sixty is not one of them. The other way round matters
+    more: frames a panel cannot show are spent on the wire before anyone
+    can decline them.
+    """
+    run = tempfile.mkdtemp(prefix="bitwall-test-")
+    try:
+        w = bitwall.Wall("localhost", run=run, min_frame=0.05)
+        w._told(protocol.parse("hello v1 line"))
+        assert w.depth == "true" and w.screen() == {}, "silence says nothing"
+
+        w._told(protocol.parse("screen colour=mono rate=1"))
+        assert w.depth == "mono"
+        assert w.screen() == {"colour": "mono", "rate": 1}
+        assert w.min_frame == 1.0, w.min_frame
+
+        w._told(protocol.parse("screen colour=true rate=240"))
+        assert w.min_frame == 0.05, "a fast screen must not hurry a sender"
+
+        for bad in ("screen colour=lots", "screen rate=0",
+                    "screen rate=99999", "screen"):
+            w._told(protocol.parse(bad))
+            assert w.depth in bitwall.DEPTHS
+            assert w.min_frame >= 0.05
+    finally:
+        shutil.rmtree(run, ignore_errors=True)
+
+
+@check
+def a_screen_says_which_code_points_it_has_and_is_believed():
+    """Coverage as CSS spells it, and silence meaning no constraint.
+
+    The spelling is `unicode-range`, which exists for this exact question,
+    and ranges rather than categories because a font either has a code
+    point or it does not -- a name for the group it belongs to is a guess
+    laid over the evidence.
+
+    Saying nothing is the case that matters most: every sender written
+    before this said nothing and must keep working, and a browser falling
+    back through every font on the machine genuinely has no constraint to
+    declare. So an absent claim is not a claim of ASCII.
+    """
+    spans = protocol.ranges("U+2500-257F,U+2580-259F,U+2800-28FF")
+    assert spans == ((0x2500, 0x257F), (0x2580, 0x259F), (0x2800, 0x28FF))
+    assert protocol.covers(spans, "\u2588\u2500\u2801")
+    assert not protocol.covers(spans, "\uff66")
+    assert not protocol.covers(spans, "A")
+    # A word is covered only if every letter of it is.
+    assert not protocol.covers(spans, "\u2588A")
+
+    # Silence is not a refusal.
+    assert protocol.covers(protocol.ranges(""), "\uff66")
+    assert protocol.covers(protocol.ranges(None), "anything")
+
+    # Nothing a receiver writes may make this raise or grow without bound.
+    for bad in ("U+ZZZZ", "U+10-1", "nonsense", "U+", "-", "U+110000",
+                ",,,,", "U+41-" , "u+0041"):
+        got = protocol.ranges(bad)
+        assert isinstance(got, tuple), bad
+    assert len(protocol.ranges(",".join(["U+41"] * 500))) \
+        <= protocol.MAX_RANGES
+
+    run = tempfile.mkdtemp(prefix="bitwall-test-")
+    try:
+        w = bitwall.Wall("localhost", run=run)
+        w._told(protocol.parse("hello v1 line"))
+        assert w.can("\uff66"), "told nothing, so free as before"
+
+        w._told(protocol.parse(
+            "screen colour=true rate=30 glyphs=U+0020-007E,U+2500-259F"))
+        assert w.can("\u2588") and w.can("A")
+        assert not w.can("\u2801"), "braille was not claimed"
+        assert not w.can("\u2588", "\u2801"), "all of them, or none"
+        assert w.screen()["glyphs"] == ((0x20, 0x7E), (0x2500, 0x259F))
+
+        # And it is the only part of `screen` a sender must act on itself,
+        # so a receiver that claims nothing leaves the rate and the colour
+        # doing their own work regardless.
+        assert w.screen()["rate"] == 30 and w.depth == "true"
+    finally:
+        shutil.rmtree(run, ignore_errors=True)
+
+
+# --------------------------------------------------------------- both ends
+
+def _js_roundtrip(cols, rows, frames):
+    """Feed real frames to the real parser, and get its grid back."""
+    node = shutil.which("node")
+    if not node:
+        return None
+    work = tempfile.mkdtemp(prefix="bitwall-js-")
+    try:
+        data = os.path.join(work, "frames.json")
+        with open(data, "w") as fh:
+            json.dump({"cols": cols, "rows": rows, "frames": frames}, fh)
+        script = os.path.join(work, "run.js")
+        with open(script, "w") as fh:
+            fh.write(_JS % (json.dumps(os.path.join(
+                ROOT, "bitwall", "receivers", "web", "bitwall-screen.js")),
+                json.dumps(data)))
+        out = subprocess.run([node, script], capture_output=True, text=True)
+        if out.returncode != 0:
+            raise AssertionError(f"node failed: {out.stderr[:400]}")
+        return json.loads(out.stdout)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+_JS = """
+const fs = require('fs');
+global.window = global;
+global.document = { createElement: () => ({ getContext: () => ({
+  measureText: () => ({ width: 10 }) }), style: {} }),
+  addEventListener: () => {} };
+global.HTMLElement = class {};
+global.customElements = { define: () => {} };
+global.ResizeObserver = class { observe() {} disconnect() {} };
+global.performance = { now: () => Date.now() };
+global.requestAnimationFrame = () => 0;
+global.location = {};
+eval(fs.readFileSync(%s, 'utf8'));
+const B = window.Bitwall;
+const d = JSON.parse(fs.readFileSync(%s, 'utf8'));
+const g = new B.Grid(d.cols, d.rows);
+const p = new B.Parser(g);
+p.cover();
+const enc = new TextEncoder();
+for (const f of d.frames) {
+  const bytes = enc.encode(f.text);
+  const n = f.chunks || 1;
+  const size = Math.ceil(bytes.length / n);
+  for (let i = 0; i < bytes.length; i += size)
+    p.feed(bytes.slice(i, i + size));
+}
+const cells = [];
+for (let y = 0; y < d.rows; y++) {
+  const row = [];
+  for (let x = 0; x < d.cols; x++) {
+    const k = y * d.cols + x;
+    row.push([String.fromCodePoint(g.ch[k]), g.fg[k], g.bg[k], g.at[k]]);
+  }
+  cells.push(row);
+}
+console.log(JSON.stringify({ cells: cells, covered: p.covered,
+                             frames: p.frames }));
+"""
+
+
+def _as_js_colour(value):
+    return -1 if value == "default" else int(value, 16)
+
+
+@check
+def the_javascript_parser_rebuilds_what_serialise_wrote():
+    """The two implementations of the wire format, on a real frame.
+
+    This is the one that breaks everything at once if it ever fails, and
+    it fails silently: nothing errors, the wall just looks wrong.
+    """
+    cols, rows = 40, 8
+    rnd = random.Random(7)
+    glyphs = "abcXY0123 ." + "█▀▄┌─┴⠁"
+    want = [[cell(rnd.choice(glyphs),
+                  "default" if rnd.random() < .2 else
+                  f"{rnd.randrange(1 << 24):06x}",
+                  "default" if rnd.random() < .6 else
+                  f"{rnd.randrange(1 << 24):06x}")
+             for _ in range(cols)] for _ in range(rows)]
+    full = serialise(want, None, True, cols, rows)
+
+    got = _js_roundtrip(cols, rows, [{"text": full, "chunks": 1}])
+    if got is None:
+        return "skipped: node is not installed"
+
+    assert got["covered"] == cols * rows, \
+        f"a full frame covered {got['covered']} of {cols * rows} cells"
+    for y in range(rows):
+        for x in range(cols):
+            mine, theirs = want[y][x], got["cells"][y][x]
+            assert mine[0] == theirs[0], \
+                f"({x},{y}) char {mine[0]!r} became {theirs[0]!r}"
+            assert _as_js_colour(mine[1]) == theirs[1], \
+                f"({x},{y}) fg {mine[1]} became {theirs[1]:#x}"
+            assert _as_js_colour(mine[2]) == theirs[2], \
+                f"({x},{y}) bg {mine[2]} became {theirs[2]:#x}"
+
+
+@check
+def the_parser_survives_a_frame_cut_into_pieces():
+    """The pipe splits a frame anywhere, including mid escape sequence."""
+    cols, rows = 30, 6
+    want = grid_of(cols, rows, "█", "ff8800", "004400")
+    want[2][3] = cell("┌", "00ffff")
+    full = serialise(want, None, True, cols, rows)
+
+    for pieces in (2, 3, 7, 13, 64):
+        got = _js_roundtrip(cols, rows,
+                            [{"text": full, "chunks": pieces}])
+        if got is None:
+            return "skipped: node is not installed"
+        assert got["covered"] == cols * rows, \
+            f"split into {pieces}: covered {got['covered']}"
+        assert got["cells"][2][3][0] == "┌", \
+            f"split into {pieces} lost a glyph"
+
+
+@check
+def a_delta_applies_to_what_the_parser_already_holds():
+    cols, rows = 24, 5
+    first = grid_of(cols, rows, ".", "444444")
+    second = [row[:] for row in first]
+    second[1][4] = cell("A", "ff0000")
+    second[3][20] = cell("B", "00ff00", "0000ff")
+
+    full = serialise(first, None, True, cols, rows)
+    delta = serialise(second, first, False, cols, rows)
+    got = _js_roundtrip(cols, rows, [{"text": full}, {"text": delta}])
+    if got is None:
+        return "skipped: node is not installed"
+
+    assert got["cells"][1][4][0] == "A"
+    assert got["cells"][3][20][0] == "B"
+    assert got["cells"][3][20][1] == 0x00ff00
+    assert got["cells"][0][0][0] == ".", \
+        "the delta disturbed a cell it did not name"
+
+
+@check
+def the_parser_counts_the_same_frames_serialise_wrote():
+    """The delimiter, from the reading end."""
+    cols, rows = 16, 4
+    a = grid_of(cols, rows, "1")
+    b = [row[:] for row in a]
+    b[0][0] = cell("2")
+    frames = [{"text": serialise(a, None, True, cols, rows)},
+              {"text": serialise(b, a, False, cols, rows)},
+              {"text": serialise(a, b, False, cols, rows)}]
+    got = _js_roundtrip(cols, rows, frames)
+    if got is None:
+        return "skipped: node is not installed"
+    # two for the full repaint, one for each delta
+    assert got["frames"] == 4, f"parser counted {got['frames']} boundaries"
+
+
+# ---------------------------------------------------------- legacy blocks
+
+#: The solid blocks of Symbols for Legacy Computing that both receivers
+#: draw as geometry, beside the two eighths of Block Elements they lacked.
+LEGACY = ([0x2594, 0x2595] + list(range(0x1FB00, 0x1FB3C))
+          + list(range(0x1FB70, 0x1FB8C)) + list(range(0x1FBE4, 0x1FBE8))
+          + list(range(0x1CD00, 0x1CDE6)) + list(range(0x1CEA0, 0x1CEB0)))
+
+_FRACTION = {"ONE EIGHTH": 1 / 8, "ONE QUARTER": 1 / 4, "THREE EIGHTHS": 3 / 8,
+             "HALF": 1 / 2, "FIVE EIGHTHS": 5 / 8, "THREE QUARTERS": 3 / 4,
+             "SEVEN EIGHTHS": 7 / 8}
+_F = "|".join(sorted(_FRACTION, key=len, reverse=True))
+
+
+def _side(side, part):
+    """The band `part` deep along one side of a cell, as a test of (u, v)."""
+    return {"UPPER": lambda u, v: v < part, "LOWER": lambda u, v: v > 1 - part,
+            "LEFT": lambda u, v: u < part, "RIGHT": lambda u, v: u > 1 - part}[side]
+
+
+def _named(cp):
+    """What a block's Unicode name says it covers, as a test of (u, v).
+
+    Read from the name alone, so it is a second reading of the characters
+    beside the receivers' tables, not a copy of them.
+    """
+    import unicodedata
+    name = unicodedata.name(chr(cp))
+    m = re.fullmatch(r"BLOCK (SEXTANT|OCTANT)-(\d+)", name)
+    if m:
+        down = 3 if m[1] == "SEXTANT" else 4
+        parts = {int(d) - 1 for d in m[2]}
+        return lambda u, v: int(v * down) * 2 + int(u * 2) in parts
+    m = re.fullmatch(r"(VERTICAL|HORIZONTAL) ONE EIGHTH BLOCK-(\d+)", name)
+    if m:
+        lines = {int(d) - 1 for d in m[2]}
+        if m[1] == "VERTICAL":
+            return lambda u, v: int(u * 8) in lines
+        return lambda u, v: int(v * 8) in lines
+    m = re.fullmatch(rf"(UPPER|LOWER|LEFT|RIGHT) ({_F}) BLOCK", name)
+    if m:
+        return _side(m[1], _FRACTION[m[2]])
+    m = re.fullmatch(r"(\w+) AND (\w+) ONE EIGHTH BLOCK", name)
+    if m:
+        a, b = _side(m[1], 1 / 8), _side(m[2], 1 / 8)
+        return lambda u, v: a(u, v) or b(u, v)
+    m = re.fullmatch(rf"(LEFT|RIGHT|UPPER|LOWER) ({_F}) "
+                     rf"(UPPER|LOWER|LEFT|RIGHT) ({_F}) BLOCK", name)
+    if m:
+        a = _side(m[1], _FRACTION[m[2]])
+        b = _side(m[3], _FRACTION[m[4]])
+        return lambda u, v: a(u, v) and b(u, v)
+    m = re.fullmatch(r"(UPPER|LOWER|MIDDLE) (CENTRE|LEFT|RIGHT) ONE QUARTER BLOCK",
+                     name)
+    if m:
+        y0 = {"UPPER": 0, "LOWER": .5, "MIDDLE": .25}[m[1]]
+        x0 = {"LEFT": 0, "RIGHT": .5, "CENTRE": .25}[m[2]]
+        return lambda u, v: x0 <= u < x0 + .5 and y0 <= v < y0 + .5
+    raise AssertionError(f"U+{cp:04X} {name}: a name this reader does not know")
+
+
+def _samples(inside):
+    """A shape at the centres of an 8 x 24 grid over its cell, row by row:
+    fine enough to put every edge in eighths, quarters and thirds between
+    two samples."""
+    return "".join("1" if inside((i + .5) / 8, (j + .5) / 24) else "0"
+                   for j in range(24) for i in range(8))
+
+
+def _legacy_reference():
+    return {cp: _samples(_named(cp)) for cp in LEGACY}
+
+
+@check
+def the_web_receiver_draws_each_legacy_block_as_its_name_says():
+    node = shutil.which("node")
+    if not node:
+        return "skipped: node is not installed"
+    work = tempfile.mkdtemp(prefix="bitwall-js-")
+    try:
+        script = os.path.join(work, "blocks.js")
+        with open(script, "w") as fh:
+            fh.write(_JS_BLOCKS % json.dumps(os.path.join(
+                ROOT, "bitwall", "receivers", "web", "bitwall-screen.js")))
+        out = subprocess.run([node, script], capture_output=True, text=True)
+        assert out.returncode == 0, f"node failed: {out.stderr[:400]}"
+        drawn = json.loads(out.stdout)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    for cp, want in _legacy_reference().items():
+        rects = drawn.get(str(cp))
+        assert rects, f"U+{cp:04X} is not drawn as geometry"
+        got = _samples(lambda u, v: any(x <= u < x + w and y <= v < y + h
+                                        for x, y, w, h in rects))
+        assert got == want, f"U+{cp:04X} is not what its name says"
+
+
+_JS_BLOCKS = """
+const fs = require('fs');
+global.window = global;
+global.document = { createElement: () => ({ getContext: () => ({
+  measureText: () => ({ width: 10 }) }), style: {} }),
+  addEventListener: () => {} };
+global.HTMLElement = class {};
+global.customElements = { define: () => {} };
+global.ResizeObserver = class { observe() {} disconnect() {} };
+global.performance = { now: () => Date.now() };
+global.requestAnimationFrame = () => 0;
+global.location = {};
+eval(fs.readFileSync(%s, 'utf8'));
+console.log(JSON.stringify(window.Bitwall.BLOCK));
+"""
+
+
+@check
+def the_painter_offers_the_legacy_blocks_it_draws():
+    """Said in `glyphs` whatever the font."""
+    with open(os.path.join(ROOT, "bitwall", "receivers", "pi",
+                           "bitwall-paint.c")) as fh:
+        painter = re.search(r'#define DRAWN "([^"]+)"', fh.read())[1]
+    offered = protocol.ranges(painter)
+    for cp in LEGACY:
+        if cp > 0xFFFF:
+            assert protocol.covers(offered, chr(cp)), \
+                f"U+{cp:04X} is drawn but not offered"
+
+
+# ---------------------------------------------------------------- painter
+
+@check
+def the_pi_painter_passes_its_own_tests():
+    """The C that paints the Pi's wall, parsing the stream this file writes.
+
+    It is built against fakes of SDL, GL and the card rather than the real
+    ones, so it runs anywhere with a compiler, and under the sanitizers,
+    because the ways C goes wrong are the ones that stay quiet.
+    """
+    cc = os.environ.get("CC") or shutil.which("cc") or shutil.which("gcc") \
+        or shutil.which("clang")
+    if not cc or not shutil.which(cc.split()[0]):
+        return "skipped: no C compiler"
+    work = tempfile.mkdtemp(prefix="bitwall-shapes-")
+    try:
+        names = os.path.join(work, "names")
+        with open(names, "w") as fh:
+            for cp, samples in _legacy_reference().items():
+                fh.write(f"{cp:x} {samples}\n")
+        env = dict(os.environ, CC=cc, BITWALL_SHAPE_NAMES=names)
+        out = subprocess.run([os.path.join(HERE, "paint", "run")],
+                             capture_output=True, text=True, env=env)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    if out.returncode != 0:
+        said = (out.stdout + out.stderr).splitlines()
+        failed = [line for line in said
+                  if line.startswith(("  FAIL", "        ")) or "error" in line]
+        raise AssertionError("\n        ".join(failed[:30] or said[-30:]))
+
+
+# -------------------------------------------------------------- catalogue
+
+sys.path.insert(0, os.path.join(ROOT, "controllers"))
+import catalogue                                               # noqa: E402
+
+
+def a_catalogue(top):
+    """A made-up catalogue, as a host might have it: a plain file, a tree
+    linked in from another repository, a single file linked in, and each
+    kind of mistake."""
+    def put(path, spec, raw=None):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write(raw if raw is not None else json.dumps(spec))
+
+    def run(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write("#!/bin/sh\n")
+        os.chmod(path, 0o755)
+
+    font = {"type": "font", "label": "Font", "description": "Cells",
+            "default": 14}
+    cat = os.path.join(top, "senders")
+    repo = os.path.join(top, "repo")
+    run(os.path.join(top, "clock", "main.py"))
+    put(os.path.join(cat, "clock.json"),
+        {"label": "Clock", "description": "The time",
+         "start": "../clock/main.py", "options": {"font": font}})
+    run(os.path.join(repo, "video", "main.py"))
+    put(os.path.join(repo, "catalogue", "video.json"),
+        {"label": "Films", "description": "A film",
+         "start": "../video/main.py",
+         "options": {"mode": {"type": "choice", "label": "Mode",
+                              "description": "Pixels", "default": "fine",
+                              "choices": ["half", "fine"]},
+                     "shuffle": {"type": "bool", "label": "Shuffle",
+                                 "description": "Any order", "default": False}}})
+    os.symlink(os.path.join(repo, "catalogue"), os.path.join(cat, "demos"))
+    os.symlink(os.path.join(repo, "catalogue", "video.json"),
+               os.path.join(cat, "film.json"))
+    os.symlink(os.path.join(repo, "catalogue"), os.path.join(cat, "again"))
+    os.symlink(cat, os.path.join(repo, "catalogue", "back"))
+    os.symlink(os.path.join(top, "gone.json"), os.path.join(cat, "dangling.json"))
+    put(os.path.join(cat, "broken.json"), None, raw="{not json")
+    put(os.path.join(cat, "nostart.json"),
+        {"label": "No start", "description": "x", "start": "./nope"})
+    with open(os.path.join(top, "plain"), "w") as fh:
+        fh.write("")
+    put(os.path.join(cat, "noexec.json"),
+        {"label": "No exec", "description": "x", "start": "../plain"})
+    put(os.path.join(cat, "badopt.json"),
+        {"label": "Bad", "description": "x", "start": "../clock/main.py",
+         "options": {"font": dict(font, default=999)}})
+    put(os.path.join(cat, "badname.json"),
+        {"label": "Bad", "description": "x", "start": "../clock/main.py",
+         "options": {"--rm -rf": font}})
+    return cat
+
+
+def walked(fn):
+    with tempfile.TemporaryDirectory() as top:
+        return fn(catalogue.walk(a_catalogue(top)), top)
+
+
+@check
+def a_sender_is_named_by_its_path_and_found_through_links():
+    def test(cat, top):
+        ids = sorted(s["id"] for s in cat["senders"])
+        wanted = ["again/video", "clock", "film"] if ids[0] == "again/video" \
+            else ["clock", "demos/video", "film"]
+        assert ids == wanted, ids
+    walked(test)
+
+
+@check
+def a_script_is_found_from_where_the_json_really_is():
+    def test(cat, top):
+        film = next(s for s in cat["senders"] if s["id"] == "film")
+        assert film["start"] == os.path.join(os.path.realpath(top), "repo",
+                                             "video", "main.py"), film["start"]
+        assert film["stop"] is None and film["status"] is None
+    walked(test)
+
+
+@check
+def a_loop_or_a_second_link_is_reported_not_followed():
+    def test(cat, top):
+        said = {p["id"]: p["problem"] for p in cat["problems"]}
+        loops = [k for k, v in said.items() if v.startswith("a loop")]
+        again = [k for k, v in said.items() if v.startswith("already listed")]
+        assert len(loops) == 1, said
+        assert len(again) == 1 and again[0] in ("again", "demos"), said
+    walked(test)
+
+
+@check
+def a_bad_file_is_a_problem_and_the_rest_is_still_listed():
+    def test(cat, top):
+        said = {p["id"]: p["problem"] for p in cat["problems"]}
+        for name, start in [("dangling", "a link to nothing"),
+                            ("broken", "not JSON"),
+                            ("nostart", "start ./nope: not found"),
+                            ("noexec", "start ../plain: not executable"),
+                            ("badopt", "option font: default 999"),
+                            ("badname", "option '--rm -rf': not a flag")]:
+            assert said.get(name, "").startswith(start), (name, said.get(name))
+        assert "clock" in [s["id"] for s in cat["senders"]]
+    walked(test)
+
+
+@check
+def the_walker_runs_on_a_host_as_one_script_from_stdin():
+    with tempfile.TemporaryDirectory() as top:
+        cat = a_catalogue(top)
+        with open(os.path.join(ROOT, "controllers", "catalogue.py")) as fh:
+            out = subprocess.run([sys.executable, "-", cat], stdin=fh,
+                                 capture_output=True, text=True, cwd=top)
+        assert out.returncode == 0, out.stderr
+        said = json.loads(out.stdout)
+        assert "clock" in [s["id"] for s in said["senders"]], said
+
+
+@check
+def a_walls_option_is_a_list_of_targets_each_checked_as_a_target_is():
+    """The walker's copy of the target rules is the library's, a list
+    reads as `address()` reads each of its targets, and a bad address, a
+    wall named twice or a count out of range is refused."""
+    from bitwall.session import WALL_TOKEN, address
+    assert catalogue.WALL_TOKEN.pattern == WALL_TOKEN.pattern
+    good = "pi.local,pi.local:1,pi-b.local:kitchen,192.0.2.10:0,::1"
+    assert catalogue.walls(good, 1, 8) == [address(t) for t in good.split(",")]
+    assert catalogue.walls("") == [], "empty is the option not given"
+    for bad in ("pi.local:Kitchen", "pi.local:", "-oProxyCommand=x", "a,,b",
+                "a b", "pi.local,pi.local:0", "x:1:2:z"):
+        try:
+            catalogue.walls(bad)
+        except catalogue.Bad:
+            continue
+        raise AssertionError(f"{bad!r} was taken")
+    for value, low, high in (("a,b,c", 1, 2), ("a", 2, 4)):
+        try:
+            catalogue.walls(value, low, high)
+        except catalogue.Bad as e:
+            assert "not within" in str(e), e
+        else:
+            raise AssertionError((value, low, high))
+
+
+@check
+def a_walls_option_in_an_entry_is_checked_and_passed_as_written():
+    """An entry's walls option is listed with its counts and default, a
+    bad default leaves the entry out, and `bitwall-senders start` passes
+    a list on as it was written, leaves out an empty one, and refuses a
+    bad one."""
+    import importlib.machinery
+    import importlib.util
+    to = {"type": "walls", "label": "To", "description": "Where", "max": 3}
+    with tempfile.TemporaryDirectory() as top:
+        script = os.path.join(top, "main.py")
+        with open(script, "w") as fh:
+            fh.write("#!/bin/sh\n")
+        os.chmod(script, 0o755)
+        cat = os.path.join(top, "senders")
+        os.makedirs(cat)
+        for name, opt in (("good", to), ("bad", dict(to, default="pi.local:Bad")),
+                          ("many", dict(to, default="a,b,c,d")),
+                          ("zero", dict(to, min=0))):
+            with open(os.path.join(cat, name + ".json"), "w") as fh:
+                json.dump({"label": name, "description": "x", "start": "../main.py",
+                           "options": {"to": opt}}, fh)
+        said = catalogue.walk(cat)
+    assert [s["id"] for s in said["senders"]] == ["good"], said
+    problems = {p["id"]: p["problem"] for p in said["problems"]}
+    assert problems["bad"].startswith("option to: default: 'pi.local:Bad'"), problems
+    assert "not within 1..3" in problems["many"], problems
+    assert "min 0" in problems["zero"], problems
+    entry = said["senders"][0]
+    assert entry["options"]["to"] == dict(to, min=1, default=""), entry["options"]
+
+    loader = importlib.machinery.SourceFileLoader(
+        "bitwall_senders", os.path.join(ROOT, "controllers", "bitwall-senders"))
+    spec = importlib.util.spec_from_loader("bitwall_senders", loader)
+    senders = importlib.util.module_from_spec(spec)
+    loader.exec_module(senders)
+    argv, chosen = senders.options_argv(entry, ["--to", "pi.local,pi-b.local:1"])
+    assert argv == ["--to", "pi.local,pi-b.local:1"], argv
+    assert chosen == {"to": "pi.local,pi-b.local:1"}, chosen
+    assert senders.options_argv(entry, ["--to=pi-a.local:0"])[0] == ["--to", "pi-a.local:0"]
+    assert senders.options_argv(entry, []) == ([], {"to": ""})
+    assert senders.options_argv(entry, ["--to", ""]) == ([], {"to": ""})
+    for bad in ("pi.local:Bad", "-oProxyCommand=x", "a,b,c,d"):
+        try:
+            senders.options_argv(entry, ["--to", bad])
+        except senders.Failed as e:
+            assert str(e).startswith(f"--to {bad}: "), e
+        else:
+            raise AssertionError(f"{bad!r} was passed")
+
+
+def a_catalogue_of_scripts(top, entries, settings=None):
+    """A catalogue at top/senders of `entries`, name to the shell an
+    `available` script runs (None for an entry without one), each with a
+    start script; and the host's settings beside it, as written."""
+    cat = os.path.join(top, "senders")
+    os.makedirs(cat, exist_ok=True)
+    for name, body in entries.items():
+        os.makedirs(os.path.dirname(os.path.join(cat, name)), exist_ok=True)
+        spec = {"label": name, "description": "x"}
+        for kind, text in (("start", ""), ("available", body)):
+            if text is None:
+                continue
+            path = os.path.join(top, f"{name}.{kind}")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                fh.write("#!/bin/sh\n" + text + "\n")
+            os.chmod(path, 0o755)
+            spec[kind] = os.path.relpath(path, os.path.dirname(os.path.join(cat, name)))
+        with open(os.path.join(cat, name + ".json"), "w") as fh:
+            json.dump(spec, fh)
+    if settings is not None:
+        with open(os.path.join(top, "catalogue.json"), "w") as fh:
+            fh.write(settings)
+    return cat
+
+
+@check
+def a_sender_is_offered_only_where_its_available_script_says_so():
+    """Exit 0 is offered; anything else is unavailable with the first line
+    it printed, and a start refuses it with that; one that takes too long
+    is unavailable, and the walk waits for no more than AVAILABLE_WAIT."""
+    import importlib.machinery
+    import importlib.util
+    import types
+    with tempfile.TemporaryDirectory() as top:
+        cat = a_catalogue_of_scripts(top, {
+            "plain": None,
+            "here": "exit 0",
+            "gone": "echo 'no USB capture device'\necho more\nexit 1",
+            "mute": "exit 3",
+            "slow": "sleep 10"})
+        began = time.monotonic()
+        said = catalogue.walk(cat)
+        took = time.monotonic() - began
+    assert took < catalogue.AVAILABLE_WAIT + 1, took
+    assert sorted(s["id"] for s in said["senders"]) == ["here", "plain"], said
+    why = {u["id"]: u["reason"] for u in said["unavailable"]}
+    assert why == {"gone": "no USB capture device", "mute": "available exited 3",
+                   "slow": "took too long to say"}, why
+    assert said["problems"] == [] and said["hidden"] == 0, said
+
+    loader = importlib.machinery.SourceFileLoader(
+        "bitwall_senders", os.path.join(ROOT, "controllers", "bitwall-senders"))
+    spec = importlib.util.spec_from_loader("bitwall_senders", loader)
+    senders = importlib.util.module_from_spec(spec)
+    loader.exec_module(senders)
+    senders.catalogue = lambda host: said
+    try:
+        senders.do_start(types.SimpleNamespace(on="localhost", wall="localhost:0",
+                                            sender="gone", replace=False), [])
+    except senders.Failed as e:
+        assert str(e) == "gone is unavailable here: no USB capture device", e
+    else:
+        raise AssertionError("an unavailable sender was started")
+
+
+@check
+def a_host_hides_senders_by_name_or_wildcard_and_says_how_many():
+    """`hide` in the host's catalogue.json leaves out a sender named
+    exactly and every one a wildcard matches, counted and not read; a
+    broken file hides nothing and is a problem."""
+    entries = {"clock": None, "hdmi": "exit 1", "games/snake": None,
+               "games/pong": None, "games-not/x": None}
+    with tempfile.TemporaryDirectory() as top:
+        cat = a_catalogue_of_scripts(top, entries,
+                                     json.dumps({"hide": ["hdmi", "games/*"]}))
+        with open(os.path.join(cat, "games", "broken.json"), "w") as fh:
+            fh.write("{not json")
+        said = catalogue.walk(cat)
+    assert [s["id"] for s in said["senders"]] == ["clock", "games-not/x"], said
+    assert said["unavailable"] == [] and said["problems"] == [], said
+    assert said["hidden"] == 4, said
+    for broken in ("{not json", '{"hide": "hdmi"}'):
+        with tempfile.TemporaryDirectory() as top:
+            said = catalogue.walk(a_catalogue_of_scripts(top, entries, broken))
+        assert said["hidden"] == 0 and len(said["senders"]) == 4, said
+        assert [p["id"] for p in said["problems"]] == [
+            os.path.join(top, "catalogue.json")], said
+    with tempfile.TemporaryDirectory() as top:
+        said = catalogue.walk(a_catalogue_of_scripts(top, entries))
+    assert said["hidden"] == 0 and said["problems"] == [], said
+
+
+@check
+def hdmi_is_available_only_where_a_usb_capture_device_is():
+    """Its entry is in bitwall's catalogue with an `available` that looks
+    where main.py's find_device() does."""
+    said = catalogue.walk(os.path.join(ROOT, "senders", "catalogue"))
+    ids = [s["id"] for s in said["senders"]] + [u["id"] for u in said["unavailable"]]
+    assert "hdmi" in ids and not said["problems"], said["problems"]
+    import glob
+    here = bool(glob.glob("/dev/v4l/by-id/usb-*-video-index0"))
+    gone = {u["id"]: u["reason"] for u in said["unavailable"]}
+    assert ("hdmi" not in gone) if here else gone.get("hdmi") == "no USB capture device", gone
+    with open(os.path.join(ROOT, "senders", "hdmi", "main.py")) as fh:
+        assert '"/dev/v4l/by-id/usb-*-video-index0"' in fh.read()
+    with open(os.path.join(ROOT, "senders", "hdmi", "available")) as fh:
+        assert "/dev/v4l/by-id/usb-*-video-index0" in fh.read()
+
+
+# ---------------------------------------------------------------- letters
+
+def _ink(out):
+    """A drawing as rows of booleans: where a cell has anything on it."""
+    return [[c is not None for c in row] for row in out]
+
+
+class _Wall:
+    """Only what `letters.usable` asks of a wall."""
+
+    def __init__(self, glyphs):
+        self.glyphs = glyphs
+
+    def can(self, *text):
+        return all(protocol.covers(self.glyphs, t) for t in text)
+
+
+@check
+def each_font_draws_known_characters_at_its_size():
+    """A letter is the size its font says, and size() agrees with rows()."""
+    from bitwall import letters as L
+    expect = {L.BLOCK: (6, 5), L.HALF: (3, 3), L.DOTS: (3, 2)}
+    for font, (cols, rows) in expect.items():
+        out = L.rows("8", font, spacing="mono")
+        assert (len(out[0]), len(out)) == (cols, rows), (font, len(out[0]),
+                                                         len(out))
+        assert any(any(r) for r in _ink(out)), font
+    for font in L.FONTS:
+        for text in ("AB 12", "Hi!\nthere", "x"):
+            out = L.rows(text, font)
+            assert L.size(text, font) == (len(out[0]), len(out)), (font, text)
+    seg = L.rows("0", L.SEGMENT, height=12)
+    assert len(seg) == 12, len(seg)
+    assert {c[0] for row in seg for c in row if c} <= {" ", "▀", "▄"}
+    dots = L.rows("Ag", L.DOTS)
+    assert all(0x2800 <= ord(c[0]) <= 0x28FF for row in dots for c in row
+               if c), "DOTS is braille"
+    assert L.rows("", L.BLOCK) == () and L.size("", L.BLOCK) == (0, 0)
+
+
+@check
+def proportional_letters_differ_in_width_and_digits_do_not():
+    """An i is narrower than a w, and every digit is one width either way,
+    so a number that changes keeps its place."""
+    from bitwall import letters as L
+    assert L.size("i", L.DOTS)[0] < L.size("w", L.DOTS)[0]
+    assert L.size("i", L.DOTS, spacing="mono") == L.size(
+        "w", L.DOTS, spacing="mono")
+    # The faces are spaced by their own files, not by these options.
+    for font in (f for f in L.FONTS if f not in L.FACES):
+        for spacing in ("proportional", "mono"):
+            widths = {L.size(d, font, spacing=spacing)[0] for d in "0123456789"}
+            assert len(widths) == 1, (font, spacing, widths)
+        assert L.size("1.:", font)[0] < L.size("1.:", font,
+                                               spacing="mono")[0], font
+
+
+@check
+def a_turned_word_swaps_its_sides_and_reads_the_right_way():
+    """Up reads from the bottom, down from the top, each a quarter turn."""
+    from bitwall import letters as L
+    upright = L.rows("LT", L.BLOCK, cell=1.0)
+    for turn in ("up", "down"):
+        c, r = L.size("LT", L.BLOCK, cell=1.0, turn=turn)
+        assert (c, r) == (len(upright), len(upright[0])), (turn, c, r)
+    up = _ink(L.rows("LT", L.BLOCK, cell=1.0, turn="up"))
+    down = _ink(L.rows("LT", L.BLOCK, cell=1.0, turn="down"))
+    ink = _ink(upright)
+    wide, high = len(ink[0]), len(ink)
+    for y in range(wide):
+        for x in range(high):
+            assert up[y][x] == ink[x][wide - 1 - y], ("up", x, y)
+            assert down[y][x] == ink[high - 1 - x][y], ("down", x, y)
+    # The L comes first: at the bottom going up, at the top going down.
+    assert up[-1] == [True] * 5 and down[0] == [True] * 5
+    got = L.size("TALL", L.SEGMENT, turn="up", height=20)
+    assert got[1] <= 20, got
+
+
+@check
+def height_fills_a_shape_font_exactly_and_a_bitmap_to_its_step():
+    from bitwall import letters as L
+    for h in (5, 9, 17, 30):
+        assert L.size("12", L.SEGMENT, height=h)[1] == h, h
+    assert L.size("A", L.BLOCK, height=12)[1] == 10
+    assert L.size("A", L.BLOCK, height=4) == (0, 0)
+
+
+@check
+def fit_takes_the_biggest_in_the_first_font_that_fits_and_can_be_drawn():
+    """Fonts are tried in order; a font the wall cannot draw is passed
+    over; and the answer draws as it says."""
+    from bitwall import letters as L
+    got = L.fit("HI", 40, 20, fonts=(L.BLOCK, L.HALF))
+    assert got["font"] == L.BLOCK, got
+    c, r = L.size(**got)
+    assert c <= 40 and r <= 20
+    bigger = dict(got, height=got["height"] + 5)
+    bc, br = L.size(**bigger)
+    assert (bc > 40 or br > 20) or (bc, br) == (c, r), (c, r, bc, br)
+    assert L.fit("HI", 40, 20, fonts=(L.HALF, L.BLOCK))["font"] == L.HALF
+    ascii_only = _Wall([(0x20, 0x7E)])
+    assert not L.usable(L.DOTS, ascii_only) and L.usable(L.BLOCK, ascii_only)
+    assert L.usable(L.DOTS, _Wall(())), "a wall that has not said may"
+    got = L.fit("HI", 40, 20, fonts=(L.DOTS, L.SEGMENT, L.BLOCK),
+                wall=ascii_only)
+    assert got["font"] == L.BLOCK, got
+    assert L.fit("HELLO", 3, 2, fonts=(L.BLOCK,)) is None
+    wrapped = L.fit("ONE TWO THREE", 40, 20, fonts=(L.BLOCK,), wrap=True)
+    assert "\n" in wrapped["text"], wrapped
+    assert L.size(**wrapped)[0] <= 40
+
+
+@check
+def dots_at_scale_one_is_its_bitmap_exactly():
+    """A dot a bitmap pixel: what the table says, and nothing else."""
+    from bitwall import letters as L
+    for ch in "AWgk%@0":
+        bits = L._bits(L.DOTS, ch, "mono")
+        want = [[bool(v) for v in row] for row in bits]
+        got = L._pixels(L.DOTS, 2, [ch], L._options({"spacing": "mono"}))[0]
+        got = [[v >= 0.5 for v in row] for row in got]
+        assert got == want, ch
+
+
+@check
+def dots_grow_as_strokes_on_the_dot_grid_not_as_blocks():
+    """Bigger, a diagonal is a line of dots rather than steps of squares,
+    and a corner is rounded off rather than square."""
+    from bitwall import letters as L
+    o = L._options({"spacing": "mono"})
+    # '/' is one pixel wide stepping diagonally; at scale 4 a block
+    # would be 4x4 dots at each step, a stroke a thin slanted line.
+    big = L._pixels(L.DOTS, 8, ["/"], o)[0]
+    widths = [sum(1 for v in row if v) for row in big if any(row)]
+    assert max(widths) <= 6, widths
+    blocky = [[v for v in row for _ in range(4)]
+              for row in L._bits(L.DOTS, "/", "mono") for _ in range(4)]
+    assert big != blocky
+    # Each row's ink moves along a little at a time, not four at once.
+    starts = [row.index(1.0) for row in big if any(row)]
+    steps = {abs(a - b) for a, b in zip(starts, starts[1:])}
+    assert steps <= {0, 1, 2}, steps
+    # The outer corner of an L-shape (the top left of 'E') is cut off.
+    e = L._pixels(L.DOTS, 8, ["E"], o)[0]
+    assert not e[0][0] and e[0][3] and e[3][0], "a rounded corner"
+    assert L.size("Ag", L.DOTS, height=7)[1] == 7, "height fills exactly"
+
+
+@check
+def smoothing_is_for_shape_fonts_at_a_depth_that_shows_it():
+    from bitwall import letters as L
+
+    def colours(out):
+        return {v for row in out for c in row if c for v in c[1:] if v}
+
+    for font in (L.BLOCK, L.HALF, L.DOTS):
+        assert (L.rows("AW", font, "ffd75f")
+                == L.rows("AW", font, "ffd75f", smooth=True)), font
+    crisp = L.rows("KW8", L.SEGMENT, "ffd75f", height=10)
+    assert colours(crisp) == {"ffd75f"}, colours(crisp)
+    smooth = L.rows("KW8", L.SEGMENT, "ffd75f", height=10, smooth=True)
+    assert smooth != crisp and len(colours(smooth)) > 2
+    for depth in ("16", "grey", "mono"):
+        assert L.rows("KW8", L.SEGMENT, "ffd75f", height=10, smooth=True,
+                      depth=depth) == crisp, depth
+    assert L.rows("KW8", L.SEGMENT, "ffd75f", height=10, smooth=True,
+                  depth="256") == smooth
+
+
+@check
+def ghost_colours_the_segments_that_are_not_lit():
+    from bitwall import letters as L
+    plain_ = L.rows("1", L.SEGMENT, "ffffff", height=10)
+    ghost = L.rows("1", L.SEGMENT, "ffffff", height=10, ghost="222222")
+    seen = {v for row in ghost for c in row if c for v in c[1:] if v}
+    assert seen == {"ffffff", "222222"}, seen
+    assert sum(map(sum, _ink(ghost))) > sum(map(sum, _ink(plain_)))
+    one = L._glyph_shapes("1", 10, "proportional")
+    assert len(one[1]) == 12, "a digit has all fourteen behind it"
+    one7 = L._glyph_shapes("1", 10, "proportional", seven=True)
+    assert len(one7[1]) == 5, "a 1's unlit are a, d, e, f and the middle"
+    eight = L.rows("8", L.SEGMENT7, "ffffff", height=10, ghost="222222")
+    assert "222222" not in {v for row in eight for c in row if c
+                            for v in c[1:] if v}, "an 8 has nothing unlit"
+
+
+@check
+def a_faint_cell_travels_as_sgr_2_and_comes_back():
+    """Faint is the ninth field of a cell, there only when set; it goes
+    out as SGR 2, and the web receiver's grid keeps it for braille."""
+    from bitwall.grid import Grid
+    assert len(cell("x")) == 8 and len(cell("x", faint=True)) == 9
+    g = [[cell("⠁", "ff0000", "0000ff", faint=True), cell("A", "ff0000")]]
+    out = serialise(g, None, True, 2, 1)
+    assert "\x1b[0;2;" in out, repr(out)
+    grid = Grid(2, 1)
+    grid.feed(out)
+    looks = grid.looks(0)
+    assert looks[0][3] is True and looks[1][3] is False, looks
+    pic, _ = grid.picture()
+    dim, braille = pic.find(b"\x1b[2m"), pic.find("⠁".encode())
+    undim, a = pic.find(b"\x1b[22m"), pic.find(b"A")
+    assert 0 <= dim < braille < undim < a, pic
+
+
+@check
+def dots_ghost_boxes_letters_when_mono_and_fills_the_line_otherwise():
+    from bitwall import letters as L
+
+    def faint_cols(out):
+        return [any(len(row[x] or ()) > 3 for row in out)
+                for x in range(len(out[0]))]
+
+    plain_ = L.rows("AB", L.DOTS, "ffffff")
+    assert all(len(c or ()) <= 3 for row in plain_ for c in row)
+    mono = L.rows("AB", L.DOTS, "ffffff", spacing="mono", ghost="102030")
+    cols = faint_cols(mono)
+    # a box of three cells, a cell of black, and the next box
+    assert cols == [True, True, True, False, True, True, True], cols
+    assert all(c is None or c[2] == "102030" for row in mono for c in row
+               if c and len(c) > 3)
+    prop = L.rows("AB", L.DOTS, "ffffff", ghost="102030")
+    assert all(faint_cols(prop)), faint_cols(prop)
+    assert L.size("AB", L.DOTS, spacing="mono", ghost="1") == (7, 2)
+    blank = L.rows(" ", L.DOTS, "ffffff", ghost="102030")
+    assert all(c[0] == "⠀" and c[3] for row in blank for c in row)
+    g = grid_of(10, 2, " ", "default", "000000")
+    L.draw(g, "A", 0, 0, "ffffff", font=L.DOTS, ghost="102030")
+    assert g[0][0][8] is True and g[0][0][2] == "102030", g[0][0]
+
+
+@check
+def segment_letters_have_gaps_and_their_14_segment_shapes():
+    """Crisp, the bars stop short of each other; the letters use the
+    segments a 14-segment display does."""
+    from bitwall import letters as L
+    o = dict(L._options({}), edges="square", seven=False)
+    top = L._pixels(L.SEGMENT, 12, ["8"], o)[0][0]
+    ink = [a >= 0.5 for a in top]
+    # the upright bars reach the corners, the top bar stops a gap short
+    assert ink[0] and not ink[1] and ink[2], top
+    assert ink[-1] and not ink[-2] and ink[-3], top
+    assert set(L.SEGMENTS["M"]) == set("bcefkl"), "M: the two upper diagonals"
+    assert set(L.SEGMENTS["N"]) == set("bcefkn"), "N: upper left, lower right"
+    for d in "0123456789":
+        assert set(L.SEGMENTS[d]) <= set("abcdefgh"), d
+
+
+@check
+def cut_edges_draw_slopes_with_diagonal_halves():
+    """edges="cut" edges slopes with ◢◣◤◥ on SEGMENT and BLOCK; square,
+    the default, never does, and HALF, whose edges fall on half cells,
+    stays square; SEGMENT_CUT is SEGMENT cut."""
+    from bitwall import letters as L
+    tri = set("◢◣◤◥")
+
+    def halves(out):
+        return sum(1 for row in out for c in row if c and c[0] in tri)
+
+    for font, opts in ((L.SEGMENT, {"height": 12}), (L.BLOCK, {}),
+                       (L.HALF, {"scale": 2})):
+        text = "MXZ" if font == L.SEGMENT else "O2S"
+        square = L.rows(text, font, "ffffff", **opts)
+        assert square == L.rows(text, font, "ffffff", edges="square", **opts)
+        assert halves(square) == 0, font
+        cut_ = L.rows(text, font, "ffffff", edges="cut", **opts)
+        if font == L.HALF:
+            assert cut_ == square, font
+        else:
+            assert halves(cut_), font
+    cut = L.rows("MXZ 42", L.SEGMENT, "ffffff", height=12, edges="cut")
+    assert L.rows("MXZ 42", L.SEGMENT_CUT, "ffffff", height=12) == cut
+    assert L.rows("MXZ 42", L.SEGMENT_CUT, "ffffff", height=12,
+                  edges="square") == L.rows("MXZ 42", L.SEGMENT, "ffffff",
+                                            height=12)
+    assert L.SEGMENT_CUT in L.FONTS
+    no_halves = _Wall([(0x20, 0x7E), (0x2580, 0x259F)])
+    assert L.usable(L.SEGMENT, no_halves)
+    assert not L.usable(L.SEGMENT_CUT, no_halves)
+    got = L.fit("HI", 60, 20, fonts=(L.SEGMENT_CUT,))
+    assert got["font"] == L.SEGMENT_CUT and L.rows(**{**got, "fg": "ffffff"})
+    # A cut O keeps its bitmap's shape: the outer corners go, the sides stay.
+    o = L.rows("O", L.BLOCK, "ffffff", edges="cut")
+    assert o[0][0][0] == "◢" and o[2][0] == (" ", None, "ffffff"), o
+    # N's top is "##." over "#.#": the two pixels touching corner to
+    # corner are joined by a slope in the empty pixel between them, and
+    # the stroke's end stays square.
+    n = L.rows("N", L.BLOCK, "ffffff", edges="cut")
+    assert n[0][4][0] == "◣" and n[0][5] is None, n[0]
+    assert n[4][0] == (" ", None, "ffffff"), n[4]
+    # E's inside corners, with ink on both sides and diagonally, stay
+    # empty and square.
+    e = L.rows("E", L.BLOCK, "ffffff", edges="cut")
+    assert e[1][2] is None and e[1][3] is None, e[1]
+    assert e[3][2] is None and e[3][3] is None, e[3]
+
+
+@check
+def what_fit_answers_drawn_fits_the_box():
+    """fit's answer is the keywords to draw with: drawn, every font's text
+    is within the columns and rows it was fitted to -- TILE too, whose
+    steps are finer than the rows its height is given in."""
+    from bitwall import letters as L
+
+    class Kitty(_Wall):
+        depth = "true"
+
+        def offers(self, word):
+            return word == "kitty"
+
+        def screen(self):
+            return {"cell": (12, 24)}
+
+    wall = Kitty(())
+    fonts = [L.BLOCK, L.HALF, L.DOTS, L.SEGMENT]
+    if L._pillow():
+        fonts.append(L.TILE)
+    for font in fonts:
+        for text in ("THE NATIVITY", "FRA BARTOLOMMEO - 1504-7", "Moon Pine at Ueno"):
+            for cols, rows in ((140, 5), (60, 8), (40, 3), (100, 12)):
+                got = L.fit(text, cols, rows, fonts=(font,), wall=wall)
+                if got is None:
+                    continue
+                c, r = L.size(**got, wall=wall)
+                assert c <= cols and r <= rows, (font, text, cols, rows, got, (c, r))
+
+
+@check
+def a_font_the_wall_cannot_draw_is_drawn_as_the_nearest_it_can():
+    """Given the wall, size, rows and draw use the nearest font it draws:
+    DOTS as HALF, then BLOCK; the cut segments with square edges; and a
+    wall that draws everything, or has not said, gets what was asked."""
+    from bitwall import letters as L
+    text = "Ab 12"
+    ascii_only = _Wall([(0x20, 0x7E)])
+    halves = _Wall([(0x20, 0x7E), (0x2580, 0x259F)])
+    everything = _Wall([(0x20, 0x7E), (0x2580, 0x259F), (0x25E2, 0x25E5),
+                        (0x2800, 0x28FF)])
+    for font, wall, like in ((L.DOTS, halves, L.HALF),
+                             (L.DOTS, ascii_only, L.BLOCK),
+                             (L.HALF, ascii_only, L.BLOCK),
+                             (L.SEGMENT, ascii_only, L.BLOCK),
+                             (L.SEGMENT_CUT, halves, L.SEGMENT),
+                             (L.SEGMENT7_CUT, halves, L.SEGMENT7),
+                             (L.SEGMENT7_CUT, ascii_only, L.BLOCK)):
+        got = L.rows(text, font, "ffffff", wall=wall)
+        assert got == L.rows(text, like, "ffffff", wall=wall), (font, like)
+        assert L.size(text, font, wall=wall) == (len(got[0]), len(got)), font
+        grid = [[bitwall.cell(" ", "default", "000000")] * 80 for _ in range(30)]
+        assert L.draw(grid, text, 0, 0, "ffffff", font=font, wall=wall) \
+            == (len(got[0]), len(got)), font
+        drawn = {c[0] for row in grid for c in row}
+        assert all(wall.can(ch) for ch in drawn), (font, drawn)
+    # A cut edge on a wall without diagonals is square, whatever the font.
+    assert L.rows("N", L.BLOCK, "ffffff", edges="cut", wall=halves) \
+        == L.rows("N", L.BLOCK, "ffffff")
+    for wall in (everything, _Wall(()), None):
+        for font in (L.DOTS, L.HALF, L.SEGMENT_CUT):
+            assert L.rows(text, font, "ffffff", wall=wall) \
+                == L.rows(text, font, "ffffff"), (font, wall)
+
+
+@check
+def pack_shows_a_picture_in_the_shapes_a_wall_can_draw():
+    """pack turns points, two across and four down a cell, into cells:
+    one colour where a cell is one, else the split that fits best among
+    those allowed, and the nearest there is where the best is not."""
+    from bitwall import letters as L
+    r, b = "ff0000", "0000ff"
+    top = [[r, r], [r, r], [b, b], [b, b]]
+    assert L.pack(top) == [[("▀", r, b) + L.pack(top)[0][0][3:]]]
+    assert L.pack([[r, r]] * 4)[0][0][:3] == (" ", "default", r)
+    slope = [[b, b], [b, r], [b, r], [r, r]]          # ◢: points 3, 5, 6, 7
+    assert L.pack(slope)[0][0][:3] == ("◢", r, b)
+    no_cuts = _Wall([(0x20, 0x7E), (0x2580, 0x259F)])
+    got = L.pack(slope, L.shapes(no_cuts))[0][0]
+    assert got[0] in "▀▄▌▐▘▝▖▗ ", got
+    assert L.shapes(None) == L.SHAPES
+    assert len(L.pack([[r] * 6] * 8)) == 2 and len(L.pack([[r] * 6] * 8)[0]) == 3
+
+
+@check
+def cut_edges_trim_corners_and_bridge_diagonals():
+    """Every cell cut changes becomes a diagonal half: an inked one where a
+    corner is trimmed, an empty one where a diagonal step is bridged."""
+    from bitwall import letters as L
+    text = "".join(sorted(L.SMALL))
+    for font, scales in ((L.BLOCK, (1, 2)),):
+        for scale in scales:
+            square = L.rows(text, font, "ffffff", scale=scale)
+            cut = L.rows(text, font, "ffffff", scale=scale, edges="cut")
+            assert len(square) == len(cut)
+            trimmed = bridged = 0
+            for sr, cr in zip(square, cut):
+                for s_, c_ in zip(sr, cr):
+                    if c_ == s_:
+                        continue
+                    assert c_[0] in "◢◣◤◥", (font, scale, s_, c_)
+                    if s_ is None:
+                        bridged += 1
+                    else:
+                        assert s_ == (" ", None, "ffffff"), (font, scale, s_)
+                        trimmed += 1
+            assert trimmed and bridged, (font, scale, trimmed, bridged)
+    # R's leg steps down a pixel diagonally: bridged on both sides (the
+    # notch above it takes one of its two corners in its single cell).
+    r = L.rows("R", L.BLOCK, "ffffff", edges="cut")
+    assert r[2][4][0] in "◤◣" and r[3][3][0] == "◥", (r[2], r[3])
+
+
+@check
+def cut_never_fills_a_counter():
+    """A slope is bridged only in empty space open to the outside: the
+    inside of a D, an O or an 8 is exactly as square draws it."""
+    from bitwall import letters as L
+    for ch in "DOBPR0896AQ":
+        bits = L._bits(L.BLOCK, ch, "mono")
+        high, wide = len(bits), len(bits[0])
+        out, todo = set(), [(x, y) for x in range(-1, wide + 1)
+                            for y in (-1, high)] + \
+            [(x, y) for y in range(high) for x in (-1, wide)]
+        while todo:
+            x, y = todo.pop()
+            if (x, y) in out or not (-1 <= x <= wide and -1 <= y <= high):
+                continue
+            if 0 <= x < wide and 0 <= y < high and bits[y][x]:
+                continue
+            out.add((x, y))
+            todo += [(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)]
+        holes = [(x, y) for y in range(high) for x in range(wide)
+                 if not bits[y][x] and (x, y) not in out]
+        for font, scale, per in ((L.BLOCK, 1, 1), (L.BLOCK, 2, 1),
+                                 (L.HALF, 2, 2), (L.HALF, 4, 2)):
+            square = L.rows(ch, font, "ffffff", scale=scale, spacing="mono")
+            cut = L.rows(ch, font, "ffffff", scale=scale, spacing="mono",
+                         edges="cut")
+            across = scale * L._widen(font, 2.0)
+            for hx, hy in holes:
+                for r in range(hy * scale // per,
+                               -(-(hy + 1) * scale // per)):
+                    for c in range(hx * across, (hx + 1) * across):
+                        assert cut[r][c] == square[r][c], (ch, font, scale,
+                                                            r, c, cut[r][c])
+    # D's outside corners are the slopes, not its counter's.
+    d = L.rows("D", L.BLOCK, "ffffff", edges="cut")
+    assert d[0][4][0] == "◣" and d[4][4][0] == "◤", (d[0], d[4])
+
+
+@check
+def a_ghost_is_chosen_for_the_depth_it_goes_out_at():
+    """At 256 colours a ghost is a palette colour no lighter than asked and
+    well under the ink, and the stream sends it as that colour; with 16
+    colours or one there is none."""
+    from bitwall import letters as L
+    from bitwall import stream as S
+
+    def luma(h):
+        r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+    for ghost in ("1a2130", "3a2a08", "12304a", "402020", "0a0a0a"):
+        for ink in ("ffd75f", "7fe8ff", "808080"):
+            got = L.ghost_for(ghost, ink, "256")
+            if got is None:
+                continue
+            assert luma(got) <= luma(ghost) + 0.5, (ghost, got)
+            assert luma(got) <= luma(ink) * L.GHOST_UNDER_INK, (ink, got)
+            sent = S.palette_256(S._reduce(got, "256"))
+            assert "%02x%02x%02x" % sent == got, (got, sent)
+        assert L.ghost_for(ghost, "ffd75f", "16") is None
+        assert L.ghost_for(ghost, "ffd75f", "mono") is None
+        assert L.ghost_for(ghost, "ffd75f", "true") == ghost
+    # drawn: no ghost at 16 colours, for segments or dots
+    seg = L.rows("1", L.SEGMENT, "ffd75f", height=10, ghost="1a2130",
+                 depth="16")
+    assert seg == L.rows("1", L.SEGMENT, "ffd75f", height=10, depth="16")
+    dots = L.rows("Hi", L.DOTS, "ffd75f", ghost="12304a", depth="16")
+    assert not any(c and len(c) > 3 for row in dots for c in row)
+    # the stream matches a dark colour to what the palette really has
+    assert S.palette_256(S._reduce("1a2130", "256"))[0] < 60
+
+
+def _letters_demo():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "letters_demo", os.path.join(ROOT, "senders", "letters", "main.py"))
+    demo = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(demo)
+    return demo
+
+
+@check
+def the_letters_demo_shows_the_scene_it_is_asked_for():
+    """--scene by name or number, --hold to stay there, and the catalogue
+    offering every scene there is."""
+    demo = _letters_demo()
+    a = demo.parse(["--scene", "clock", "--hold", "localhost:letters"])
+    assert a.scene == demo.SCENES.index("clock") and a.hold, a
+    a = demo.parse(["--scene", "3", "localhost"])
+    assert a.scene == 2 and not a.hold, a
+    a = demo.parse(["localhost"])
+    assert a.scene is None and not a.hold, a
+    assert demo.parse(["--scene", "all", "h"]).scene is None
+    for bad in ("0", str(len(demo.SCENES) + 1), "nonsense"):
+        try:
+            with open(os.devnull, "w") as quiet:
+                saved, sys.stderr = sys.stderr, quiet
+                try:
+                    demo.parse(["--scene", bad, "h"])
+                finally:
+                    sys.stderr = saved
+        except SystemExit:
+            continue
+        raise AssertionError(f"--scene {bad} was taken")
+    with open(os.path.join(ROOT, "senders", "catalogue", "letters.json")) as f:
+        offered = json.load(f)["options"]["scene"]["choices"]
+    assert offered == ["all"] + list(demo.SCENES), offered
+
+    class Wall:
+        depth = "true"
+
+        def can(self, *text):
+            return True
+
+    held = demo.Demo(Wall(), 5, 10, first=7, hold=True)
+    rolling = demo.Demo(Wall(), 5, 10, first=7)
+    held.start = rolling.start = held.start - 12
+    assert held.current()[1] == 7, held.current()
+    assert rolling.current()[1] == 9, rolling.current()
+    assert len(held.scenes) == len(demo.SCENES)
+
+
+def _one_run(cells):
+    """Whether a set of (x, y) is one piece, each touching the next on a
+    side or a corner."""
+    if not cells:
+        return False
+    todo, seen = [next(iter(cells))], set()
+    while todo:
+        x, y = todo.pop()
+        if (x, y) in seen:
+            continue
+        seen.add((x, y))
+        todo += [(x + dx, y + dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+                 if (x + dx, y + dy) in cells]
+    return seen == cells
+
+
+@check
+def a_segment_diagonal_is_one_stroke_even_small():
+    """Each diagonal alone, at SEGMENT's smallest sizes, upright and turned,
+    square, cut and smooth: one run of lit cells from its corner towards
+    the centre, stopping a gap short of it, never broken into dashes by a
+    gap or a steep slope."""
+    from bitwall import letters as L
+    one = "\x01"
+    try:
+        for name in "klmn":
+            L.SEGMENTS[one] = name
+            for n in range(L.SEGMENT_MIN, 13):
+                for opts in ({}, {"edges": "cut"}, {"smooth": True},
+                             {"turn": "up"}, {"turn": "down", "smooth": True}):
+                    out = L.rows(one, L.SEGMENT, "ffffff", height=n, **opts) \
+                        if "turn" not in opts else \
+                        L.rows(one, L.SEGMENT, "ffffff", scale=1, **opts)
+                    lit = {(x, y) for y, row in enumerate(out)
+                           for x, c in enumerate(row) if c is not None}
+                    assert _one_run(lit), (name, n, opts, sorted(lit))
+                    if "turn" not in opts:
+                        rows_ = {y for _x, y in lit}
+                        # from a corner's rows most of the way in
+                        assert len(rows_) >= max(1, (n - 2) // 3), (
+                            name, n, opts, rows_)
+                L.SEGMENTS.pop(one, None)
+                L.SEGMENTS[one] = name
+    finally:
+        L.SEGMENTS.pop(one, None)
+    # Two that carry on from each other, as N's and Z's do, are one line
+    # through the middle.
+    try:
+        for pair in ("kn", "lm"):
+            L.SEGMENTS[one] = pair
+            for n in range(L.SEGMENT_MIN, 13):
+                for opts in ({}, {"edges": "cut"}):
+                    out = L.rows(one, L.SEGMENT, "ffffff", height=n, **opts)
+                    lit = {(x, y) for y, row in enumerate(out)
+                           for x, c in enumerate(row) if c is not None}
+                    assert _one_run(lit), (pair, n, opts, sorted(lit))
+    finally:
+        L.SEGMENTS.pop(one, None)
+
+
+@check
+def fit_passes_over_a_segment_too_small_to_read():
+    from bitwall import letters as L
+    got = L.fit("MNKV", 40, 5, fonts=(L.SEGMENT, L.BLOCK))
+    assert got["font"] == L.BLOCK, got
+    got = L.fit("MNKV", 40, 5, fonts=(L.SEGMENT,))
+    assert got and got["font"] == L.SEGMENT and got["height"] < \
+        L.SEGMENT_READABLE, got
+    got = L.fit("MNKV", 80, 12, fonts=(L.SEGMENT, L.BLOCK))
+    assert got["font"] == L.SEGMENT, got
+
+
+class _Screen:
+    """A wall as far as letters asks of it: what it can draw, its depth,
+    its screen and the font size its area is at."""
+
+    def __init__(self, cell=None, font=None, depth="true", glyphs=()):
+        self.cell, self.font_size, self.depth = cell, font, depth
+        self.glyphs = glyphs
+
+    def can(self, *text):
+        return all(protocol.covers(self.glyphs, t) for t in text)
+
+    def screen(self):
+        return {"cell": self.cell} if self.cell else {}
+
+
+@check
+def letters_know_a_cell_by_what_the_wall_says_or_its_font():
+    from bitwall import letters as L
+    assert L.resolution(None) is None
+    assert L.resolution(_Screen()) is None, "a terminal says nothing"
+    assert L.resolution(_Screen(cell=(11, 25), font=20)) == (11, 25)
+    assert L.resolution(_Screen(font=20)) == (12, 25), "Meslo at 20"
+
+
+@check
+def a_cells_shape_and_depth_come_from_the_wall_unless_said():
+    from bitwall import letters as L
+    tall = _Screen(cell=(10, 30))
+    assert L.rows("A", L.BLOCK, wall=tall) == L.rows("A", L.BLOCK, cell=3.0)
+    assert L.rows("A", L.BLOCK, px=(10, 30)) == L.rows("A", L.BLOCK, cell=3.0)
+    assert L.rows("A", L.BLOCK, wall=tall, cell=2.0) == L.rows("A", L.BLOCK)
+    grey = _Screen(depth="grey")
+    crisp = L.rows("KW", L.SEGMENT, "ffd75f", height=20)
+    assert L.rows("KW", L.SEGMENT, "ffd75f", height=20, smooth=True,
+                  wall=grey) == crisp
+    assert L.rows("KW", L.SEGMENT, "ffd75f", height=20, smooth=True,
+                  wall=grey, depth="true") != crisp
+
+
+@check
+def smoothing_is_kept_for_strokes_it_helps():
+    """Crisp where a smoothed edge would be as wide as the stroke, unless
+    the cells are fine grain; as asked where nothing is known."""
+    from bitwall import letters as L
+
+    def smooth(height, px):
+        a = L.rows("KW", L.SEGMENT, "ffd75f", height=height, smooth=True,
+                   px=px)
+        return a != L.rows("KW", L.SEGMENT, "ffd75f", height=height, px=px)
+
+    assert L._seg_box(9)[2] < L.SMOOTH_STROKE <= L._seg_box(24)[2]
+    assert smooth(9, None), "nothing known: as asked"
+    assert not smooth(9, (12, 26)), "thin strokes on big cells stay crisp"
+    assert smooth(9, (5, 10)), "fine cells smooth whatever the stroke"
+    assert smooth(24, (12, 26)), "a wide stroke smooths"
+
+
+@check
+def fit_suits_the_resolution_and_says_so():
+    from bitwall import letters as L
+    blur = _Screen(cell=(4, 8))
+    sharp = _Screen(cell=(12, 26))
+    both = (L.DOTS, L.BLOCK)
+    assert L.fit("Hello", 60, 10, fonts=both, wall=sharp)["font"] == L.DOTS
+    got = L.fit("Hello", 60, 10, fonts=both, wall=blur)
+    assert got["font"] == L.BLOCK and got["px"] == (4, 8), got
+    assert L.fit("Hello", 60, 10, fonts=(L.DOTS,), wall=blur)["font"] == L.DOTS
+    # the answer draws as it was measured
+    g = grid_of(60, 10)
+    assert L.draw(g, x=0, y=0, fg="ffffff", **got) == L.size(**got)
+    assert L.fit("Hello", 60, 10, fonts=both)["font"] == L.DOTS
+
+
+@check
+def every_segment_character_fills_the_same_box():
+    """Mitred as a real display is, a 1 is as tall as an 8 or a 7, and the
+    whole display behind any character is the same box, in every mode."""
+    from bitwall import letters as L
+
+    def box(out):
+        at = [(x, y) for y, row in enumerate(out)
+              for x, c in enumerate(row) if c is not None]
+        return (min(y for _x, y in at), max(y for _x, y in at),
+                min(x for x, _y in at), max(x for x, _y in at))
+
+    for font in (L.SEGMENT, L.SEGMENT_CUT, L.SEGMENT7, L.SEGMENT7_CUT):
+        for n in (5, 7, 9, 12, 20):
+            for opts in ({}, {"smooth": True}):
+                tall = {box(L.rows(ch, font, "ffffff", height=n, spacing="mono",
+                                   **opts))[:2] for ch in "1784I"
+                        if L.plain(ch, font).strip()}
+                assert len(tall) == 1, (font, n, opts, tall)
+                whole = {box(L.rows(ch, font, "ffffff", height=n,
+                                    spacing="mono", ghost="222222", **opts))
+                         for ch in "18-47"}
+                assert len(whole) == 1, (font, n, opts, whole)
+
+
+@check
+def segment7_is_a_seven_segment_display():
+    """Its letters are the ones seven bars make, in their own case; the
+    rest are spaces; and only seven bars stand behind a character."""
+    from bitwall import letters as L
+    assert L.plain("Hello 42", L.SEGMENT7) == "HELLo 42"
+    assert L.plain("dry run", L.SEGMENT7) == "dry run"
+    assert L.plain("MWKX", L.SEGMENT7) == "    "
+    for f in (L.SEGMENT7, L.SEGMENT7_CUT):
+        assert f in L.FONTS and L.usable(f)
+    four14 = L._glyph_shapes("4", 12, "proportional")
+    four7 = L._glyph_shapes("4", 12, "proportional", seven=True)
+    # b, c, f and the middle: two halves on fourteen, one bar on seven
+    assert len(four14[0]) == 5 and len(four7[0]) == 4, (
+        len(four14[0]), len(four7[0]))
+    assert len(four14[1]) == 9 and len(four7[1]) == 3, (
+        len(four14[1]), len(four7[1]))
+    ghosted = L.rows("4", L.SEGMENT7, "ffffff", height=12, ghost="222222")
+    assert any(c and "222222" in c[1:] for row in ghosted for c in row)
+    assert L.rows("42", L.SEGMENT7_CUT, "ffffff", height=12) == \
+        L.rows("42", L.SEGMENT7, "ffffff", height=12, edges="cut")
+    got = L.fit("12:30", 60, 12, fonts=(L.SEGMENT7,))
+    assert got["font"] == L.SEGMENT7 and L.size(**got)[0] <= 60
+
+
+@check
+def plain_folds_what_a_font_cannot_draw():
+    from bitwall import letters as L
+    assert L.plain("Cézanne – “x”…", L.BLOCK) == 'CEZANNE - "X"...'
+    assert L.plain("Crème", L.DOTS) == "Creme"
+    assert L.plain("a☃b\nc", L.SEGMENT) == "A B\nC"
+
+
+@check
+def draw_paints_into_a_grid_and_leaves_the_rest():
+    from bitwall import letters as L
+    g = grid_of(20, 6, ".", "default", "101010")
+    c, r = L.draw(g, "7", 1, 0, "ff0000", font=L.HALF)
+    assert (c, r) == L.size("7", L.HALF)
+    assert g[0][0] == cell(".", "default", "101010"), "outside is untouched"
+    painted = {x[1] for row in g for x in row} | {x[2] for row in g for x in row}
+    assert "ff0000" in painted
+    L.draw(g, "WIDE WORDS", 15, 5, "00ff00")      # clipped, not raised
+
+
+@check
+def tile_is_a_picture_over_its_cells_and_falls_back_to_block():
+    """TILE fills a height exactly, from two rows; a wall that does not
+    offer kitty gets BLOCK with its corners cut; and where it is drawn, a
+    picture goes once to the wall, stays while it is drawn, and is taken
+    down after a frame without it and on leaving."""
+    from bitwall import letters as L
+    for h in (2, 3, 5):
+        assert L.size("18:07", L.TILE, height=h)[1] == h, h
+    assert L.size("18:07", L.TILE) == L.size("18:07", L.TILE, height=5)
+
+    class Wall:
+        depth = "true"
+
+        def __init__(self, kitty):
+            self.kitty, self.sent, self.after, self.leave = kitty, [], [], []
+
+        def can(self, *text):
+            return True
+
+        def offers(self, word):
+            return self.kitty and word == "kitty"
+
+        def screen(self):
+            return {"cell": (12, 28)}
+
+        def passthrough(self, data):
+            self.sent.append(data)
+
+        def after_frame(self, fn):
+            self.after.append(fn)
+
+        def before_leaving(self, fn):
+            self.leave.append(fn)
+
+    plain = Wall(kitty=False)
+    assert not L.usable(L.TILE, plain) and not L.usable(L.TILE, None)
+    g = grid_of(40, 6, " ", "default", "101010")
+    got = L.draw(g, "HI", 0, 0, "ff0000", font=L.TILE, height=5, wall=plain)
+    assert got == L.draw(grid_of(40, 6, " ", "default", "101010"), "HI", 0, 0,
+                         "ff0000", font=L.BLOCK, height=5, edges="cut",
+                         wall=plain), got
+    assert not plain.sent
+
+    if not L._pillow():
+        return "the picture itself unchecked: no Pillow here"
+    w = Wall(kitty=True)
+    assert L.usable(L.TILE, w)
+    g = grid_of(60, 6, "x", "default", "101010")
+    c, r = L.draw(g, "HELLO", 2, 1, "ffc542", font=L.TILE, height=2, wall=w)
+    assert (c, r) == L.size("HELLO", L.TILE, height=2, wall=w)
+    assert all(g[1 + y][2 + x][0] == " " for y in range(r) for x in range(c))
+    assert g[1][1][0] == "x" and g[1][2 + c][0] == "x", "only its own cells"
+    assert len(w.sent) == 1 and b"a=T,f=100" in w.sent[0]
+    for fn in w.after:
+        fn()
+    L.draw(g, "HELLO", 2, 1, "ffc542", font=L.TILE, height=2, wall=w)
+    assert len(w.sent) == 1, "the same text in the same place is not sent again"
+    for fn in w.after:
+        fn()
+    for fn in w.after:
+        fn()                                       # a frame that did not draw it
+    assert w.sent[-1].startswith(b"\x1b_Ga=d,d=I"), w.sent[-1][:30]
+    L.draw(g, "HI", 2, 1, "ffc542", font=L.TILE, height=2, wall=w)
+    for fn in w.leave:
+        fn()
+    assert w.sent[-1].startswith(b"\x1b_Ga=d,d=I"), "taken down on leaving"
+
+
+@check
+def the_faces_fill_a_height_and_fall_back_to_dots():
+    """WHITE_RABBIT, BYTES256 and VT323 take the rows asked for, from one;
+    without kitty they are DOTS, which keeps their lower case."""
+    from bitwall import letters as L
+    for font in (L.WHITE_RABBIT, L.BYTES256, L.VT323):
+        for h in (1, 2, 3):
+            c, r = L.size("Wake up", font, height=h)
+            assert r == h and c > 0, (font, h, c, r)
+        assert L.plain("Neo", font) == "Neo"
+
+    class Plain:
+        depth = "true"
+
+        def can(self, *text):
+            return True
+
+        def offers(self, word):
+            return False
+
+        def screen(self):
+            return {"cell": (10, 20)}
+
+    g = grid_of(40, 4, " ", "default", "000000")
+    got = L.draw(g, "Neo", 0, 0, "33ff66", font=L.VT323, height=2,
+                 wall=Plain())
+    assert got == L.size("Neo", L.DOTS, height=2, wall=Plain()), got
+
+
+# ---------------------------------------------------------------- machine
+
+@check
+def a_sender_imports_where_there_is_no_pty_or_terminal():
+    """The library loads on a machine without Unix's terminal modules and
+    with Windows' paths, and still names a Pi's fifos as the Pi does:
+    only the tmux source asks for a pty, when it starts."""
+    code = ("import ntpath, os, sys\n"
+            "for m in ('fcntl', 'pty', 'termios', 'tty', 'pwd', 'grp', 'resource'):\n"
+            "    sys.modules[m] = None\n"
+            "os.path = sys.modules['os.path'] = ntpath\n"
+            f"sys.path.insert(0, {ROOT!r})\n"
+            "import bitwall, bitwall.video, bitwall.letters\n"
+            "from bitwall import session\n"
+            "link = bitwall.Link('pi.local:1', run='/run/user/1000/bitwall/1')\n"
+            "s = session.Session(link, 'probe', 'controller')\n"
+            "said = ' '.join([s.writer_argv()[-1], link.q, link.session_dir('probe')])\n"
+            "assert session.wall_run('/run/user/1000', '1') == '/run/user/1000/bitwall/1'\n"
+            "assert '\\\\' not in said and '/run/user/1000/bitwall/1/s/probe/in' in said, said\n")
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr.strip().splitlines()[-1:]
+
+
+@check
+def only_a_cell_stream_is_compressed_on_its_way():
+    """A cells session's ssh compresses, on a master of its own; a video
+    layer's, its `data` and a controller's do not, on another, since every
+    session shares its master's compression; `compress=` says otherwise."""
+    from bitwall import session, video, portable
+    link = session.Link("pi.local:1", run="/run/user/1000/bitwall/1")
+
+    def ssh_of(argv):
+        return "-C" in argv, next((a for a in argv if a.startswith("ControlPath=")), None)
+    cells = session.Session(link, "c", "layer", {"z": 0, "type": "cells"})
+    vid = session.Session(link, "v", "layer", {"z": "above", "type": "video"})
+    ctl = session.Session(link, "k", "controller", {})
+    forced = session.Session(link, "f", "layer", {"z": "above", "type": "video"}, compress=True)
+    for s, want in ((cells, True), (vid, False), (ctl, False), (forced, True)):
+        for argv in (s.open_argv(), s.writer_argv()):
+            on, path = ssh_of(argv)
+            assert on == want, f"{s.name}: -C {on}, wanted {want}"
+            if portable.SSH_SHARES:
+                assert path and path.endswith("-raw") != want, f"{s.name}: {path}"
+    layer = video.Layer("pi.local:1", run="/run/user/1000/bitwall/1", data=True, codec="hevc")
+    layer._session = vid
+    assert "-C" not in layer.data_argv(), "a film's data is compressed"
+
+
+def _copier(path):
+    return subprocess.Popen(
+        [sys.executable, "-c", "import sys, shutil; "
+         "shutil.copyfileobj(sys.stdin.buffer, open(sys.argv[1], 'wb'))", path],
+        stdin=subprocess.PIPE)
+
+
+@check
+def a_pipe_carries_everything_whole_and_closes_once_drained():
+    """What a Pipe is handed reaches the far end in order and entire, and
+    its close lets the far end finish rather than cutting it off."""
+    from bitwall import portable
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "got")
+        proc = _copier(path)
+        pipe = portable.Pipe(proc)
+        parts = [os.urandom(n) for n in (1, 70000, 3, 1 << 20)]
+        for part in parts:
+            assert pipe.write(part, timeout=10) == len(part), "a write came up short"
+        assert pipe.idle, "a pipe with nothing in hand says it is busy"
+        pipe.close()
+        assert proc.wait(timeout=10) == 0
+        with open(path, "rb") as fh:
+            assert fh.read() == b"".join(parts), "the far end got something else"
+        assert pipe.write(b"late") is None, "a closed pipe took a write"
+
+
+@check
+def a_pipe_nobody_reads_holds_a_write_only_as_long_as_asked():
+    """A wall that has stopped reading costs a writer its timeout, or less
+    when told to stop, and a far end that goes is noticed."""
+    import threading
+    from bitwall import portable
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                            stdin=subprocess.PIPE)
+    try:
+        pipe = portable.Pipe(proc)
+        big = b"x" * (4 << 20)
+        t = time.monotonic()
+        got = pipe.write(big, timeout=0.3)
+        took = time.monotonic() - t
+        assert got is not None and got < len(big), f"a stuck pipe took {got} bytes"
+        assert took < 1.0, f"a 0.3s timeout held the writer {took:.2f}s"
+        assert not pipe.idle, "a pipe still holding a piece says it is idle"
+        stop = threading.Event()
+        threading.Timer(0.2, stop.set).start()
+        t = time.monotonic()
+        assert pipe.write(b"y", stop) is None, "a stopped write said it went"
+        assert time.monotonic() - t < 1.0, "stop was not heard"
+        proc.kill()
+        proc.wait()
+        assert _until(lambda: pipe.closed), "a far end that went was not noticed"
+        assert pipe.write(b"z", timeout=1) is None, "a broken pipe took a write"
+    finally:
+        proc.kill()
+
+
+# -------------------------------------------------------------- contracts
+
+@check
+def the_receivers_and_the_wall_keep_their_contracts():
+    """What AGENTS.md and PROTOCOL.md promise, run against the real thing.
+
+    Every receiver that can run here, each in a run directory of its own,
+    and a Wall attached to the fake wall, which records what reaches it.
+    A contract known not to be kept is reported there and does not fail
+    this; one that was kept and stops being kept does.
+    """
+    if not shutil.which("uv"):
+        return "skipped: uv is not installed"
+    proc = _contracts or _start_contracts()
+    proc.wait()
+    for f in proc.said:
+        f.seek(0)
+    out = subprocess.CompletedProcess(proc.args, proc.returncode,
+                                      proc.said[0].read(), proc.said[1].read())
+    if out.returncode != 0:
+        said = (out.stdout + out.stderr).splitlines()
+        failed = []
+        for at, line in enumerate(said):
+            if line.startswith(("  FAIL", "  ERROR")):
+                failed += said[at:at + 2]
+        raise AssertionError("\n        ".join(failed[:30] or said[-30:]))
+
+
+# ------------------------------------------------------------ GPU painter
+
+@check
+def the_painter_on_its_own_gpu_keeps_its_contracts_and_its_pixels():
+    """The painter as it runs on a desktop, shaders compiled and pixels
+    read back from a real GPU: the painter's contracts against it, and
+    tests/painter-pixels. Run after the contracts on the fakes, not beside
+    them, since both time the painter against its clocks."""
+    import gpupainter
+    why = gpupainter.why_not()
+    if why:
+        return f"skipped: {why}"
+    if not shutil.which("uv"):
+        return "skipped: uv is not installed"
+    failed = []
+    for argv, env in (([os.path.join(HERE, "bitwall-contracts"), "pi painter", "painter turned"],
+                       dict(os.environ, BITWALL_PAINTER="gpu")),
+                      ([os.path.join(HERE, "painter-pixels")], dict(os.environ))):
+        out = subprocess.run(argv, capture_output=True, text=True, env=env)
+        said = (out.stdout + out.stderr).splitlines()
+        if out.returncode != 0:
+            these = [x for at, line in enumerate(said)
+                     if line.startswith(("  FAIL", "  ERROR")) for x in said[at:at + 2]]
+            failed += these or said[-10:]
+    if failed:
+        raise AssertionError("\n        ".join(failed[:30]))
+
+
+# -------------------------------------------------------------------- run
+
+# ----------------------------------------------------------- what is there
+#
+# A sender asking the wall it is on who is there and what they show, on
+# its own session: `sessions`, `picture` and `mirror`, against the fake
+# wall in tests/fakewall.py.
+
+def _fake_and_wall(text="H"):
+    import tempfile
+    sys.path.insert(0, HERE)
+    import fakewall
+    fake = fakewall.FakeWall(tempfile.mkdtemp(prefix="bwt-"), "0", 20, 5, 14,
+                             timings=fakewall.Timings(0.1))
+    shown = {"text": text}
+
+    def render(cols, rows):
+        g = grid_of(cols, rows)
+        for i, ch in enumerate(shown["text"][:cols]):
+            g[0][i] = cell(ch, "ff0000", "0000ff")
+        return g
+    w = bitwall.attach("localhost", run=fake.dir, min_frame=0.02)
+    w.set_source(bitwall.FunctionSource(render))
+    return fake, w, shown
+
+
+def _until(test, seconds=3.0):
+    import time
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if test():
+            return True
+        time.sleep(0.02)
+    return test()
+
+
+@check
+def a_sender_finds_the_base_by_name_and_reads_its_cells():
+    fake, w, _ = _fake_and_wall("Hi")
+    try:
+        assert _until(lambda: w.talking and fake.painted), "the sender never painted"
+        found = w.sessions()
+        base = [s for s in found if s.z == 0]
+        assert [s.name for s in base] == [w.session.name] and base[0].type == "cells", found
+        assert _until(lambda: fake.grid.ch[0][:2] == ["H", "i"]), fake.grid.ch[0][:4]
+        p = w.picture(base[0].name)
+        assert p.format == "grid" and (p.width, p.height) == (20, 5), p
+        assert p.cell(0, 0) == ("H", 0xff0000, 0x0000ff), p.cell(0, 0)
+        assert p.row(0).startswith("Hi"), p.row(0)
+        g = w.picture("glass", size=(40, 40))
+        assert g.format == "qoi" and g.data[:4] == b"qoif" and g.width == 40 \
+            and g.height < 40, (g, g.width, g.height)
+        try:
+            w.picture("nobody")
+        except bitwall.CaptureError as e:
+            assert "no such session" in str(e), e
+        else:
+            raise AssertionError("a picture of nobody came back")
+    finally:
+        w.detach()
+        fake.remove()
+
+
+@check
+def a_mirror_keeps_a_current_copy_and_says_when_it_changed():
+    fake, w, shown = _fake_and_wall("one")
+    try:
+        assert _until(lambda: w.talking and fake.painted), "the sender never painted"
+        base = next(s.name for s in w.sessions() if s.z == 0)
+        m = w.mirror(base, every=50)
+        assert _until(lambda: m.version and m.row(0).startswith("one")), (m.version, m.grid)
+        seen, when = m.version, m.changed
+        shown["text"] = "two"
+        assert _until(lambda: m.version > seen and m.row(0).startswith("two")), \
+            (m.version, m.row(0))
+        assert m.changed > when and m.cell(0, 0) == ("t", 0xff0000, 0x0000ff), m.cell(0, 0)
+        m.off()
+        import time
+        time.sleep(0.3)
+        seen = m.version
+        shown["text"] = "three"
+        time.sleep(0.5)
+        assert m.version == seen and m.row(0).startswith("two"), "a stopped mirror went on"
+    finally:
+        w.detach()
+        fake.remove()
+
+
+@check
+def a_mirror_of_a_video_layer_holds_its_frame_and_goes_when_it_does():
+    fake, w, _ = _fake_and_wall()
+    layer = None
+    try:
+        assert _until(lambda: w.talking), "the sender never opened"
+        layer = w.layer()
+        assert _until(lambda: layer.open_now), "the layer never opened"
+        m = w.mirror(layer._session.name)
+        import time
+        time.sleep(0.2)
+        q = bytes.fromhex("716f6966000000020000000204 00".replace(" ", "")) \
+            + bytes([0xFE, 1, 2, 3, 0xC2]) + b"\0" * 7 + b"\1"
+        assert layer.frame(q, at=(7, 9), hold=5000), "the frame was dropped"
+        assert _until(lambda: m.shown and m.data == q), (m.shown, m.data)
+        assert (m.format, m.width, m.height, m.at, m.hold) == ("qoi", 2, 2, (7, 9), 5000), \
+            (m.format, m.width, m.height, m.at, m.hold)
+        p = layer.picture(layer._session.name)
+        assert p.data == q and p.at == (7, 9), p
+        layer.clear()
+        assert _until(lambda: not m.shown), "the mirror did not go when the layer did"
+    finally:
+        if layer is not None:
+            layer.close()
+        w.detach()
+        fake.remove()
+
+
+# ---------------------------------------------------------------- windows
+#
+# A wall on Windows is named pipes, reached through the relay (WINDOWS.md).
+# The relay runs on any host, so here it carries a session to the fake
+# wall's fifos as it would to a Windows wall's pipes; the receiver core on
+# this machine's own pipes is tests/windows-pipes, run here and, when it
+# answers, on the Windows host `BITWALL_WINDOWS_HOST` (default `pc`).
+
+def _relayed(fake, name=None):
+    from bitwall.session import Controller
+    c = Controller("localhost", run=fake.dir, name=name)
+    c.link._pipes = True          # what a `//./pipe/` run directory says
+    return c
+
+
+@check
+def the_relay_carries_a_session_as_cat_and_the_opener_do():
+    import tempfile
+    sys.path.insert(0, HERE)
+    import fakewall
+    fake = fakewall.FakeWall(tempfile.mkdtemp(prefix="bwt-"), "0", 20, 5, 14,
+                             timings=fakewall.Timings(0.1))
+    try:
+        c = _relayed(fake)
+        assert c.session.open_argv()[:3] == [sys.executable, "-c", bitwall.relay.BOOT], \
+            "a local wall's relay runs on this Python, with no shell"
+        c.open()
+        assert any(m.name == "area" for m in c.report), [m.raw for m in c.report]
+        said = [m.raw for m in c.ask("sessions")]
+        assert any(c.name in x for x in said), said
+        dup = _relayed(fake, name=c.name)
+        dup.TRIES = 1
+        try:
+            dup.open()
+            raise AssertionError("a name already a session's was opened again")
+        except bitwall.session.Refused:
+            pass
+        c.close()
+        assert (c.state, c.closed) == ("closed", "asked"), (c.state, c.closed)
+    finally:
+        fake.remove()
+
+
+@check
+def the_relay_says_no_wall_where_nobody_reads_the_door():
+    from bitwall.session import Controller, NoWall
+    c = Controller("localhost", run="/nonexistent/bitwall/0")
+    c.link._pipes = True
+    try:
+        c.open()
+    except NoWall:
+        return
+    raise AssertionError("a wall that is not there was opened")
+
+
+@check
+def a_link_knows_a_windows_host_by_its_run_directory():
+    from bitwall.session import Link
+    assert Link("pc:kitchen", run="//./pipe/bitwall-someone/bitwall/kitchen").pipes
+    assert not Link("pi.local:1", run="/run/user/1000/bitwall/1").pipes
+    w = Link("pc:kitchen", run="//./pipe/bitwall-someone/bitwall/kitchen")
+    argv = w.writer_argv(w.session_dir("x") + "/in")
+    assert argv[0] == "ssh" and argv[-1].startswith(
+        bitwall.relay.WINDOWS_PYTHON + ' -c "' + bitwall.relay.BOOT + '" '), argv
+    assert all(ch not in argv[-1].split('"')[2] for ch in "'\"$`;&|"), \
+        "the relay's arguments carry nothing a shell would read"
+
+
+@check
+def a_local_run_moves_this_machines_walls_alone():
+    """BITWALL_LOCAL_RUN is where this machine's walls are; every other
+    host's are still asked of that host. BITWALL_RUN moves them all."""
+    from bitwall.session import Link
+    saved = {k: os.environ.pop(k, None) for k in ("BITWALL_RUN", "BITWALL_LOCAL_RUN")}
+    try:
+        os.environ["BITWALL_LOCAL_RUN"] = "//./pipe/bitwall-someone"
+        assert Link("localhost:0")._run == "//./pipe/bitwall-someone/bitwall/0"
+        assert Link("pi.local:1")._run is None, "a Pi's walls were moved too"
+        os.environ["BITWALL_RUN"] = "/tmp/elsewhere"
+        assert Link("pi.local:1")._run == "/tmp/elsewhere/bitwall/1"
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+
+
+@check
+def the_relays_clock_answers_once_and_then_once_a_line():
+    """`relay clock` says the time at once, and again for each line on
+    stdin until it ends, so the mirror times each answer on a relay
+    already running; asked with nothing on stdin it answers once."""
+    import importlib.util
+    once = subprocess.run(bitwall.relay.command("clock", python=sys.executable),
+                          stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+    assert once.returncode == 0 and len(once.stdout.split()) == 1, once.stdout + once.stderr
+    assert abs(float(once.stdout) - time.time()) < 5, once.stdout
+    p = subprocess.Popen(bitwall.relay.command("clock", python=sys.executable),
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    said = [float(p.stdout.readline())]
+    for _ in range(2):
+        p.stdin.write(b"\n")
+        p.stdin.flush()
+        said.append(float(p.stdout.readline()))
+    p.stdin.close()
+    assert p.wait(10) == 0 and said == sorted(said), said
+    spec = importlib.util.spec_from_file_location(
+        "mirror_main", os.path.join(ROOT, "senders", "mirror", "main.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    from bitwall.session import Link
+    off = m._relay_offset(Link("localhost"), 5)
+    assert off is not None and abs(off) < 0.05, off
+
+
+@check
+def the_core_on_this_machines_pipes_does_what_a_sender_needs():
+    for how in ([], ["--here"]):
+        r = subprocess.run([sys.executable, os.path.join(HERE, "windows-pipes")] + how,
+                           capture_output=True, text=True, timeout=120)
+        assert r.returncode == 0, (" ".join(how) + "\n" + r.stdout + r.stderr)[-1500:]
+
+
+WINDOWS_HOST = os.environ.get("BITWALL_WINDOWS_HOST", "pc")
+
+
+@check
+def the_core_on_windows_named_pipes_does_what_a_sender_needs():
+    """tests/windows-pipes on the Windows host, in a folder of its own
+    under Documents, with the host's own python3."""
+    ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", WINDOWS_HOST]
+    try:
+        up = subprocess.run(ssh + ["echo up"], capture_output=True, text=True, timeout=20)
+    except subprocess.TimeoutExpired:
+        up = None
+    if up is None or up.stdout.strip() != "up":
+        return f"skipped: {WINDOWS_HOST} does not answer"
+    folder = "Documents/bitwall-tests"
+    pack = subprocess.run(["tar", "-cz", "--exclude", "__pycache__", "bitwall", "tests",
+                           "senders/mirror"],
+                          cwd=ROOT, capture_output=True, env={**os.environ, "COPYFILE_DISABLE": "1"})
+    put = subprocess.run(ssh + [f"New-Item -ItemType Directory -Force {folder} | Out-Null; "
+                                f"cd {folder}; tar -xzf -"],
+                         input=pack.stdout, capture_output=True, timeout=120)
+    assert put.returncode == 0, put.stderr.decode()[-500:]
+    r = subprocess.run(ssh + [f"cd {folder}; python3 tests/windows-pipes"],
+                       capture_output=True, text=True, timeout=180)
+    assert r.returncode == 0, (r.stdout + r.stderr)[-1500:]
+
+
+#: The contracts, started as the run starts: they take longest, and are
+#: mostly waiting, so the other groups run while they do. What they say
+#: goes to files rather than pipes, which nobody reads until the other
+#: groups are done and which would stop them when full.
+_contracts = None
+
+
+def _start_contracts():
+    out, err = tempfile.TemporaryFile("w+"), tempfile.TemporaryFile("w+")
+    proc = subprocess.Popen([os.path.join(HERE, "bitwall-contracts")],
+                            stdout=out, stderr=err, text=True)
+    proc.said = (out, err)
+    return proc
+
+
+def chosen(argv):
+    """The checks to run: those whose names hold any word given, else all,
+    less those holding a word after --skip."""
+    want, skip = [], []
+    words = iter(argv)
+    for word in words:
+        if word == "--skip":
+            skip.append(next(words, ""))
+        else:
+            want.append(word)
+    name = lambda fn: fn.__name__.replace("_", " ")             # noqa: E731
+    return [fn for fn in _checks
+            if (not want or any(w in name(fn) for w in want))
+            and not any(w and w in name(fn) for w in skip)]
+
+
+def main():
+    global _contracts
+    checks = chosen(sys.argv[1:])
+    if shutil.which("uv") and the_receivers_and_the_wall_keep_their_contracts in checks:
+        _contracts = _start_contracts()
+    width = max(len(c.__name__) for c in _checks) + 2
+    failed = skipped = 0
+    for fn in checks:
+        name = fn.__name__.replace("_", " ")
+        try:
+            note = fn()
+        except AssertionError as exc:
+            failed += 1
+            print(f"  FAIL  {name}\n        {exc}")
+        except Exception as exc:                       # noqa: BLE001
+            failed += 1
+            print(f"  ERROR {name}\n        {type(exc).__name__}: {exc}")
+        else:
+            if note:
+                skipped += 1
+                print(f"  skip  {name:<{width}} {note}")
+            else:
+                print(f"  ok    {name}")
+    total = len(checks)
+    print(f"\n{total - failed - skipped} passed, {failed} failed, "
+          f"{skipped} skipped")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

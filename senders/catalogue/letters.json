@@ -1,0 +1,24 @@
+{
+  "label": "Letters",
+  "description": "bitwall's big text, every font, size and option, a scene at a time",
+  "start": "../letters/main.py",
+  "moves": true,
+  "options": {
+    "font": {"type": "font", "label": "Font size",
+             "description": "Cell size on the wall", "default": 10, "min": 6, "max": 40},
+    "secs": {"type": "choice", "label": "Seconds a scene",
+             "description": "How long each scene is held",
+             "choices": ["5", "8", "10", "20"], "default": "8"},
+    "scene": {"type": "choice", "label": "Scene",
+              "description": "One scene to start at, or all of them in turn",
+              "choices": ["all", "fonts", "block-sizes", "half-sizes", "dots-sizes",
+                          "segment-sizes", "spacing", "turned", "filled",
+                          "segment-ways", "segment-cut", "block-cut", "lcd", "header",
+                          "clock", "families", "resolution", "wrapped", "lower",
+                          "spec-block-cut", "spec-half-cut", "spec-segment",
+                          "spec-segment7", "spec-dots", "spec-dots-ghost", "tile", "faces"],
+              "default": "all"},
+    "hold": {"type": "bool", "label": "Hold",
+             "description": "Stay on the scene rather than rolling on", "default": false}
+  }
+}

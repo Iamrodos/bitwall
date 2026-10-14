@@ -1,0 +1,41 @@
+#!/bin/sh
+# Whatever comes in, onto a wall's base, byte for byte.
+#
+#     chafa -f kitty --size 60x20 picture.jpg | tests/wall-cat shell
+#     tests/kitty-graphics --draw | tests/wall-cat shell
+#
+# Opens a base session at the wall's door, taking it from whoever holds it,
+# and copies stdin into the session's `in` with `cat`: nothing in bitwall
+# reads, parses or changes a byte of it. The shell receiver cats the base
+# on to its terminal, so whatever the terminal draws -- kitty graphics in
+# Ghostty, or in a herdr pane -- it draws here too. The session ends when
+# stdin does, and stays up until then; `--hold` keeps it open after,
+# so what was drawn stays until the wall is given to someone else.
+#
+# A wall on this machine only, by name: BITWALL_RUN or the run directory
+# the receivers use.
+set -eu
+hold=0
+[ "${1:-}" = "--hold" ] && { hold=1; shift; }
+wall=${1:?usage: tests/wall-cat [--hold] <wall>}
+run=${BITWALL_RUN:-${XDG_RUNTIME_DIR:-$HOME/.bitwall/run}}
+dir=$run/bitwall/$wall
+[ -p "$dir/door.in" ] || { echo "wall-cat: no wall $wall in $run/bitwall" >&2; exit 1; }
+name=cat-$$
+printf 'open %s layer z=0 type=cells take=1\n' "$name" >"$dir/door.in"
+s=$dir/s/$name
+i=0
+until [ -p "$s/in" ] && [ -p "$s/out" ]; do
+  i=$((i + 1)); [ $i -lt 50 ] || { echo "wall-cat: $wall did not open $name" >&2; exit 1; }
+  sleep 0.1
+done
+# The wall's answers, read so it never blocks writing them, and said on
+# stderr so a refusal is seen.
+cat "$s/out" >&2 &
+reader=$!
+trap 'kill $reader 2>/dev/null' EXIT
+if [ $hold = 1 ]; then
+  { cat; while :; do sleep 3600; done; } >"$s/in"
+else
+  cat >"$s/in"
+fi

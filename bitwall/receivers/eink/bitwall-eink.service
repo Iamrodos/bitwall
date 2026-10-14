@@ -1,0 +1,28 @@
+# The e-ink wall on this Pi's IT8951 panel, from boot: a user service, as
+# bitwall-screen.service is for the painter, so it runs with the user's
+# runtime directory (its walls in /run/user/1000/bitwall) and groups (spi,
+# gpio), and lingering starts it with no login at all.
+#
+#     mkdir -p ~/bitwall-eink ~/.config/systemd/user
+#     cp target/release/bitwall-eink ~/bitwall-eink/
+#     cp bitwall-eink.service ~/.config/systemd/user/
+#     sudo loginctl enable-linger $USER
+#     systemctl --user enable --now bitwall-eink
+#
+# Restart it with `systemctl --user restart bitwall-eink`; its log is
+# ~/bitwall-eink.log. The VCOM is the one on the panel's ribbon. No
+# --mirror: the IT8951 driver already loads every row right to left, as
+# this panel scans, so --mirror would show the glass backwards.
+
+[Unit]
+Description=bitwall wall on this Pi's e-ink panel
+
+[Service]
+ExecStart=%h/bitwall-eink/bitwall-eink --vcom -1.17 --font 22 paper
+Restart=on-failure
+RestartSec=3
+StandardOutput=append:%h/bitwall-eink.log
+StandardError=inherit
+
+[Install]
+WantedBy=default.target

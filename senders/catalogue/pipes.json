@@ -1,0 +1,10 @@
+{
+  "label": "Pipes",
+  "description": "The 3D pipes screensaver, growing through a room",
+  "start": "../games/pipes/main.py",
+  "moves": true,
+  "options": {
+    "font": {"type": "font", "label": "Font size",
+             "description": "Cell size on the wall", "default": 12, "min": 6, "max": 40}
+  }
+}

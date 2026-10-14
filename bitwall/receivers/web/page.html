@@ -1,0 +1,218 @@
+<!doctype html>
+<meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1,user-scalable=no">
+<title>bitwall __NAME__</title>
+<style>
+  @font-face {
+    font-family: "bitwall wall";
+    src: url("/font.woff2") format("woff2");
+    font-display: block;
+  }
+  @font-face {
+    font-family: "bitwall wall";
+    src: url("/icons.woff2") format("woff2");
+    font-display: block;
+    unicode-range: U+E300-E3E3, U+EA60-EC1E, U+F000-F2E0, U+F400-F533,
+                   U+F0001-F1AF0;
+  }
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { box-sizing: border-box; }
+  bitwall-screen { display: block; width: 100%; height: 100%; }
+  #help {
+    position: fixed; inset: 0; z-index: 4; display: none;
+    align-items: center; justify-content: center;
+    background: rgba(0,0,0,.72); backdrop-filter: blur(2px);
+  }
+  #help.on { display: flex; }
+  #help table {
+    border-collapse: collapse;
+    font: 13px/1.9 ui-monospace, Menlo, monospace; color: #bcbcbc;
+    background: #121216; border: 1px solid #2c2c33; border-radius: 8px;
+    padding: 18px 26px;
+  }
+  #help th { text-align: left; color: #6a6a72; font-weight: normal;
+             letter-spacing: .08em; padding-bottom: 8px; }
+  #help td { padding: 1px 0; vertical-align: top; }
+  #help td.key { color: #d0d0d0; white-space: nowrap; padding-right: 22px; }
+  #help td.off { color: #6a6a72; }
+</style>
+
+<bitwall-screen name="__NAME__" primary></bitwall-screen>
+<div id=help><table>
+  <tr><th colspan=2>bitwall &mdash; keys</th></tr>
+  <tr><td class=key>&#8984; &minus; / =</td>
+      <td>the same wall, bigger or smaller</td></tr>
+  <tr><td class=key>&#8679;&#8984; _ / +</td>
+      <td>keep the window, change the grid</td></tr>
+  <tr><td class=key>&#8984; 0</td><td>back to the opening grid</td></tr>
+  <tr><td class=key>&#8984; /</td><td>this</td></tr>
+  <tr><td class=key>&#8984; s</td><td>the wall's stats, for everyone watching</td></tr>
+  <tr><td class=key>&#8984; q</td><td class=off>quit &mdash; a window only</td></tr>
+  <tr><td class=key>&nbsp;</td><td class=off>&nbsp;</td></tr>
+  <tr><td class=key>? s q esc</td>
+      <td class=off>the same, while no sender is<br>listening to the keyboard</td></tr>
+</table></div>
+
+<script>
+  /* What the host asked for, applied before the component wakes up. A
+     window hosting this page passes its flags in the query string, which
+     is the only channel it has before the socket is open. */
+  var q = new URLSearchParams(location.search);
+  var screenEl = document.querySelector('bitwall-screen');
+  /* A margin round the wall, as a percentage of the window. A screen
+     with nothing else on it usually wants the wall edge to edge, but one
+     being looked at rather than hung on a wall reads better with air
+     around it -- and the smaller box means fewer, larger cells. */
+  var pad = parseFloat(q.get('pad'));
+  if (pad > 0 && pad < 45) {
+    document.body.style.padding = pad + 'vh ' + pad + 'vw';
+  }
+
+  if (q.get('font')) screenEl.setAttribute('font-size', q.get('font'));
+  if (q.get('touch') === '1') screenEl.setAttribute('touch', '');
+  if (q.get('keyboard') === '1') screenEl.setAttribute('keyboard', '');
+</script>
+<script src="/bitwall-screen.js"></script>
+<script>
+  var helpBox = document.getElementById('help');
+
+  /* A multiplier on whatever font the sender asks for, so a viewer can
+     open a wall larger without the sender knowing or caring. The same
+     number the zoom keys move. */
+  var zoom = parseFloat(q.get('zoom')) || 1;
+  var helping = false;
+
+  function help(on) {
+    helping = on;
+    helpBox.classList.toggle('on', on);
+  }
+  helpBox.onclick = function () { help(false); };
+
+  /* Whether a window is hosting this page, and how to ask it for
+     something. In a browser tab there is none, and the keys that belong
+     to a window do nothing.
+
+     Asking is a fetch whose answer nobody reads: what the window does in
+     reply -- closing, resizing -- is not something it can report back to
+     a page it has just closed or moved. */
+  function host() { return q.get('host') === '1'; }
+
+  function ask(path) {
+    fetch('/host/' + path).catch(function () {});
+  }
+
+  /* Size the window so a grid of cells fits it exactly.
+     The page is the only thing that knows how big a cell is, so the
+     window cannot work this out for itself. */
+  function fit(cols, rows) {
+    if (!host() || !cols || !rows || !screenEl.cw) return false;
+    ask('fit?w=' + Math.round(cols * screenEl.cw) +
+        '&h=' + Math.round(rows * screenEl.chh));
+    return true;
+  }
+
+  /* The grid this page was asked to open at. */
+  function asked() {
+    return [parseInt(q.get('cols'), 10), parseInt(q.get('rows'), 10)];
+  }
+
+  (function settle(tries) {
+    var a = asked();
+    if (fit(a[0], a[1]) || tries > 40) return;
+    setTimeout(function () { settle(tries + 1); }, 50);
+  })(0);
+
+  if (zoom !== 1) {
+    (function apply(tries) {
+      if (screenEl.cw) { screenEl.zoom(zoom); return; }
+      if (tries < 40) setTimeout(function () { apply(tries + 1); }, 50);
+    })(0);
+  }
+
+  /* Bigger, with the same wall on it.
+     The font grows and the window grows with it, so the grid is what it
+     was and the sender has nothing to recompose. */
+  function scale(step) {
+    var cols = screenEl.cols, rows = screenEl.rows;
+    zoom = screenEl.zoom(zoom * step);
+    fit(cols, rows);
+  }
+
+  /* Bigger type in the same window.
+     The window is left alone, so a larger cell means fewer of them: the
+     area changes, the receiver publishes it, and the sender composes for
+     the wall it now has. */
+  function resize(step) {
+    zoom = screenEl.zoom(zoom * step);
+  }
+
+  /* The viewer's own keys, and who a key belongs to.
+     Command is the viewer's modifier: it works whatever else is going
+     on. Everything else belongs to the session as soon as a sender has
+     asked for the keyboard -- a wall showing a terminal has to be able
+     to type a q or a ? into it. */
+  addEventListener('keydown', function (e) {
+    var plus = (e.key === '+' || e.key === '='),
+        minus = (e.key === '-' || e.key === '_'),
+        step = plus ? 1.12 : 1 / 1.12;
+
+    if (e.metaKey) {
+      if (plus || minus) {
+        e.preventDefault();
+        if (e.shiftKey) resize(step); else scale(step);
+      } else if (e.key === '0') {
+        e.preventDefault();
+        zoom = screenEl.zoom(1);
+        var a = asked();
+        fit(a[0], a[1]);
+      } else if (e.key === '/' || e.key === '?') {
+        e.preventDefault();
+        help(!helping);
+      } else if (e.key === 's') {
+        e.preventDefault();
+        screenEl.toggleStats();
+      } else if (e.key === 'q' && host()) {
+        e.preventDefault();
+        ask('quit');
+      }
+      return;
+    }
+
+    /* Being typed into. The element forwards the key and marks it taken,
+       so there is nothing left for this to do. */
+    if (screenEl.allowed('keyboard')) return;
+
+    /* Nothing is listening, so the bare keys are the viewer's. One that
+       reaches the end of the responder chain unhandled is what makes
+       macOS ring the bell. */
+    if (host()) e.preventDefault();
+
+    if (e.key === '?') help(!helping);
+    else if (e.key === 'Escape' && helping) help(false);
+    else if ((e.key === 'q' || e.key === 'Escape') && host()) ask('quit');
+    else if (e.key === 's') screenEl.toggleStats();
+  });
+
+  /* A double tap, or a double click, takes the page full screen and back.
+     A browser grants full screen only to a gesture, and a tablet has no
+     key for it; a single tap stays the wall's, for a sender that asked for
+     touch. Two taps count as one double tap within 350 ms and 40 px. */
+  var lastTap = 0, lastX = 0, lastY = 0;
+  function fullscreen() {
+    var d = document, el = d.documentElement;
+    if (d.fullscreenElement || d.webkitFullscreenElement)
+      (d.exitFullscreen || d.webkitExitFullscreen).call(d);
+    else if (el.requestFullscreen || el.webkitRequestFullscreen)
+      (el.requestFullscreen || el.webkitRequestFullscreen).call(el);
+  }
+  addEventListener('pointerup', function (e) {
+    if (host()) return;
+    var now = e.timeStamp;
+    if (now - lastTap < 350 && Math.abs(e.clientX - lastX) < 40 && Math.abs(e.clientY - lastY) < 40) {
+      lastTap = 0;
+      fullscreen();
+    } else {
+      lastTap = now; lastX = e.clientX; lastY = e.clientY;
+    }
+  });
+</script>

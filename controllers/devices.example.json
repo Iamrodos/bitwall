@@ -1,0 +1,4 @@
+[
+  {"name": "pi", "host": "pi.local", "order": ["0", "1"]},
+  {"name": "mac", "host": "mac.local", "order": ["0"]}
+]

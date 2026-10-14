@@ -1,0 +1,33 @@
+{
+  "label": "HDMI in",
+  "description": "Whatever is plugged into a USB HDMI capture dongle on this host -- a laptop, another Pi, a console -- as a picture on the wall; it needs the dongle, and is offered only where one is plugged in",
+  "type": "video",
+  "place": "base",
+  "moves": true,
+  "start": "../hdmi/main.py",
+  "available": "../hdmi/available",
+  "options": {
+    "size": {"type": "choice", "label": "Source size",
+             "description": "What the source sends: the dongle stretches it to this, so match its shape",
+             "choices": ["1920x1080", "1280x720", "2560x1440", "1920x1200", "1024x768"],
+             "default": "1920x1080"},
+    "fps": {"type": "choice", "label": "Frames a second",
+            "description": "How often to capture; a still picture sends nothing however high",
+            "choices": ["10", "15", "30"], "default": "30"},
+    "align": {"type": "choice", "label": "Align",
+              "description": "Where the picture sits on a screen taller than its shape: against the top, centred, or against the bottom",
+              "choices": ["centre", "top", "bottom"], "default": "centre"},
+    "motion": {"type": "choice", "label": "Moving size",
+               "description": "How many lines high the picture is sent while it moves: smaller is decoded sooner on the wall and leaves it room for other video, and is softer while it moves; a still is always sent whole",
+               "choices": ["full", "720", "540"], "default": "full"},
+    "quality": {"type": "choice", "label": "Moving quality",
+                "description": "JPEG quality while the picture moves, 2 best to 31 worst: lower numbers are sharper and slower over wifi",
+                "choices": ["4", "6", "8", "12"], "default": "8"},
+    "sharpen": {"type": "choice", "label": "Sharpen",
+                "description": "How much to sharpen text once the picture stands still",
+                "choices": ["0", "0.6", "0.8", "1"], "default": "1"},
+    "rotate": {"type": "choice", "label": "Turn",
+               "description": "Turn the picture, for a source that is itself turned",
+               "choices": ["0", "90", "180", "270"], "default": "0"}
+  }
+}

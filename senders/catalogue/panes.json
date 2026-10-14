@@ -1,0 +1,9 @@
+{
+  "label": "Panes",
+  "description": "This wall cut into panes, each a wall of its own for any sender: start it, then split a pane with bitwall-ctl <host>:<wall>-main split right <name>",
+  "start": "../panes/main.py",
+  "options": {
+    "font": {"type": "font", "label": "Font size",
+             "description": "The wall's font, every pane's", "default": 14, "min": 6, "max": 40}
+  }
+}

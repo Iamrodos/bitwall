@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""A wall on this machine's own pipes, driven as a sender drives one.
+
+    tests/windows-pipes [--here]
+
+Run where the wall is: on Windows, where the pipes are named pipes, or on
+a Mac or a Pi, where they are fifos, the same checks either way. It
+starts the receiver core (`bitwall/receivers/core.py`) on a glass that
+shows nothing, under a run directory of its own, and checks, through the
+library and the relay as a sender reaches a wall:
+
+    a second claim of a live wall is refused
+    a controller opens, hears its report and `sessions`, and closes
+    a name already a session's is dropped, a wall that is not there absent
+    a sender's frames reach the wall's grid
+    a writer that goes is end of file, and the session is closed `eof`
+    a full `data` pipe holds its writer back rather than running ahead
+    the mirror reads a glass stream's frames whole off this machine's pipe
+
+and prints how long opening a session took. A sender on Windows opens a
+wall's pipes on its own machine in its own process; `--here` makes a Mac
+or a Pi do the same with its fifos, which it otherwise opens through `sh`
+and `cat`. `tests/bitwall-tests` runs it
+on the Windows host `BITWALL_WINDOWS_HOST` through ssh when it answers
+(WINDOWS.md).
+"""
+import os
+import subprocess
+import sys
+import threading
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+
+import bitwall                                                 # noqa: E402
+from bitwall import local, relay                               # noqa: E402
+from bitwall.receivers import core                             # noqa: E402
+from bitwall.session import Controller, NoWall, Session, Link  # noqa: E402
+
+
+class Glass:
+    """A glass that shows nothing and says so at once."""
+
+    def cells(self, data): pass
+    def frame(self, z, head, data): pass
+    def clear(self, z): pass
+    def kitty(self, head, data): pass
+    def changed(self): pass
+    def stats(self): pass
+    def look(self, w, h, done): done(None)
+
+
+def run_dir():
+    """A run directory of this test's own, so no real wall is touched."""
+    if local.PIPES:
+        return f"//./pipe/bitwall-test-{os.getpid()}"
+    import tempfile
+    return tempfile.mkdtemp(prefix="bw-pipes-")
+
+
+def until(test, seconds=5.0):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if test():
+            return True
+        time.sleep(0.02)
+    return test()
+
+
+def read_glass(run):
+    """Three raw frames written to a `glass` pipe as the painter writes
+    one, read by the mirror's own reader on a link as the mirror's: the
+    frames as it read them, and whether it read the pipe's end."""
+    import importlib.util
+    import posixpath
+    import struct
+    spec = importlib.util.spec_from_file_location(
+        "mirror_main", os.path.join(os.path.dirname(HERE), "senders", "mirror", "main.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    path = posixpath.join(run, "bitwall", "t", "s", f"glass-{os.getpid()}", "glass")
+    if not local.PIPES:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    end = local.make_out(path)
+
+    def paint():
+        for n in (1, 2, 3):
+            body = bytes([40 + n]) * (32 * 18) + bytes([128]) * (32 * 18 // 2)
+            data = memoryview(struct.pack("<4sIIQQI", b"BWG1", 32, 18, n, n * 1000, len(body))
+                              + body)
+            until_ = time.monotonic() + 10
+            while data and time.monotonic() < until_:
+                try:
+                    data = data[local.write(end, data):]
+                except BlockingIOError:
+                    time.sleep(0.01)
+        time.sleep(0.2)
+        local.close(end)
+    stop = threading.Event()
+    th = threading.Thread(target=paint, daemon=True)
+    th.start()
+    stream = type("Stream", (), {"path": path})()
+    src = m.Source("localhost:t", [], stop)
+    fd, proc = src._open(stream, path)
+    got, ended = [], False
+    try:
+        until_ = time.monotonic() + 10
+        while time.monotonic() < until_:
+            f = m.read_frame(fd, stop)
+            if f is not None:
+                got.append(f)
+            elif not th.is_alive():
+                ended = len(got) == 3
+                break
+            else:
+                time.sleep(0.01)
+    finally:
+        os.close(fd)
+        th.join(5)
+    return got, ended
+
+
+def main():
+    if "--here" in sys.argv[1:]:
+        made = Link.__init__
+
+        def here(self, *a, **kw):
+            made(self, *a, **kw)
+            self.here = self.local
+        Link.__init__ = here
+    run = run_dir()
+    os.environ["BITWALL_RUN"] = run
+    wall = core.Wall(run, "t", Glass(), timings=core.Timings(0.2),
+                     data=("qoi",))
+    wall.start()
+    results = []
+
+    def check(name, ok, note=""):
+        results.append(ok)
+        print(f"  {'ok  ' if ok else 'FAIL'}  {name}{('  ' + note) if note else ''}", flush=True)
+
+    try:
+        again = core.Wall(run, "t", Glass())
+        try:
+            again.start()
+            check("a second claim of a live wall is refused", False)
+            again.stop()
+        except core.ClaimRefused:
+            check("a second claim of a live wall is refused", True)
+
+        check("the wall is listed", local.walls(run) == ["t"], repr(local.walls(run)))
+
+        t = time.monotonic()
+        c = Controller("localhost:t")
+        c.open()
+        took = time.monotonic() - t
+        names = [m.name for m in c.report]
+        check("a controller opens and hears its report", "area" in names and "caps" in names,
+              f"opened in {took * 1000:.0f} ms")
+        said = [m.raw for m in c.ask("sessions")]
+        check("sessions lists it", any(c.name in x for x in said), repr(said[:2]))
+
+        dup = Session(Link("localhost:t"), c.name, "controller")
+        dup.open()
+        check("a name already a session's is dropped",
+              until(lambda: dup.state != "opening") and dup.state == "dropped", dup.state)
+        dup.kill()
+        c.close()
+        check("a controller closes", c.state == "closed" and c.closed == "asked",
+              f"{c.state} {c.closed}")
+
+        gone = Controller("localhost:nowhere")
+        try:
+            gone.open()
+            check("a wall that is not there is absent", False)
+        except NoWall:
+            check("a wall that is not there is absent", True)
+
+        t = time.monotonic()
+        w = bitwall.attach("localhost:t", min_frame=0.02)
+        w.set_source(bitwall.FunctionSource(
+            lambda cols, rows: [[bitwall.cell("W" if x == 0 and y == 0 else " ")
+                                 for x in range(cols)] for y in range(rows)]))
+        ok = until(lambda: wall.connected and wall.base is not None
+                   and wall.base.in_bytes > 0, 10)
+        check("a sender attaches and draws", ok, f"connected in {(time.monotonic() - t) * 1000:.0f} ms")
+        base = wall.base
+        w.detach()
+        check("a sender detaching is closed `asked`",
+              until(lambda: base is not None and base.state == "closed") and base.reason == "asked",
+              f"{base and base.state} {base and base.reason}")
+
+        # A writer that simply goes: end of file.
+        s = Session(Link("localhost:t"), f"eof-{os.getpid()}", "layer", {"z": 0})
+        s.open()
+        until(lambda: s.state == "open")
+        s.write(b"\x1b[0m")
+        until(lambda: wall.base is not None and wall.base.connected)
+        held = wall.base
+        s.pipe.close()
+        check("a writer that goes is end of file",
+              until(lambda: held is not None and held.state == "closed") and held.reason == "eof",
+              f"{held and held.state} {held and held.reason}")
+        s.kill()
+
+        # Backpressure on `data`: a wall that does not read it holds its writer.
+        layer = bitwall.layer("localhost:t", place="above", data=True, codec="qoi")
+        until(lambda: layer.open_now, 10)
+        slot = next((x for x in wall.sessions.values() if x.data), None)
+        if slot is not None:
+            slot.data_idle_until = time.monotonic() + 3600   # the wall stops reading it
+        sent = [0]
+        stop = threading.Event()
+
+        def pour():
+            chunk = b"\0" * 65536
+            while not stop.is_set():
+                n = layer.data_write(chunk, timeout=0.5)
+                if not n:
+                    continue
+                sent[0] += n
+        th = threading.Thread(target=pour, daemon=True)
+        th.start()
+        time.sleep(3)
+        a = sent[0]
+        time.sleep(2)
+        b = sent[0]
+        if slot is not None:
+            slot.data_idle_until = 0.0                       # and reads it again
+        flowed = until(lambda: sent[0] > b + (1 << 20), 10)
+        stop.set()
+        check("a full data pipe holds its writer back", a < 8 << 20 and b - a < 256 << 10,
+              f"{a >> 10} KB in before it stopped, {(b - a) >> 10} KB in the next 2 s")
+        check("and lets it go when the wall reads again", flowed,
+              f"{(sent[0] - b) >> 10} KB once it read")
+        layer.close()
+
+        # The mirror's reader on a glass stream's pipe, written as the
+        # painter writes it: frames whole, and its end the stream's end.
+        got, ended = read_glass(run)
+        check("the mirror reads a glass stream's frames whole",
+              [f[:3] for f in got] == [(32, 18, n) for n in (1, 2, 3)]
+              and all(f[4][0] == 40 + f[2] for f in got), repr([f[:4] for f in got]))
+        check("and its end is the stream's end", ended)
+    finally:
+        wall.remove()
+    print(f"{sum(results)} passed, {len(results) - sum(results)} failed", flush=True)
+    return 0 if all(results) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

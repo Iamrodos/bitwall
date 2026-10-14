@@ -1,0 +1,10 @@
+{
+  "label": "Snake",
+  "description": "A snake that plays itself, eating its way round the board",
+  "start": "../games/snake/main.py",
+  "moves": true,
+  "options": {
+    "font": {"type": "font", "label": "Font size",
+             "description": "Cell size on the wall", "default": 18, "min": 6, "max": 40}
+  }
+}

@@ -1,0 +1,101 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.14"
+# ///
+"""A plasma, sent as DDP, standing in for real LED software.
+
+    senders/leds/pattern --size 32x16 127.0.0.1
+
+Nothing here is part of bitwall, and that is what it demonstrates: this
+talks to `senders/leds/main.py` over the wire WLED and LedFx use, so
+anything else that speaks it works the same way. Point xLights or LedFx at
+the same address instead and this script becomes unnecessary.
+
+The pattern is the classic plasma -- a few sine fields summed and read as a
+hue -- because it is four lines of arithmetic, it never repeats exactly,
+and it exercises every pixel every frame, which is the hardest case for
+whatever is drawing it.
+"""
+import argparse
+import math
+import socket
+import struct
+import sys
+import time
+
+
+def hsv(h, s, v):
+    """One colour as (r, g, b), hue in turns."""
+    i = int(h * 6) % 6
+    f = h * 6 - int(h * 6)
+    p, q, t = v * (1 - s), v * (1 - s * f), v * (1 - s * (1 - f))
+    r, g, b = ((v, t, p), (q, v, p), (p, v, t),
+               (p, q, v), (t, p, v), (v, p, q))[i]
+    return int(r * 255), int(g * 255), int(b * 255)
+
+
+def plasma(w, h, t):
+    """One frame of pixels, row major."""
+    out = bytearray()
+    for y in range(h):
+        for x in range(w):
+            v = (math.sin(x / 3.0 + t)
+                 + math.sin(y / 2.0 - t * 0.7)
+                 + math.sin((x + y) / 4.0 + t * 1.3)
+                 + math.sin(math.hypot(x - w / 2, y - h / 2) / 3.0 - t * 2))
+            out += bytes(hsv((v / 8.0 + 0.5) % 1.0, 0.85, 1.0))
+    return bytes(out)
+
+
+#: Bytes of pixel in one packet. A datagram has to clear whatever the
+#: sending machine will pass -- macOS refuses anything over 9216 by
+#: default -- and 1440 keeps a packet inside one ethernet frame as well,
+#: which is what every LED controller settles on.
+CHUNK = 1440
+
+
+def ddp(offset, payload, last):
+    """One DDP packet: ten bytes of header, then the pixels.
+
+    `push` marks the end of a frame, so it goes on the last packet only.
+    A receiver that acted on every one would show a frame in stripes as it
+    arrived rather than whole.
+    """
+    head = bytearray(10)
+    head[0] = 0x41 if last else 0x40        # version 1, push on the last
+    head[2] = 0x0B                 # RGB, 8 bits a channel
+    head[3] = 1                    # the default output
+    struct.pack_into(">I", head, 4, offset)
+    struct.pack_into(">H", head, 8, len(payload))
+    return bytes(head) + payload
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("host", nargs="?", default="127.0.0.1")
+    ap.add_argument("--size", default="32x16")
+    ap.add_argument("--port", type=int, default=4048)
+    ap.add_argument("--fps", type=float, default=30.0)
+    args = ap.parse_args()
+
+    w, h = (int(v) for v in args.size.lower().split("x"))
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    wait = 1.0 / max(1.0, args.fps)
+    print(f"plasma -> {args.host}:{args.port}  {w}x{h} over DDP at "
+          f"{args.fps:g}fps  (ctrl-c to stop)", flush=True)
+    start = time.monotonic()
+    try:
+        while True:
+            frame = plasma(w, h, (time.monotonic() - start) * 0.9)
+            for at in range(0, len(frame), CHUNK):
+                part = frame[at:at + CHUNK]
+                sock.sendto(ddp(at, part, at + CHUNK >= len(frame)),
+                            (args.host, args.port))
+            time.sleep(wait)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

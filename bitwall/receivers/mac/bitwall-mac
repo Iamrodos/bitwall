@@ -1,0 +1,200 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.14"
+# dependencies = ["aiohttp", "pywebview"]
+# ///
+"""A bitwall receiver in a Mac window, painted by a web view.
+
+Accepts a font size, publishes the area it can offer in cells, and paints
+the stream it is given.
+
+    bitwall/receivers/mac/bitwall-mac [--size COLSxROWS] [--wall NAME]
+                                     [--run DIR] [--touch] [--keyboard]
+
+The window is the wall `mac` unless named, in the host's run directory,
+so a sender and a controller find it as they find any other:
+
+    senders/hello.py localhost:mac
+
+One process. The window is a WKWebView showing the web receiver's page,
+served from a socket this process opens on the loopback address, so the
+parser and the painter are the same files a browser uses and a fix to
+either lands in both. The wall, its door and its sessions are the web
+receiver's, imported rather than written again.
+
+Nothing listens on the network: the socket is bound to 127.0.0.1 on a port
+the kernel picks, and the port is never published.
+"""
+import argparse
+import asyncio
+import os
+import shutil
+import signal
+import socket
+import sys
+import threading
+
+import webview
+from aiohttp import web
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
+sys.path.insert(0, ROOT)
+from bitwall.receivers import mac as defaults              # noqa: E402
+from bitwall.receivers import web as receiver              # noqa: E402
+
+
+def serve(run, name, sock, host):
+    """Run the web receiver on a loopback socket, in this thread.
+
+    The socket is bound by the caller rather than by the site, so the port
+    is known before the loop starts and the window has somewhere to point.
+
+    What the page may ask of the window is served from here rather than
+    through pywebview's javascript bridge. The bridge holds the calling
+    thread until it can hand a return value back into the page, which a
+    window that has just been told to close can no longer take -- and that
+    thread is not a daemon, so the process then cannot exit. Nothing here
+    has anything to return.
+    """
+    async def run_forever():
+        _, app = receiver.server().build(run, [name], program="bitwall-mac")
+        app.router.add_get("/host/quit", host.on_quit)
+        app.router.add_get("/host/fit", host.on_fit)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        await web.SockSite(runner, sock).start()
+        await asyncio.Event().wait()
+
+    asyncio.run(run_forever())
+
+
+class Host:
+    """What the page may ask of the window it is hosted in.
+
+    The page knows how big a cell is and the window knows how big it is in
+    pixels, and neither can work out the other's business alone -- so
+    sizing is a request from the page rather than a setting here.
+    """
+
+    def __init__(self):
+        self.window = None
+        self.want = None
+        self.running = False
+        self.lock = threading.Lock()
+
+    def _later(self, fn, *a):
+        threading.Thread(target=fn, args=a, daemon=True).start()
+
+    def quit(self):
+        if self.window:
+            self._later(self.window.destroy)
+
+    async def on_quit(self, request):
+        self.quit()
+        return web.Response(text="")
+
+    async def on_fit(self, request):
+        try:
+            self.fit(request.query["w"], request.query["h"])
+        except (KeyError, ValueError):
+            raise web.HTTPBadRequest(text="w and h, in pixels\n")
+        return web.Response(text="")
+
+    def fit(self, width, height):
+        """Resize to what the page measured, one resize at a time.
+
+        A resize changes the box, which the page measures again, which can
+        ask for another -- so the latest request wins and the rest are
+        dropped rather than queued behind it.
+        """
+        if not self.window:
+            return
+        with self.lock:
+            self.want = (int(width), int(height))
+            if self.running:
+                return
+            self.running = True
+        self._later(self._settle)
+
+    def _settle(self):
+        while True:
+            with self.lock:
+                size, self.want = self.want, None
+                if size is None:
+                    self.running = False
+                    return
+            try:
+                self.window.resize(*size)
+            except Exception:
+                with self.lock:
+                    self.running = False
+                return
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--run", default=defaults.RUN,
+                    help="the run directory the wall is kept in, as RUN/bitwall/<wall>")
+    ap.add_argument("--wall", default=defaults.WALL,
+                    help="the wall's name, as a sender names it: localhost:<wall>")
+    ap.add_argument("--size", default="100x30", metavar="COLSxROWS",
+                    help="the grid to open at, before a sender asks")
+    ap.add_argument("--font-size", type=int, default=14,
+                    help="cell size until a sender asks for one")
+    ap.add_argument("--touch", action="store_true",
+                    help="offer taps to a sender that asks for them")
+    ap.add_argument("--keyboard", action="store_true",
+                    help="offer keystrokes to a sender that asks")
+    ap.add_argument("--fullscreen", action="store_true")
+    ap.add_argument("--framed", action="store_true",
+                    help="keep the title bar")
+    args = ap.parse_args()
+
+    try:
+        cols, rows = (int(n) for n in args.size.lower().split("x"))
+    except ValueError:
+        ap.error("--size takes COLSxROWS, as in 100x30")
+
+    def gone(*_):
+        """The wall goes with the window, however the window goes."""
+        shutil.rmtree(os.path.join(args.run, "bitwall", args.wall), ignore_errors=True)
+        os._exit(0)
+
+    # The window's run loop never hands a signal to Python, so SIGTERM is
+    # taken by a thread of its own, blocked everywhere else.
+    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGHUP})
+    threading.Thread(target=lambda: gone(signal.sigwait({signal.SIGTERM, signal.SIGHUP})),
+                     daemon=True).start()
+
+    sock = socket.socket()
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(16)
+    port = sock.getsockname()[1]
+
+    name = args.wall
+    host = Host()
+    threading.Thread(target=serve, daemon=True,
+                     args=(args.run, name, sock, host)).start()
+
+    query = (f"?cols={cols}&rows={rows}&font={args.font_size}"
+             f"&touch={int(args.touch)}&keyboard={int(args.keyboard)}"
+             f"&host=1")
+    url = f"http://127.0.0.1:{port}/r/{name}{query}"
+    print(f"bitwall-mac  run={args.run}  {cols}x{rows} at font "
+          f"{args.font_size}  {url}", flush=True)
+
+    # An opening size in pixels is a guess; the page measures a cell and
+    # asks for the window that fits the grid.
+    host.window = webview.create_window(
+        "bitwall", url, width=max(320, cols * 9), height=max(200, rows * 18),
+        frameless=not args.framed, fullscreen=args.fullscreen,
+        background_color="#000000")
+
+    webview.start()
+    gone()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

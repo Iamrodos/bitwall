@@ -1,0 +1,33 @@
+[package]
+name = "bitwall-eink"
+version = "1.0.0"
+edition = "2021"
+description = "a bitwall wall on electronic paper: cells, cells layers and pictures composed in 16 greys and pushed to an IT8951 panel"
+publish = false
+
+[features]
+default = ["it8951"]
+# The IT8951 driver, over the Pi's SPI and GPIO; built on Linux only.
+it8951 = ["dep:rppal"]
+
+[dependencies]
+skrifa = "0.44"
+zeno = "0.3"
+png = "0.17"
+bitwall-receiver = { path = "../core-rs", features = ["decode"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[build-dependencies]
+sha2 = "0.10"
+
+[[bin]]
+name = "bitwall-eink"
+path = "src/bin/bitwall-eink/main.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rppal = { version = "0.22", optional = true }
+
+[profile.release]
+strip = true

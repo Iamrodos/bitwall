@@ -1,0 +1,25 @@
+# The walls on this Pi's screens, from boot: a user service, so it runs
+# with the user's runtime directory and groups as a login would, and
+# lingering starts it with no login at all. ~/bitwall/start is the one
+# file that differs between Pis: the font and what each wall follows for
+# presence.
+#
+#     mkdir -p ~/.config/systemd/user
+#     cp bitwall-screen.service ~/.config/systemd/user/
+#     sudo loginctl enable-linger $USER
+#     systemctl --user enable --now bitwall-screen
+#
+# Restart it with `systemctl --user restart bitwall-screen`.
+
+[Unit]
+Description=bitwall walls on this Pi's screens
+
+[Service]
+ExecStart=%h/bitwall/start
+Restart=on-failure
+RestartSec=3
+StandardOutput=append:%h/bitwall-screen.log
+StandardError=inherit
+
+[Install]
+WantedBy=default.target

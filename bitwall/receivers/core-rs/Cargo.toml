@@ -1,0 +1,29 @@
+[package]
+name = "bitwall-receiver"
+version = "1.0.0"
+edition = "2021"
+description = "a bitwall wall's door, sessions, grids and layers, for a receiver to give a glass"
+publish = false
+
+[lib]
+name = "bitwall_receiver"
+
+[features]
+# Pictures on a video layer decoded to RGBA, for a receiver that composes
+# them itself. A receiver with no pixels leaves it off.
+decode = ["dep:qoi", "dep:png", "dep:zune-jpeg"]
+
+[dependencies]
+qoi = { version = "0.4", optional = true }
+png = { version = "0.17", optional = true }
+zune-jpeg = { version = "0.4", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Threading", "Win32_System_Console", "Win32_System_SystemInformation"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[[example]]
+name = "headless"
+required-features = ["decode"]

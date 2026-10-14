@@ -1,0 +1,15 @@
+{
+  "label": "Pictures",
+  "description": "Pictures one at a time, with the label underneath: museum art, NASA, Pepper&Carrot and any series the host keeps in ~/.bitwall/picture.json",
+  "start": "../picture/main.py",
+  "options": {
+    "font": {"type": "font", "label": "Font size",
+             "description": "Cell size on the wall", "default": 10, "min": 6, "max": 40},
+    "category": {"type": "choice", "label": "Category",
+                 "description": "What kind of picture: art is the museum's, everything is all of them",
+                 "choices": ["art", "popular", "japanese", "space", "anime", "everything"], "default": "art"},
+    "mode": {"type": "choice", "label": "Picture mode",
+             "description": "How a cell is made of pixels: half is colour, fine is detail",
+             "choices": ["half", "quad", "braille", "ascii", "fine"], "default": "fine"}
+  }
+}

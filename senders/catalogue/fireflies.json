@@ -1,0 +1,19 @@
+{
+  "label": "Fireflies",
+  "description": "Fireflies drifting and blinking over whatever the base shows, now and then falling into step, a video layer",
+  "type": "video",
+  "place": "above",
+  "start": "../fireflies/main.py",
+  "moves": true,
+  "options": {
+    "colour": {"type": "choice", "label": "Colour",
+               "description": "Warm yellow-green with some amber, a cooler green, or blue ghosts that glow low and steady",
+               "choices": ["warm", "green", "blue"], "default": "warm"},
+    "count": {"type": "choice", "label": "How many",
+              "description": "How many fireflies, or auto to size them to the glass",
+              "choices": ["auto", "12", "24", "40", "60"], "default": "auto"},
+    "fps": {"type": "choice", "label": "Frames a second",
+            "description": "How many frames a second are sent; 10 is kindest to a Pi 3",
+            "choices": ["10", "15", "20", "30"], "default": "15"}
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "label": "ANSI art",
+  "description": "ANSI art from the BBS scene, a piece at a time, tall ones panned",
+  "start": "../ansi/main.py",
+  "moves": true,
+  "options": {
+    "font": {"type": "font", "label": "Font size",
+             "description": "Cell size on the wall", "default": 12, "min": 6, "max": 40},
+    "in-order": {"type": "bool", "label": "In order",
+                 "description": "Show the pieces in name order rather than shuffled",
+                 "default": false}
+  }
+}

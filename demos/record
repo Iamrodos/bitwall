@@ -1,0 +1,156 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = []
+# ///
+"""A wall's glass recorded to a video file, every layer as it is shown.
+
+    demos/record localhost:reel reel.mp4
+    demos/record --size 960x540 --fps 10 --seconds 30 localhost:reel reel.mp4
+
+A controller session on the wall asks for its glass as a raw stream
+(PROTOCOL.md, *The glass as a raw stream*) and ffmpeg encodes it,
+H.264 at near-lossless quality, so a GIF or a still made from the file
+afterwards loses nothing to it. The wall draws a frame every 1/fps and
+lets go of one the reader was not ready for, numbering through the gap,
+so a frame missed is written again as the one before it: the file's
+clock is the wall's, and a scene recorded for ten seconds plays for ten.
+
+It records until `--seconds` have passed, or SIGINT or SIGTERM, then
+closes the file whole. Only a wall that says `stream` in its `caps` can
+be recorded: the painter where it draws on a GPU, a headless one
+(`--driver none --glass 1920x1080`) among them.
+"""
+import argparse
+import os
+import signal
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, ".."))
+import bitwall                                                  # noqa: E402
+
+HEADER = struct.Struct("<4sIIqqI")
+
+
+def log(*parts):
+    print(time.strftime("%H:%M:%S"), *parts, flush=True)
+
+
+def read_full(fh, n):
+    """Exactly `n` bytes, or None where the stream ended first."""
+    buf = bytearray()
+    while len(buf) < n:
+        got = fh.read(n - len(buf))
+        if not got:
+            return None
+        buf += got
+    return bytes(buf)
+
+
+def parse(argv):
+    ap = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
+    ap.add_argument("--size", default="960x540",
+                    help="the recording's size, even on both sides (default 960x540)")
+    ap.add_argument("--fps", type=int, default=10,
+                    help="frames a second, 1 to 60 (default 10)")
+    ap.add_argument("--seconds", type=float, default=None,
+                    help="how long to record (default until stopped)")
+    ap.add_argument("--crf", type=int, default=10,
+                    help="x264's quality, lower is better (default 10)")
+    ap.add_argument("--no-overlay", dest="overlay", action="store_false",
+                    help="leave out the wall's own stats overlay, which is "
+                         "recorded as it is shown unless told")
+    ap.add_argument("target", help="the wall, host:wall")
+    ap.add_argument("out", help="the file to write, .mp4 or .mkv")
+    a = ap.parse_args(argv)
+    try:
+        a.w, a.h = (int(v) for v in a.size.lower().split("x"))
+    except ValueError:
+        ap.error(f"--size {a.size!r}: WxH")
+    if a.w % 2 or a.h % 2:
+        ap.error(f"--size {a.size}: even on both sides")
+    return a
+
+
+def main():
+    a = parse(sys.argv[1:])
+    stop = threading.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: stop.set())
+
+    c = bitwall.Controller(a.target).open()
+    ask = (f"mirror glass stream=i420 size={a.w}x{a.h} fps={a.fps}"
+           + (" overlay=1" if a.overlay else ""))
+    errors = [x.raw for x in c.ask(ask, timeout=2)
+              if getattr(x, "name", None) == "error"]
+    if errors:
+        log(f"{a.target}: {errors[0]}")
+        c.close()
+        return 1
+    fifo = os.path.join(c.link.session_dir(c.name), "glass")
+    for _ in range(50):
+        if os.path.exists(fifo):
+            break
+        time.sleep(0.05)
+    log(f"recording {a.target} at {a.w}x{a.h} {a.fps}fps from {fifo} to {a.out}")
+
+    ff = subprocess.Popen(
+        ["ffmpeg", "-loglevel", "error", "-y",
+         "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", f"{a.w}x{a.h}",
+         "-r", str(a.fps), "-i", "-",
+         "-c:v", "libx264", "-preset", "medium", "-crf", str(a.crf),
+         "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
+         "-pix_fmt", "yuv420p", "-movflags", "+faststart", a.out],
+        stdin=subprocess.PIPE)
+    # The session is kept, its pings answered, while frames are read.
+    def listen():
+        while not stop.is_set() and c.state == "open":
+            c.read(timeout=0.5)
+    threading.Thread(target=listen, daemon=True).start()
+
+    frame = a.w * a.h * 3 // 2
+    written, repeated, first, last = 0, 0, None, None
+    started = time.monotonic()
+    with open(fifo, "rb", buffering=0) as fh:
+        while not stop.is_set():
+            if a.seconds is not None and time.monotonic() - started >= a.seconds:
+                break
+            head = read_full(fh, HEADER.size)
+            if head is None:
+                log("the stream ended")
+                break
+            magic, w, h, n, _, size = HEADER.unpack(head)
+            if magic != b"BWG1" or (w, h) != (a.w, a.h) or size != frame:
+                log(f"unexpected frame header {magic!r} {w}x{h} {size}")
+                break
+            body = read_full(fh, size)
+            if body is None:
+                log("the stream ended mid-frame")
+                break
+            if first is None:
+                first = n
+            # A gap in the numbers is frames the wall let go: the last
+            # one shown stands for them.
+            if last is not None and n > last + 1:
+                for _ in range(n - last - 1):
+                    ff.stdin.write(prev)
+                    repeated += 1
+            ff.stdin.write(body)
+            written += 1
+            prev, last = body, n
+    c.close()
+    ff.stdin.close()
+    ff.wait()
+    total = written + repeated
+    log(f"wrote {total} frames, {total / a.fps:.1f} s, {repeated} of them "
+        f"repeated for frames missed, to {a.out}")
+    return 0 if ff.returncode == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

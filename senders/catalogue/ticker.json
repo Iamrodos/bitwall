@@ -1,0 +1,18 @@
+{
+  "label": "Ticker",
+  "description": "The time, and the weather where the host is (~/.bitwall/place.json), on a band along the top or bottom of the wall, a cells layer over whatever the base shows",
+  "type": "cells",
+  "place": "above",
+  "start": "../ticker/main.py",
+  "options": {
+    "at": {"type": "choice", "label": "Along",
+           "description": "The edge of the wall the band runs along",
+           "choices": ["top", "bottom"], "default": "top"},
+    "font": {"type": "choice", "label": "Text size",
+             "description": "The band's own font size, or base to use the grid of whatever is beneath",
+             "choices": ["base", "10", "14", "18", "22", "28", "36"], "default": "base"},
+    "speed": {"type": "choice", "label": "Speed",
+              "description": "Cells a second the weather moves past",
+              "choices": ["3", "6", "10", "15"], "default": "6"}
+  }
+}

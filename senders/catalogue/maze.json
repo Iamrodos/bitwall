@@ -1,0 +1,10 @@
+{
+  "label": "Maze",
+  "description": "A maze that draws itself, then is solved several ways over",
+  "start": "../maze/main.py",
+  "moves": true,
+  "options": {
+    "font": {"type": "font", "label": "Font size",
+             "description": "Cell size on the wall", "default": 14, "min": 6, "max": 40}
+  }
+}

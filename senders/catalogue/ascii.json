@@ -1,0 +1,12 @@
+{
+  "label": "ASCII animations",
+  "description": "Classic terminal animations, one after another: fish tanks, pipes, parrots",
+  "start": "../ascii/main.py",
+  "options": {
+    "font": {"type": "font", "label": "Font size",
+             "description": "Cell size on the wall", "default": 22, "min": 6, "max": 40},
+    "secs": {"type": "choice", "label": "Seconds each",
+             "description": "How long each animation plays before the next",
+             "choices": ["15", "30", "60", "120", "300"], "default": "30"}
+  }
+}

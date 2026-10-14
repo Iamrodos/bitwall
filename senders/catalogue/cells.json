@@ -1,0 +1,14 @@
+{
+  "label": "Cells",
+  "description": "Soft organisms that drift, split, merge and die",
+  "start": "../games/cells/main.py",
+  "moves": true,
+  "options": {
+    "font": {"type": "font", "label": "Font size",
+             "description": "Cell size on the wall", "default": 18, "min": 6, "max": 40},
+    "kinds": {"type": "choice", "label": "Kinds",
+              "description": "Which kinds of organism are born",
+              "choices": ["drifter,swimmer,mote", "drifter", "swimmer", "mote"],
+              "default": "drifter,swimmer,mote"}
+  }
+}
