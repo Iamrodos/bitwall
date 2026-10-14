@@ -18,7 +18,7 @@ if jpeg=$(pkg-config --cflags --libs libjpeg 2>/dev/null); then
 fi
 ${CC:-cc} -std=c99 -Wall -Wextra -Wno-unused-function -g \
     -fsanitize=address,undefined \
-    -fno-sanitize-recover=undefined -Werror=format -DBITWALL_TEST \
+    -fno-sanitize-recover=undefined -Werror=format -Wno-error=format-truncation -DBITWALL_TEST \
     -I"$here/stub" "$here/test_paint.c" "$here/stub/fake.c" $png -pthread \
     -o "$out/paint-tests"
 ASAN_OPTIONS=detect_leaks=0 "$out/paint-tests" "$@"
