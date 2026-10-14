@@ -17,8 +17,8 @@ What a wall can show, from the senders here:
 - **dashboards and text** in cells, truecolor, with big text in eleven
   fonts (`senders/sysinfo`, `senders/letters`)
 - **self-playing games** and animation (`senders/games`, `senders/fluid`)
-- **pictures and films**: a JPEG on a layer, a film decoded on the Pi's own
-  hardware, one film cut across several screens (`senders/picture`,
+- **pictures and films**: a JPEG on a layer, a film decoded on the
+  receiver's own hardware, one film cut across several screens (`senders/picture`,
   `senders/film`)
 - **HDMI in** from a laptop through a capture dongle (`senders/hdmi`)
 - **one wall shown on others** as video, encoded on the source's host and
@@ -557,11 +557,10 @@ to a status page; the sender attaches again on its own when the wall comes
 back. All data generation, credentials and API access stay on the trusted
 machine.
 
-**The wall runs no tmux.** tmux requires client and server to be the
-exact same version, and a sender and a Pi rarely have the same one. So the
-sender runs the tmux client itself inside a pty, decodes it with a headless
-terminal emulator into a grid of cells, and ships the cells. The wall needs
-only something that can paint them.
+**A wall needs only something that paints cells.** Whatever makes the
+picture runs on the sender, so a wall never needs a program, its libraries
+or a matching version of anything. Even a terminal program is run on the
+sender: `TmuxSource` runs it there and reads its screen into cells.
 
 **The receiver owns its area.** The sender requests a font size; the area
 that produces is a fact the receiver publishes, and it can change without
@@ -575,7 +574,7 @@ stands still costs nothing on the wire. A bare `ESC[0m` marks where a frame
 ends, so a receiver paints whole frames, never half of one.
 
 **A film is decoded on the wall.** The sender writes the encoded stream;
-the wall decodes it (on the Pi's own hardware decoder) and plays frame i at
+the wall decodes it (on the receiver's hardware decoder where it has one) and plays frame i at
 start + i/fps on its own clock, so the sender never paces a film and walls
 whose clocks agree play one together.
 
