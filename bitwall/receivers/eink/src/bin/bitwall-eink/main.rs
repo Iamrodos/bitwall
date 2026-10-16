@@ -8,11 +8,14 @@
 //! and pushes to the panel when its policy says.
 //!
 //!     bitwall-eink [--font <n>] [--rotate 0|90|180|270] [--mirror]
-//!                  [--vcom <volts>] [--presence <name>] [--panel it8951|file:DIR] [--glass WxH]
+//!                  [--vcom <volts>] [--presence <name>] [--panel spi|usb|file:DIR] [--glass WxH]
 //!                  [--paper|--screen] [wall]          wall `paper` unless named
 //!     bitwall-eink --cell <font>                       a cell's pixels at a font
 //!
-//! `--panel file:DIR` writes every push to DIR as a PNG and a line of log,
+//! `--panel spi` is the IT8951 HAT on a Pi's SPI, the default there;
+//! `--panel usb` the same board on USB, on any machine, root on a Mac to
+//! take it from the system's disk driver, and run under sudo it goes back
+//! to the user who ran sudo once the board is open. `--panel file:DIR` writes every push to DIR as a PNG and a line of log,
 //! the panel `--glass` pixels (1872x1404 unless given), and is the panel
 //! on a machine with no IT8951; a line `glass WxH` on its stdin gives it
 //! another size. BITWALL_RUN puts the walls elsewhere. SIGTERM or SIGINT
@@ -59,11 +62,14 @@ fn fail(msg: &str) -> ! {
     std::process::exit(1);
 }
 
-/// Where pushes go: a directory of PNGs, or the IT8951 on a Pi's SPI.
+/// Where pushes go: a directory of PNGs, or the IT8951 on a Pi's SPI or
+/// on USB.
 enum AnyPanel {
     File(FilePanel),
     #[cfg(all(target_os = "linux", feature = "it8951"))]
     It(bitwall_eink::panel::it8951::It8951),
+    #[cfg(feature = "usb")]
+    Usb(bitwall_eink::panel::usb::Usb),
 }
 
 impl Panel for AnyPanel {
@@ -72,6 +78,8 @@ impl Panel for AnyPanel {
             AnyPanel::File(p) => p.size(),
             #[cfg(all(target_os = "linux", feature = "it8951"))]
             AnyPanel::It(p) => p.size(),
+            #[cfg(feature = "usb")]
+            AnyPanel::Usb(p) => p.size(),
         }
     }
 
@@ -80,6 +88,8 @@ impl Panel for AnyPanel {
             AnyPanel::File(p) => p.clear(),
             #[cfg(all(target_os = "linux", feature = "it8951"))]
             AnyPanel::It(p) => p.clear(),
+            #[cfg(feature = "usb")]
+            AnyPanel::Usb(p) => p.clear(),
         }
     }
 
@@ -88,6 +98,8 @@ impl Panel for AnyPanel {
             AnyPanel::File(p) => p.push(r, grey, mode),
             #[cfg(all(target_os = "linux", feature = "it8951"))]
             AnyPanel::It(p) => p.push(r, grey, mode),
+            #[cfg(feature = "usb")]
+            AnyPanel::Usb(p) => p.push(r, grey, mode),
         }
     }
 
@@ -96,6 +108,18 @@ impl Panel for AnyPanel {
             AnyPanel::File(p) => p.sleep(),
             #[cfg(all(target_os = "linux", feature = "it8951"))]
             AnyPanel::It(p) => p.sleep(),
+            #[cfg(feature = "usb")]
+            AnyPanel::Usb(p) => p.sleep(),
+        }
+    }
+
+    fn reset(&mut self) -> io::Result<()> {
+        match self {
+            AnyPanel::File(p) => p.reset(),
+            #[cfg(all(target_os = "linux", feature = "it8951"))]
+            AnyPanel::It(p) => p.reset(),
+            #[cfg(feature = "usb")]
+            AnyPanel::Usb(p) => p.reset(),
         }
     }
 }
@@ -450,7 +474,7 @@ fn main() {
     let mut options = Options::default();
     let mut vcom: Option<u16> = None;
     let mut presence: Option<String> = None;
-    let mut panel = if cfg!(all(target_os = "linux", feature = "it8951")) { "it8951".to_string() } else { "file:eink-panel".to_string() };
+    let mut panel = if cfg!(all(target_os = "linux", feature = "it8951")) { "spi".to_string() } else { "file:eink-panel".to_string() };
     let mut glass = PANEL;
     let mut name = "paper".to_string();
     let mut args = std::env::args().skip(1);
@@ -469,7 +493,7 @@ fn main() {
                 let v: f64 = val("volts").parse().unwrap_or_else(|_| fail("--vcom wants volts, -1.17"));
                 vcom = Some((v.abs() * 1000.0).round() as u16);
             }
-            "--panel" => panel = val("it8951 or file:DIR"),
+            "--panel" => panel = val("spi, usb or file:DIR"),
             "--glass" => glass = size(&val("WxH")).unwrap_or_else(|| fail("--glass wants WxH")),
             "--cell" => {
                 let f: u32 = val("a font").parse().unwrap_or_else(|_| fail("--cell wants a font"));
@@ -479,7 +503,7 @@ fn main() {
                 return;
             }
             "-h" | "--help" => {
-                println!("usage: bitwall-eink [--font <n>] [--rotate 0|90|180|270] [--mirror] [--vcom <volts>] [--presence <name>] [--panel it8951|file:DIR] [--glass WxH] [--paper|--screen] [wall]");
+                println!("usage: bitwall-eink [--font <n>] [--rotate 0|90|180|270] [--mirror] [--vcom <volts>] [--presence <name>] [--panel spi|usb|file:DIR] [--glass WxH] [--paper|--screen] [wall]");
                 return;
             }
             _ if a.starts_with('-') => fail(&format!("{a}: unknown option")),
@@ -492,9 +516,11 @@ fn main() {
     let file_dir = panel.strip_prefix("file:").map(PathBuf::from);
     let (the_panel, render) = match &file_dir {
         Some(dir) => (AnyPanel::File(FilePanel::new(dir, glass.0, glass.1).unwrap_or_else(|e| fail(&format!("{}: {e}", dir.display())))), "file"),
-        None if panel == "it8951" => open_it8951(vcom),
-        None => fail(&format!("{panel}: not a panel, it8951 or file:DIR")),
+        None if panel == "spi" => open_it8951(vcom),
+        None if panel == "usb" => open_usb(vcom),
+        None => fail(&format!("{panel}: not a panel, spi, usb or file:DIR")),
     };
+    drop_root();
     let (pw, ph) = the_panel.size();
     let eink = Eink::new(the_panel, options);
     let glyphs: Vec<&str> = ASK.iter().filter(|(_, cp)| eink.draws(*cp)).map(|(s, _)| *s).collect();
@@ -667,3 +693,35 @@ fn open_it8951(vcom: Option<u16>) -> (AnyPanel, &'static str) {
 fn open_it8951(_vcom: Option<u16>) -> (AnyPanel, &'static str) {
     fail("it8951: built without the panel's driver, which is on Linux alone")
 }
+
+#[cfg(feature = "usb")]
+fn open_usb(vcom: Option<u16>) -> (AnyPanel, &'static str) {
+    use bitwall_eink::panel::usb::Usb;
+    let p = Usb::open(vcom).unwrap_or_else(|e| fail(&format!("usb: {e}")));
+    log!("it8951 on usb {}x{} version {:#x} vcom -{:.2} V", p.w, p.h, p.version, vcom.unwrap_or(bitwall_eink::tune::VCOM_MV) as f64 / 1000.0);
+    (AnyPanel::Usb(p), "usb")
+}
+
+#[cfg(not(feature = "usb"))]
+fn open_usb(_vcom: Option<u16>) -> (AnyPanel, &'static str) {
+    fail("usb: built without the usb feature")
+}
+
+/// Run under sudo, as a panel on USB needs on a Mac, become the user who
+/// ran it once the panel is open, so the walls are theirs.
+#[cfg(unix)]
+fn drop_root() {
+    if unsafe { libc::geteuid() } != 0 {
+        return;
+    }
+    let id = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u32>().ok());
+    let (Some(uid), Some(gid)) = (id("SUDO_UID"), id("SUDO_GID")) else { return };
+    let ok = unsafe { libc::setgroups(1, &(gid as libc::gid_t)) == 0 && libc::setgid(gid) == 0 && libc::setuid(uid) == 0 };
+    if !ok {
+        fail(&format!("could not become uid {uid}: {}", io::Error::last_os_error()));
+    }
+    log!("running as uid {uid}");
+}
+
+#[cfg(not(unix))]
+fn drop_root() {}

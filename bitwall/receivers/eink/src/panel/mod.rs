@@ -1,6 +1,7 @@
 //! Where a push goes: a panel, behind one small trait. `file` writes each
-//! push as a picture and a line of log, for tests and for a Mac; `it8951`
-//! is the Waveshare HAT on a Pi's SPI.
+//! push as a picture and a line of log, for tests and for a machine with
+//! no panel; `it8951` is the Waveshare HAT on a Pi's SPI, `usb` the same
+//! board on USB.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
@@ -12,6 +13,8 @@ use crate::policy::{Clean, Mode};
 
 #[cfg(all(target_os = "linux", feature = "it8951"))]
 pub mod it8951;
+#[cfg(feature = "usb")]
+pub mod usb;
 
 pub trait Panel {
     /// The panel's pixels, as it scans, seen from the front.

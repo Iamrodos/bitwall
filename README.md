@@ -112,7 +112,7 @@ Receivers run from a clone. Versions and releases: [RELEASING.md](RELEASING.md).
 | `bitwall/receivers/mac` | a window on a Mac | the web receiver's page in a native window |
 | `bitwall/receivers/term` | the terminal it is run in, on Windows, a Mac or Linux | the stream read into a grid, cells layers stacked over it, the stats overlay, pictures and mirrors of its cells, and the terminal's keys and clicks as input (its README.md) |
 | `bitwall/receivers/shell` | the terminal it is run in | the least a receiver can be, in `sh`; `bitwall-ps.ps1` the same on a Windows console, its pipes named pipes |
-| `bitwall/receivers/eink` | a Waveshare 10.3" IT8951 e-paper HAT on a Raspberry Pi | cells, cells layers and pictures composed in sixteen greys, on paper black ink on white, pushed to the panel once the senders pause, or every two seconds for one that never does (its README.md) |
+| `bitwall/receivers/eink` | a Waveshare 10.3" IT8951 e-paper HAT, on a Raspberry Pi's SPI or on USB from any machine | cells, cells layers and pictures composed in sixteen greys, on paper black ink on white, pushed to the panel once the senders pause, or every two seconds for one that never does (its README.md) |
 
 `bitwall/receivers/core-rs` is the wall itself for a receiver in Rust: the
 door, the sessions and every command of PROTOCOL.md, ported from

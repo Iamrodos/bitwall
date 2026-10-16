@@ -1,20 +1,23 @@
 [package]
 name = "bitwall-eink"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 description = "a bitwall wall on electronic paper: cells, cells layers and pictures composed in 16 greys and pushed to an IT8951 panel"
 publish = false
 
 [features]
-default = ["it8951"]
+default = ["it8951", "usb"]
 # The IT8951 driver, over the Pi's SPI and GPIO; built on Linux only.
 it8951 = ["dep:rppal"]
+# The IT8951 board on USB, through libusb, built in.
+usb = ["dep:rusb"]
 
 [dependencies]
 skrifa = "0.44"
 zeno = "0.3"
 png = "0.17"
 bitwall-receiver = { path = "../core-rs", features = ["decode"] }
+rusb = { version = "0.9", features = ["vendored"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

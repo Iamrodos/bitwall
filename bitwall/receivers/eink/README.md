@@ -6,10 +6,10 @@ panel when the wall decides, since a panel that takes half a second to
 refresh, and wears with every refresh, cannot simply paint what it is
 sent. Built and measured on a Waveshare 10.3" e-Paper HAT (B), an IT8951
 controller driving an ED103TC2 panel of 1872x1404 in 16 greys, on a
-Raspberry Pi 3.
+Raspberry Pi 3's SPI and on USB from a Mac mini.
 
     bitwall-eink [--font <n>] [--rotate 0|90|180|270] [--mirror]
-                 [--vcom <volts>] [--presence <name>] [--panel it8951|file:DIR] [--glass WxH]
+                 [--vcom <volts>] [--presence <name>] [--panel spi|usb|file:DIR] [--glass WxH]
                  [--paper|--screen] [wall]          wall `paper` unless named
     bitwall-eink --cell <font>                       a cell's pixels at a font
 
@@ -22,7 +22,7 @@ Raspberry Pi 3.
 | `--mirror` | the glass mirrored left to right after turning, for a panel that shows it backwards. Not for the HAT above: its driver already loads each row right to left, as the ED103TC2 scans |
 | `--vcom V` | the panel's VCOM, from the label on its ribbon (`-1.17`); set every start, since the board forgets it |
 | `--presence NAME` | the presence the wall follows, said on its `presence` line so the controller feeding that name finds it; nobody there, and nothing is pushed while the picture stays |
-| `--panel` | `it8951`, the HAT on the Pi's SPI, on Linux; `file:DIR` writes every push to DIR as a PNG and a line of log, the panel on a machine with none, and the default there |
+| `--panel` | `spi`, the HAT on the Pi's SPI, on Linux and the default there; `usb`, the same board on USB, on any machine; `file:DIR` writes every push to DIR as a PNG and a line of log, the panel on a machine with none, and the default there |
 | `--glass WxH` | a file panel's size, 1872x1404 unless given; a line `glass WxH` on stdin changes it |
 | `--paper`, `--screen` | cells turned over in brightness, black grounds white paper (the default), or drawn as a screen draws them |
 
@@ -30,7 +30,7 @@ Raspberry Pi 3.
 picture left on the panel. Its log is its stdout: each clean push, each
 sender that attaches or goes, each change of font.
 
-## Setting it up
+## Setting it up on a Pi's SPI
 
 The HAT drives its own chip select, so the kernel's is moved off GPIO8.
 In `/boot/firmware/config.txt`:
@@ -43,9 +43,9 @@ needs to be in the `spi` and `gpio` groups.
 
 It builds with cargo on the Pi itself, or on another machine for the Pi's
 target (`armv7-unknown-linux-gnueabihf` on a 32-bit Raspberry Pi OS, as the Pi 3 it was measured on runs; `aarch64-unknown-linux-gnu` on a 64-bit one) with any
-Rust cross-compiler: it links nothing but libc. The driver, `it8951`, is
-a default feature and built on Linux alone; elsewhere the wall has the
-file panel only.
+Rust cross-compiler: it links nothing but libc. The SPI driver, `it8951`,
+is a default feature and built on Linux alone; the USB driver, `usb`, is
+a default feature everywhere, with libusb built in.
 
 `bitwall-eink.service` runs it from boot as a user service, as
 `bitwall-screen.service` runs the painter, so its walls are in the user's
@@ -59,6 +59,29 @@ runtime directory, `/run/user/<uid>/bitwall`:
 
 Its `ExecStart` carries the VCOM and the wall's name, `paper`, so a sender
 draws on it as `pi.local:paper`. Its log is `~/bitwall-eink.log`.
+
+## Setting it up on USB
+
+The board's micro-USB port is a USB mass-storage device, ITE T-CON
+048d:8951, whose vendor SCSI commands are the panel's; the board's
+SPI/I80 switch makes no difference to it. USB powers the board. Plug the
+cable in with the panel's ribbon already seated, never the ribbon with
+the board powered.
+
+The system takes the board for a disk, so the wall has to take it back:
+
+- **Mac**: root, from a login session; a launchd daemon is refused the
+  board. Run under `sudo`, the wall opens the board and then becomes the
+  user who ran sudo (`SUDO_UID`, `SUDO_GID`), so its walls are in that
+  user's `~/.bitwall/run` and theirs:
+
+      sudo nohup target/release/bitwall-eink --panel usb --vcom -1.17 paper \
+        >> /tmp/bitwall-eink.log 2>&1 &
+
+- **Windows**: give the board the WinUSB driver once, with Zadig; the
+  wall then needs no administrator.
+- **Linux**: root, or a udev rule giving the user the device, so the
+  kernel's usb-storage lets it go.
 
 ## What it is
 
@@ -132,6 +155,9 @@ On a Raspberry Pi 3 and the 10.3" HAT, as `examples/panel.rs` times them
 - a small box of text pushed: about 0.5 s; a black and white box in DU:
   about 0.3 s
 - a clean push: a few seconds
+
+On USB from a Mac mini, the whole panel loads in about 0.6 s, and a
+clean push takes about 4 s.
 
 `examples/sample.rs` puts a sample wall through the file panel on any
 machine and says how long each part took.

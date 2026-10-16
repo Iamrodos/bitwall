@@ -80,3 +80,5 @@ pub const SPI_FAST: u32 = 12_000_000;
 pub const VCOM_MV: u16 = 1170;
 /// The most bytes one spidev transfer carries, its default `bufsiz`.
 pub const SPI_CHUNK: usize = 4096;
+/// The most bytes one USB load carries, its header with them.
+pub const USB_CHUNK: usize = 60 * 1024;
