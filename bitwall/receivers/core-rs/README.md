@@ -16,7 +16,8 @@ panel of electronic paper.
 
 - **the base and cells layers**, each stream read into a grid (`grid.rs`),
   stacked in the two stacks of PROTOCOL.md, *Layers and types*, a cells
-  layer with the base's grid;
+  layer with the base's grid until it asks `font` or `grid` for one of
+  its own, which `stack()` gives with its `font`;
 - **video layers**, where the glass has pixels: `open <name> layer
   z=above|top|<n> type=video`, placed, moved (`moved`) and refused (`full`)
   as cells layers are, and their `frame` commands with QOI, PNG or JPEG,
@@ -34,8 +35,7 @@ panel of electronic paper.
   `follow`, `meta`, `blank`, `presence`, `want` and `input`, pings and
   backpressure.
 
-What it does not keep: a cells layer's own font or grid (it is answered
-with the base's area), a stream on `data` (no film, no video base, no
+What it does not keep: a stream on `data` (no film, no video base, no
 `align`), a raw glass `stream`, and a JPEG picture of the glass.
 
 ## The glass

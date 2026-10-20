@@ -313,7 +313,7 @@ impl Paper {
                     c.pictures = self.kitty.pictures(self.eink.cell(font), self.origin(font, c.cols, c.rows));
                     scene.base = Some(c);
                 }
-                Surface::Cells(g) => scene.layers.push(Layer { id: id_of(layer.name), show: Show::Cells(Self::cells(font, g)) }),
+                Surface::Cells(g) => scene.layers.push(Layer { id: id_of(layer.name), show: Show::Cells(Self::cells(layer.font, g)) }),
                 Surface::Video(Some(f)) => {
                     live.push(f.seq);
                     if !self.decoded.contains_key(&f.seq) {

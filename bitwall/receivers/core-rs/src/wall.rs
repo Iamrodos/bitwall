@@ -106,6 +106,9 @@ pub struct Layer<'a> {
     pub z: usize,
     pub name: &'a str,
     pub surface: Surface<'a>,
+    /// The font its cells are drawn at: the wall's, or a cells layer's
+    /// own where it asked one.
+    pub font: u32,
 }
 
 pub struct Session {
@@ -151,6 +154,10 @@ pub struct Session {
     /// Its stream read: the base's grid and a cells layer's, at the wall's
     /// area; a controller's, no cells at all, for its commands.
     pub grid: Grid,
+    /// A cells layer above the base: what it asked of a grid of its own,
+    /// None to follow the base's, and the area it has from it.
+    own: Option<Ask>,
+    own_area: (usize, usize, u32),
     kitty_used: bool,
     /// A video layer: its stream is frames, not cells.
     pub video: bool,
@@ -205,6 +212,8 @@ impl Session {
             r_out: -1.0,
             r_fps: -1.0,
             grid: Grid::new(0, 0, false),
+            own: None,
+            own_area: (0, 0, 0),
             kitty_used: false,
             video: false,
             vbuf: Vec::new(),
@@ -359,13 +368,14 @@ impl Wall {
     pub fn stack(&self) -> Vec<Layer<'_>> {
         let mut out = Vec::new();
         if let Some(b) = self.base().filter(|_| self.connected) {
-            out.push(Layer { z: 0, name: &self.sessions[b].name, surface: Surface::Cells(&self.sessions[b].grid) });
+            out.push(Layer { z: 0, name: &self.sessions[b].name, surface: Surface::Cells(&self.sessions[b].grid), font: self.font });
         }
         for z in 1..LAYERS {
             if let Some(j) = self.above(z) {
                 let s = &self.sessions[j];
                 let surface = if s.video { Surface::Video(s.frame.as_ref()) } else { Surface::Cells(&s.grid) };
-                out.push(Layer { z, name: &s.name, surface });
+                let font = if s.own.is_some() { s.own_area.2 } else { self.font };
+                out.push(Layer { z, name: &s.name, surface, font });
             }
         }
         out
@@ -462,6 +472,7 @@ impl Wall {
         s.st = St::Open;
         if s.layer() && !s.video {
             s.grid = Grid::new(self.cols, self.rows, s.z != Some(0));
+            s.own = None;
         }
         if s.layer() {
             self.changed = true;
@@ -902,11 +913,14 @@ impl Wall {
         }
     }
 
-    /// To the base and every cells layer: what the cells' area is. A video
-    /// layer is pixels over pixels and hears nothing of it.
+    /// To the base and every cells layer that follows the base's grid:
+    /// what the cells' area is. A video layer is pixels over pixels and
+    /// hears nothing of it; a layer with a grid of its own hears its own
+    /// (`refit_layer`).
     fn tell_cells(&mut self, line: &str, cause: Option<usize>, tag: &str) {
         for j in 0..self.sessions.len() {
-            if self.sessions[j].open() && self.sessions[j].layer() && !self.sessions[j].video {
+            let s = &self.sessions[j];
+            if s.open() && s.layer() && !s.video && s.own.is_none() {
                 let l = if Some(j) == cause { format!("{line}{tag}") } else { line.to_string() };
                 self.say(j, &l);
             }
@@ -970,10 +984,15 @@ impl Wall {
     /// What a cell can be, as the glass says it: its colour and rate, and
     /// where it has pixels, how many and a cell's at the wall's font.
     fn screen_line(&self, g: &dyn Glass) -> String {
+        self.screen_line_at(g, self.font)
+    }
+
+    /// The screen line with a cell at `font`: a cells layer's own.
+    fn screen_line_at(&self, g: &dyn Glass, font: u32) -> String {
         let mut line = format!("screen colour={} rate={}", g.colour(), g.rate());
         if let Some((w, h)) = self.pixels {
             line += &format!(" pixels={w}x{h}");
-            if let Some((cw, ch)) = g.cell(self.font) {
+            if let Some((cw, ch)) = g.cell(font) {
                 line += &format!(" cell={cw}x{ch}");
             }
         }
@@ -1070,7 +1089,63 @@ impl Wall {
                 }
             }
         }
+        for i in 0..self.sessions.len() {
+            if self.sessions[i].open() && self.sessions[i].own.is_some() {
+                self.refit_layer(i, g, None, "", new_glass);
+            }
+        }
         self.changed = true;
+    }
+
+    /// A cells layer's own grid worked out again for what it asked: made
+    /// that size, and said to it -- its area, `cause`'s id, its screen and
+    /// `repaint` -- where the area changed, or `always`. A font is the
+    /// cells the glass has at it; a grid is exactly its cells, at the font
+    /// that holds them.
+    fn refit_layer(&mut self, i: usize, g: &dyn Glass, cause: Option<usize>, tag: &str, always: bool) {
+        let Some(ask) = self.sessions[i].own else {
+            return;
+        };
+        let (cols, rows, font) = g.area(ask);
+        let area = match ask {
+            Ask::Grid(c, r) => (c, r, font),
+            Ask::Font(_) => (cols, rows, font),
+        };
+        let s = &mut self.sessions[i];
+        let was = s.own_area;
+        s.own_area = area;
+        if (area.0, area.1) != (s.grid.cols, s.grid.rows) {
+            s.grid.resize(area.0, area.1);
+            for m in s.mirrors.iter_mut() {
+                m.was = None;
+            }
+        }
+        if area != was || always {
+            let t = if cause == Some(i) { tag } else { "" };
+            self.say(i, &format!("area {}x{} {}{t}", area.0, area.1, area.2));
+            let screen = self.screen_line_at(g, area.2);
+            self.say(i, &screen);
+            self.say(i, "repaint");
+            self.changed = true;
+        }
+    }
+
+    /// A cells layer gives up a grid of its own: the base's again, said to
+    /// it with its screen and `repaint`.
+    fn follow_base(&mut self, i: usize, g: &dyn Glass, tag: &str) {
+        let (cols, rows) = (self.cols, self.rows);
+        let s = &mut self.sessions[i];
+        let had = s.own.take().is_some();
+        if (s.grid.cols, s.grid.rows) != (cols, rows) {
+            s.grid.resize(cols, rows);
+        }
+        let (area, screen) = (self.area_line(), self.screen_line(g));
+        self.say(i, &format!("{area}{tag}"));
+        if had {
+            self.say(i, &screen);
+            self.say(i, "repaint");
+            self.changed = true;
+        }
     }
 
     /// A new area: every cells grid made that size, and said, to every
@@ -1083,7 +1158,7 @@ impl Wall {
         self.font = font;
         if resized {
             for s in self.sessions.iter_mut() {
-                if s.open() && s.layer() && !s.video {
+                if s.open() && s.layer() && !s.video && s.own.is_none() {
                     s.grid.resize(cols, rows);
                 }
                 for m in s.mirrors.iter_mut() {
@@ -1241,7 +1316,11 @@ impl Wall {
         let mut lines = vec!["hello v1 line".to_string(), self.receiver.clone(), self.caps_line()];
         lines.push(format!("measures {}", Wall::measure_names(g).join(" ")));
         lines.push(if self.pixels.is_some() { "pictures qoi grid" } else { "pictures grid" }.into());
-        lines.push(self.screen_line(g));
+        let own = self.sessions[i].own.map(|_| self.sessions[i].own_area);
+        lines.push(match own {
+            Some((_, _, font)) => self.screen_line_at(g, font),
+            None => self.screen_line(g),
+        });
         lines.push(self.accepts_line(g));
         let now = Instant::now();
         if let Some(b) = self.base() {
@@ -1257,7 +1336,10 @@ impl Wall {
         lines.push(self.presence_line());
         lines.push(format!("display {}", self.display()));
         lines.push(format!("watching {}", self.watching()));
-        lines.push(self.area_line());
+        lines.push(match own {
+            Some((c, r, f)) => format!("area {c}x{r} {f}"),
+            None => self.area_line(),
+        });
         for l in lines {
             self.say(i, &format!("{l}{tag}"));
         }
@@ -1300,8 +1382,14 @@ impl Wall {
             }
             return;
         }
+        let (base, cells_layer) = (self.sessions[i].z == Some(0) || !self.sessions[i].layer(), !self.sessions[i].video);
         match size {
-            Some(n) if self.sessions[i].z == Some(0) || !self.sessions[i].layer() => self.ask_area(i, Ask::Font(n as u32), tag, g),
+            Some(n) if base => self.ask_area(i, Ask::Font(n as u32), tag, g),
+            Some(n) if cells_layer => {
+                self.sessions[i].own = Some(Ask::Font(n as u32));
+                self.refit_layer(i, g, Some(i), tag, true);
+            }
+            None if !base && cells_layer => self.follow_base(i, g, tag),
             _ => self.answer_area(i, tag, g),
         }
     }
@@ -1320,6 +1408,9 @@ impl Wall {
     fn cmd_grid(&mut self, i: usize, m: &Message, tag: &str, g: &dyn Glass) {
         let arg = m.args.first().map(String::as_str).unwrap_or("");
         if arg == "base" && self.sessions[i].z != Some(0) && self.sessions[i].layer() {
+            if !self.sessions[i].video {
+                return self.follow_base(i, g, tag);
+            }
             return self.answer_area(i, tag, g);
         }
         let got = arg.split_once('x').and_then(|(c, r)| {
@@ -1339,6 +1430,9 @@ impl Wall {
                 }
                 if self.sessions[i].z == Some(0) || !self.sessions[i].layer() {
                     self.ask_area(i, Ask::Grid(c, r), tag, g);
+                } else if !self.sessions[i].video {
+                    self.sessions[i].own = Some(Ask::Grid(c, r));
+                    self.refit_layer(i, g, Some(i), tag, true);
                 } else {
                     self.answer_area(i, tag, g);
                 }

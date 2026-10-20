@@ -545,7 +545,6 @@ HEADLESS_NO_VERSION = "an example of the receiver core, whose sources receivers.
 #: a panel of sixteen greys that changes about once a second.
 EINK_NO_DATA = ("the receiver core takes no data pipe, and a panel that refreshes about once "
                 "a second plays no film: no stream, no film and no video base")
-EINK_NO_OWN_GRID = HEADLESS_NO_OWN_GRID
 EINK_GREYS = ("a glass of sixteen greys, turned over on paper: a colour shows as its grey, "
               "so a picture of the glass cannot be held to an RGB value")
 
@@ -566,9 +565,8 @@ NO_DATA = {"shell": "offers one layer, the base, and refuses a video layer, "
            "headless": HEADLESS_NO_DATA, "eink": EINK_NO_DATA}
 NO_CELLS_ABOVE = {"shell": "offers one layer, the base, and refuses a video layer"}
 NO_OWN_GRID = {"shell": "offers one layer, the base, and refuses a video layer",
-               "term": TERM_NO_FONT, "headless": HEADLESS_NO_OWN_GRID,
-               "eink": EINK_NO_OWN_GRID}
-NO_OWN_GRID_OVER_VIDEO = dict(NO_OWN_GRID, term=TERM_NO_VIDEO)
+               "term": TERM_NO_FONT, "headless": HEADLESS_NO_OWN_GRID}
+NO_OWN_GRID_OVER_VIDEO = dict(NO_OWN_GRID, term=TERM_NO_VIDEO, eink=EINK_NO_DATA)
 SHELL_NO_TIMEOUT = {"shell": "cat waits at in for a writer: a session nobody "
                              "writes to is kept rather than timed out, and a "
                              "writer killed before it has opened in was nobody"}
