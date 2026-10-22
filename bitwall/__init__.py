@@ -37,7 +37,7 @@ sender's business.
 #: `v1` a wall says in `hello`, so a sender pinned to a major release
 #: speaks the protocol its walls speak; tests/bitwall-tests holds the two
 #: together. The one place the version is written: pyproject.toml reads it.
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 import collections
 import contextlib

@@ -1,6 +1,6 @@
 [package]
 name = "bitwall-eink"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 description = "a bitwall wall on electronic paper: cells, cells layers and pictures composed in 16 greys and pushed to an IT8951 panel"
 publish = false
