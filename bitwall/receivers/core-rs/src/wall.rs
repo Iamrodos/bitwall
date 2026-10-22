@@ -1240,7 +1240,7 @@ impl Wall {
             "font" | "grid" => &["base", "layer", "controller"],
             "blank" => &["base", "controller"],
             "want" => &["base", "layer", "video"],
-            "frame" | "align" => &["video"],
+            "frame" | "align" | "box" => &["video"],
             "clear" => &["video", "layer"],
             "presence" | "stats" | "follow" | "measures" => &["controller"],
             "picture" | "mirror" | "report" | "sessions" | "ping" | "pong" | "meta" | "detach" | "close" => {

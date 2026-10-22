@@ -18,7 +18,8 @@ What a wall can show, from the senders here:
   fonts (`senders/sysinfo`, `senders/letters`)
 - **self-playing games** and animation (`senders/games`, `senders/fluid`)
 - **pictures and films**: a JPEG on a layer, a film decoded on the
-  receiver's own hardware, one film cut across several screens (`senders/picture`,
+  receiver's own hardware, full screen or in a box over whatever is
+  beneath, one film cut across several screens (`senders/picture`,
   `senders/film`)
 - **HDMI in** from a laptop through a capture dongle (`senders/hdmi`)
 - **one wall shown on others** as video, encoded on the source's host and

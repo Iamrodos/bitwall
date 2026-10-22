@@ -36,7 +36,7 @@ panel of electronic paper.
   backpressure.
 
 What it does not keep: a stream on `data` (no film, no video base, no
-`align`), a raw glass `stream`, and a JPEG picture of the glass.
+`align` or `box`), a raw glass `stream`, and a JPEG picture of the glass.
 
 ## The glass
 

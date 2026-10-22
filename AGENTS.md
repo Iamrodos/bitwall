@@ -105,6 +105,8 @@ H.264 Annex B, or QOI or JPEG back to back. The wall decodes it (ffmpeg,
 on the Pi's own decoder: HEVC on a Pi 5, H.264 on a Pi 3; its `caps`
 says `codecs=`) and plays it out itself, frame i at start + i/fps, so the
 sender never paces a film and walls whose clocks agree play one together.
+A film fills the glass, or a box on it the layer says (`box`, PROTOCOL.md,
+*The data pipe*), so it plays as an inset over whatever is beneath.
 `senders/film` is the one that does it, on one wall or cut across several
 (`--layout 'pi-a.local:0,pi-a.local:1 / pi-b.local:0,pi-b.local:1'`).
 Measured at 1080p: 24fps and nothing dropped, the painter at 15% of a core

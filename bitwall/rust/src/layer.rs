@@ -72,6 +72,14 @@ pub const CODECS: [&str; 4] = ["hevc", "h264", "qoi", "mjpeg"];
 /// Where a stream's frames may sit on a glass of another shape.
 pub const ALIGNS: [&str; 3] = ["top", "centre", "bottom"];
 
+/// `box` as it goes down `in`: the box, or alone for the glass.
+fn box_command(frame_box: Option<(i32, i32, u32, u32)>) -> String {
+    match frame_box {
+        Some((x, y, w, h)) => format!("box at={x},{y} size={w}x{h}"),
+        None => "box".into(),
+    }
+}
+
 /// How many of the wall's `error frame` lines are kept.
 const ERRORS_KEPT: usize = 16;
 
@@ -149,6 +157,9 @@ struct Config {
     start: Option<i64>,
     instance: Option<String>,
     align: String,
+    /// The box (x, y, w, h) the stream's frames are fitted to, or None
+    /// for the glass.
+    frame_box: Option<(i32, i32, u32, u32)>,
     user: Option<String>,
     run: Option<String>,
     /// What the layer says it is, in the order first said.
@@ -237,6 +248,7 @@ impl Layer {
                     start: None,
                     instance: None,
                     align: "centre".into(),
+                    frame_box: None,
                     user: None,
                     run: None,
                     meta: Vec::new(),
@@ -593,15 +605,18 @@ impl Layer {
             "opened" => {
                 let z = said.get("z").and_then(protocol::number);
                 let has_data = said.args.iter().skip(1).any(|a| a == "data");
-                let (align, meta) = {
+                let (align, frame_box, meta) = {
                     let mut c = self.cfg();
                     // A `start_at` is spent once an opening has it.
                     c.start_next = None;
-                    (c.align.clone(), c.meta.clone())
+                    (c.align.clone(), c.frame_box, c.meta.clone())
                 };
                 let _ = writer.write(&apc("report"));
                 if align != "centre" {
                     let _ = writer.write(&apc(&format!("align {align}")));
+                }
+                if frame_box.is_some() {
+                    let _ = writer.write(&apc(&box_command(frame_box)));
                 }
                 for (key, value) in &meta {
                     let _ = writer.write(&apc(&format!("meta set {key} {value}")));
@@ -772,6 +787,28 @@ impl Layer {
         self.cfg().align = place.to_string();
         if self.open_now() {
             self.command(&format!("align {place}"));
+        }
+        Ok(())
+    }
+
+    /// Fit the stream on `data` to the box w by h at x, y in the glass's
+    /// pixels, from its next frame, or to the whole glass again with
+    /// None; said again whenever the layer opens. Its frames keep their
+    /// shape within the box, `align` placing them, and the layer is
+    /// transparent outside it. A wall whose `caps` do not say `box` fills
+    /// the glass.
+    pub fn set_box(&self, frame_box: Option<(i32, i32, u32, u32)>) -> Result<(), String> {
+        if let Some((x, y, w, h)) = frame_box {
+            if x.unsigned_abs() > 65535 || y.unsigned_abs() > 65535 || !(1..=4096).contains(&w)
+                || !(1..=4096).contains(&h)
+            {
+                return Err(format!("bitwall: a box is at most 65535 off the glass and \
+                                    1..4096 each way, not {:?}", (x, y, w, h)));
+            }
+        }
+        self.cfg().frame_box = frame_box;
+        if self.open_now() {
+            self.command(&box_command(frame_box));
         }
         Ok(())
     }

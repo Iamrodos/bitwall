@@ -1147,7 +1147,9 @@ typedef struct {
     int tw, th;             /* GPU: the size `tex` was made at */
     GLuint plane[3];        /* GPU: Y, U and V, one byte a sample */
     int pw, ph;             /* GPU: the size the planes were made at, Y's */
-    SDL_Surface *soft;      /* software: the frame, ARGB, blended as it is blitted */
+    SDL_Surface *soft;      /* software: the frame, ARGB, blended as it is blitted;
+                             * only what lands on the glass, from sx, sy within it */
+    int sx, sy;
     SDL_Surface *under;     /* software: the picture beneath it, while it is up */
     SDL_Rect box, was;      /* software: where it is on the glass, and was last pushed out */
 } Pic;
@@ -2227,6 +2229,21 @@ static int pic_soft_make(Screen *s, Pic *p, int w, int h)
     return 0;
 }
 
+/* In software, the part of a picture w by h at x, y that lands on the
+ * glass, into `v`; 0 when none of it does. Only that part is scaled and
+ * kept, so a picture far off the glass costs nothing. */
+static int pic_seen(const Screen *s, int x, int y, int w, int h, SDL_Rect *v)
+{
+    int x1 = x + w, y1 = y + h;
+    v->x = x < 0 ? 0 : x;
+    v->y = y < 0 ? 0 : y;
+    if (x1 > s->glass->w) x1 = s->glass->w;
+    if (y1 > s->glass->h) y1 = s->glass->h;
+    v->w = x1 - v->x;
+    v->h = y1 - v->y;
+    return v->w > 0 && v->h > 0;
+}
+
 static void pic_placed(Screen *s, Pic *p, int x, int y, int w, int h, double until)
 {
     p->on = 1;
@@ -2256,36 +2273,51 @@ static int pic_set(Screen *s, int k, const uint8_t *rgba, int w, int h, int x, i
         glBindTexture(GL_TEXTURE_2D, s->gl.atlas);
     } else {
         int r, c;
-        if (pic_soft_make(s, p, dw, dh) < 0)
-            return -1;
-        SDL_LockSurface(p->soft);
-        for (r = 0; r < dh; r++) {
-            Uint32 *d = (Uint32 *)((uint8_t *)p->soft->pixels + (size_t)r * p->soft->pitch);
-            const uint8_t *q = rgba + (size_t)((long)r * h / dh) * w * 4;
-            for (c = 0; c < dw; c++) {
-                const uint8_t *o = q + (size_t)((long)c * w / dw) * 4;
-                d[c] = (Uint32)o[3] << 24 | (Uint32)o[0] << 16 | (Uint32)o[1] << 8 | o[2];
+        SDL_Rect v;
+        p->sx = p->sy = 0;
+        if (pic_seen(s, x, y, dw, dh, &v)) {
+            if (pic_soft_make(s, p, v.w, v.h) < 0)
+                return -1;
+            p->sx = v.x - x;
+            p->sy = v.y - y;
+            SDL_LockSurface(p->soft);
+            for (r = 0; r < v.h; r++) {
+                Uint32 *d = (Uint32 *)((uint8_t *)p->soft->pixels + (size_t)r * p->soft->pitch);
+                const uint8_t *q = rgba + (size_t)((long)(p->sy + r) * h / dh) * w * 4;
+                for (c = 0; c < v.w; c++) {
+                    const uint8_t *o = q + (size_t)((long)(p->sx + c) * w / dw) * 4;
+                    d[c] = (Uint32)o[3] << 24 | (Uint32)o[0] << 16 | (Uint32)o[1] << 8 | o[2];
+                }
             }
+            SDL_UnlockSurface(p->soft);
         }
-        SDL_UnlockSurface(p->soft);
     }
     pic_placed(s, p, x, y, dw, dh, until);
     return 0;
 }
 
-/* Where a frame w by h goes to fill the glass: the largest size that fits
- * with its shape kept, centred, or against the top (`align` -1) or the
- * bottom (1) where it is wider than the glass is. */
-static void pic_fit(const Screen *s, int w, int h, int align, SDL_Rect *r)
+/* Where a frame w by h goes to fill its box, x, y, w, h on the glass, or
+ * the glass where `box` is NULL or its w 0: the largest size that fits
+ * with its shape kept, centred, or against the box's top (`align` -1) or
+ * its bottom (1) where the frame is wider than the box is. What falls off
+ * the glass is not drawn. */
+static void pic_fit(const Screen *s, int w, int h, int align, const int *box, SDL_Rect *r)
 {
-    double k = (double)s->width / w < (double)s->height / h ? (double)s->width / w
-                                                               : (double)s->height / h;
+    int bx = 0, by = 0, bw = s->width, bh = s->height;
+    double k;
+    if (box && box[2] > 0) {
+        bx = box[0];
+        by = box[1];
+        bw = box[2];
+        bh = box[3];
+    }
+    k = (double)bw / w < (double)bh / h ? (double)bw / w : (double)bh / h;
     r->w = (int)(w * k + 0.5);
     r->h = (int)(h * k + 0.5);
     if (r->w < 1) r->w = 1;
     if (r->h < 1) r->h = 1;
-    r->x = (s->width - r->w) / 2;
-    r->y = align < 0 ? 0 : align > 0 ? s->height - r->h : (s->height - r->h) / 2;
+    r->x = bx + (bw - r->w) / 2;
+    r->y = by + (align < 0 ? 0 : align > 0 ? bh - r->h : (bh - r->h) / 2);
 }
 
 static uint8_t clamp8(int v)
@@ -2306,16 +2338,17 @@ static Uint32 yuv_argb(const uint8_t *px, int w, int h, int x, int y)
            | clamp8((Y + 541 * U + 128) >> 8);
 }
 
-/* Put a frame of a data stream up on layer `k`, filling the glass: RGBA,
- * or YUV 4:2:0 as three planes one after another, w by h. It stays up
- * until the next, since a stream's frames have no hold. On the GPU the
+/* Put a frame of a data stream up on layer `k`, filling its box (pic_fit):
+ * RGBA, or YUV 4:2:0 as three planes one after another, w by h. It stays
+ * up until the next, since a stream's frames have no hold. On the GPU the
  * frame is scaled as it is drawn; in software it is scaled here, each
  * pixel the nearest sample. -1 when this glass cannot hold it. */
-static int pic_frame(Screen *s, int k, const uint8_t *px, int w, int h, int yuv, int align)
+static int pic_frame(Screen *s, int k, const uint8_t *px, int w, int h, int yuv, int align,
+                     const int *box)
 {
     Pic *p = &s->pics[k];
     SDL_Rect at;
-    pic_fit(s, w, h, align, &at);
+    pic_fit(s, w, h, align, box, &at);
     if (s->gpu) {
         if (w > s->gl.max_texture || h > s->gl.max_texture)
             return -1;
@@ -2343,20 +2376,27 @@ static int pic_frame(Screen *s, int k, const uint8_t *px, int w, int h, int yuv,
         glBindTexture(GL_TEXTURE_2D, s->gl.atlas);
     } else {
         int r, c;
-        if (pic_soft_make(s, p, at.w, at.h) < 0)
-            return -1;
-        SDL_LockSurface(p->soft);
-        for (r = 0; r < at.h; r++) {
-            Uint32 *d = (Uint32 *)((uint8_t *)p->soft->pixels + (size_t)r * p->soft->pitch);
-            int sy = (int)((long)r * h / at.h);
-            for (c = 0; c < at.w; c++) {
-                int sx = (int)((long)c * w / at.w);
-                const uint8_t *q = px + ((size_t)sy * w + sx) * 4;
-                d[c] = yuv ? yuv_argb(px, w, h, sx, sy)
-                           : (Uint32)q[3] << 24 | (Uint32)q[0] << 16 | (Uint32)q[1] << 8 | q[2];
+        SDL_Rect v;
+        p->sx = p->sy = 0;
+        if (pic_seen(s, at.x, at.y, at.w, at.h, &v)) {
+            if (pic_soft_make(s, p, v.w, v.h) < 0)
+                return -1;
+            p->sx = v.x - at.x;
+            p->sy = v.y - at.y;
+            SDL_LockSurface(p->soft);
+            for (r = 0; r < v.h; r++) {
+                Uint32 *d = (Uint32 *)((uint8_t *)p->soft->pixels + (size_t)r * p->soft->pitch);
+                int sy = (int)((long)(p->sy + r) * h / at.h);
+                for (c = 0; c < v.w; c++) {
+                    int sx = (int)((long)(p->sx + c) * w / at.w);
+                    const uint8_t *q = px + ((size_t)sy * w + sx) * 4;
+                    d[c] = yuv ? yuv_argb(px, w, h, sx, sy)
+                               : (Uint32)q[3] << 24 | (Uint32)q[0] << 16 | (Uint32)q[1] << 8
+                                     | q[2];
+                }
             }
+            SDL_UnlockSurface(p->soft);
         }
-        SDL_UnlockSurface(p->soft);
     }
     pic_placed(s, p, at.x, at.y, at.w, at.h, 1e300);
     return 0;
@@ -2674,7 +2714,7 @@ static void pics_soft(Screen *s, int up)
             p->box = p->was = box;
             whole = (SDL_Rect){0, 0, box.w, box.h};
             SDL_BlitSurface(s->glass, &box, p->under, &whole);
-            from = (SDL_Rect){box.x - p->x, box.y - p->y, box.w, box.h};
+            from = (SDL_Rect){box.x - p->x - p->sx, box.y - p->y - p->sy, box.w, box.h};
             at = box;
             SDL_BlitSurface(p->soft, &from, s->glass, &at);
             dirty_add(s, &box);
@@ -5985,8 +6025,10 @@ typedef struct Session {
      * stream itself once it is opened */
     int data_codec;             /* 0 when it has no `data` */
     double data_fps, data_start;
-    int data_align;             /* where its frames leave the glass spare:
+    int data_align;             /* where its frames leave the box spare:
                                  * -1 all below, 0 even, 1 all above */
+    int data_box[4];            /* the box its frames are fitted to, x, y,
+                                 * w, h on the glass; w 0 for the glass */
     struct DataStream *ds;
     struct DFrame *shown;       /* the stream's frame on the glass, for a picture */
 
@@ -8246,11 +8288,14 @@ static Job *qoi_job(uint8_t *px, int w, int h, int yuv, const char *name, const 
 }
 
 /* A picture of a stream's frame on the glass: the frame as it was decoded,
- * as QOI, and where its top left went. The frame is copied, since the
- * stream uses its frames again, and made QOI by the pool. */
+ * as QOI, where its top left went, and the size it was drawn at where it
+ * was scaled. The frame is copied, since the stream uses its frames again,
+ * and made QOI by the pool. */
 static void data_picture(Wall *w, Session *from, Session *x, const char *tag)
 {
     DFrame *f = x->shown;
+    const Pic *p = &w->s->pics[x->z];
+    char size[32] = "";
     size_t n = f->yuv ? (size_t)f->w * f->h + 2 * (size_t)((f->w + 1) / 2) * ((f->h + 1) / 2)
                       : (size_t)f->w * f->h * 4;
     uint8_t *px = malloc(n);
@@ -8261,8 +8306,10 @@ static void data_picture(Wall *w, Session *from, Session *x, const char *tag)
         return;
     }
     memcpy(px, f->px, n);
-    snprintf(j->head, sizeof j->head, "picture %s qoi %dx%d at=%d,%d ", x->name, f->w, f->h,
-             w->s->pics[x->z].x, w->s->pics[x->z].y);
+    if (p->w != f->w || p->h != f->h)
+        snprintf(size, sizeof size, " size=%dx%d", p->w, p->h);
+    snprintf(j->head, sizeof j->head, "picture %s qoi %dx%d at=%d,%d%s ", x->name, f->w, f->h,
+             p->x, p->y, size);
     put_later(from, j);
 }
 
@@ -8832,6 +8879,32 @@ static int side_pair(char *word, int *w, int *h)
     return *w >= 1 && *h >= 1 && *w <= FRAME_SIDE && *h <= FRAME_SIDE;
 }
 
+/* `<x>,<y>`, each an optional `-` and ASCII digits, within 65535 of 0
+ * either way, into x and y; 0, and neither set, when it is not one. */
+static int at_pair(const char *word, int *x, int *y)
+{
+    const char *c = word;
+    long v[2];
+    int i;
+    for (i = 0; i < 2; i++) {
+        int neg = *c == '-', n = 0;
+        long a = 0;
+        c += neg;
+        for (; *c >= '0' && *c <= '9' && n < 6; c++, n++)
+            a = a * 10 + (*c - '0');
+        if (!n || a > 65535)
+            return 0;
+        v[i] = neg ? -a : a;
+        if (!i && *c++ != ',')
+            return 0;
+    }
+    if (*c)
+        return 0;
+    *x = (int)v[0];
+    *y = (int)v[1];
+    return 1;
+}
+
 static void cmd_frame(Wall *w, Session *from, char **words, int n)
 {
     char said[48];
@@ -8864,12 +8937,7 @@ static void cmd_frame(Wall *w, Session *from, char **words, int n)
         const char *v = strchr(words[i], '=');
         int ok = 0;
         if (v && !strncmp(words[i], "at=", 3)) {
-            char *c = strchr(v + 1, ','), *e1 = NULL, *e2 = NULL;
-            long ax = strtol(v + 1, &e1, 10), ay = c ? strtol(c + 1, &e2, 10) : 0;
-            ok = c && e1 == c && e2 && e2 > c + 1 && !*e2 && ax > -65536 && ax < 65536
-                 && ay > -65536 && ay < 65536;
-            fx = (int)ax;
-            fy = (int)ay;
+            ok = at_pair(v + 1, &fx, &fy);
         } else if (v && !strncmp(words[i], "size=", 5)) {
             ok = side_pair(words[i] + 5, &sw, &sh);
         } else if (v && !strncmp(words[i], "hold=", 5)) {
@@ -8895,6 +8963,39 @@ static void cmd_frame(Wall *w, Session *from, char **words, int n)
     from->fhold = hold;
 }
 
+/* The box a video layer's stream is fitted to, from its next frame: `box
+ * at=<x>,<y> size=<w>x<h>` in the glass's pixels, `at` 0,0 when left out,
+ * or `box` alone for the whole glass again. It is kept through a change
+ * of glass, and what falls off the glass is not drawn. */
+static void cmd_box(Session *from, char **words, int n)
+{
+    char said[48];
+    int i, x = 0, y = 0, bw = 0, bh = 0;
+    for (i = 1; i < n; i++) {
+        int ok;
+        if (!strncmp(words[i], "at=", 3)) {
+            ok = at_pair(words[i] + 3, &x, &y);
+        } else if (!strncmp(words[i], "size=", 5)) {
+            ok = side_pair(words[i] + 5, &bw, &bh);
+        } else {
+            wsay(from, "error box %s: unknown option", plain(words[i], said, sizeof said));
+            return;
+        }
+        if (!ok) {
+            wsay(from, "error box %s: bad value", plain(words[i], said, sizeof said));
+            return;
+        }
+    }
+    if (n > 1 && !bw) {
+        wsay(from, "error box no size");
+        return;
+    }
+    from->data_box[0] = x;
+    from->data_box[1] = y;
+    from->data_box[2] = bw;
+    from->data_box[3] = bh;
+}
+
 /* When the painter started, in Unix seconds. */
 static time_t painter_started;
 
@@ -8918,7 +9019,7 @@ static void session_report(Session *from)
     snprintf(caps, sizeof caps,
              "caps area font grid meta blank want presence repaint watching ping "
              "detach close screen sessions follow measures stats picture mirror%s frame clear "
-             "data align kitty%s layers=%d types=cells,video above=%s codecs=%s%s images=%s "
+             "data align box kitty%s layers=%d types=cells,video above=%s codecs=%s%s images=%s "
              "controllers=%d%s",
              w->s->gpu ? " stream" : "", glass_offered(w->s) ? " glass" : "", LAYERS,
              w->s->gpu ? "video,cells" : "video", taken, hws, IMAGES_TAKEN, CONTROLLERS, streams);
@@ -9098,6 +9199,9 @@ static void session_command(Wall *w, Session *from, char **words, int n, const c
     } else if (!strcmp(name, "align")) {
         NEEDROLE(from->is_video && !from->is_cells);
         cmd_align(from, words, n);
+    } else if (!strcmp(name, "box")) {
+        NEEDROLE(from->is_video && !from->is_cells);
+        cmd_box(from, words, n);
     } else if (!strcmp(name, "clear")) {
         NEEDROLE(from->is_video);
         if (w->above[from->z] == from && from->is_cells && w->s->cells[from->z]) {
@@ -9847,7 +9951,8 @@ static void data_play(Session *s)
     s->n_dropped += late;
     if (show) {
         double t0 = now_ms();
-        if (pic_frame(sc, s->z, show->px, show->w, show->h, show->yuv, s->data_align) < 0) {
+        if (pic_frame(sc, s->z, show->px, show->w, show->h, show->yuv, s->data_align,
+                      s->data_box) < 0) {
             wsay(s, "error data %s: too big for this glass", CODEC_NAME[d->codec]);
         } else {
             s->n_frames++;

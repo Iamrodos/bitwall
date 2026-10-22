@@ -186,6 +186,10 @@ class Tabs:
         self.loop.call_soon_threadsafe(self._all, ("text", json.dumps(
             {"t": "valign", "z": z, "a": align})))
 
+    def vbox(self, z, box):
+        self.loop.call_soon_threadsafe(self._all, ("text", json.dumps(
+            {"t": "vbox", "z": z, "b": box})))
+
     def vend(self, z, stream):
         self.loop.call_soon_threadsafe(self._all, ("text", json.dumps(
             {"t": "vend", "z": z, "s": stream})))

@@ -3190,7 +3190,7 @@ static void a_qoi_stream_on_data_fills_the_glass_and_ends_clearing_the_layer(voi
     /* Fitted: the largest 16:9 the glass holds, centred. */
     {
         SDL_Rect r;
-        pic_fit(s, 16, 9, 0, &r);
+        pic_fit(s, 16, 9, 0, NULL, &r);
         CHECK(s->pics[1].w == r.w && s->pics[1].h == r.h && s->pics[1].x == r.x
               && s->pics[1].y == r.y && (r.w == s->width || r.h == s->height),
               "not fitted: %dx%d at %d,%d on %dx%d", s->pics[1].w, s->pics[1].h,
@@ -3217,6 +3217,71 @@ static void a_qoi_stream_on_data_fills_the_glass_and_ends_clearing_the_layer(voi
     pump(0.05);
     CHECK(strstr(out_text(o), "error align middle: not top, centre or bottom"),
           "align middle was not refused");
+    /* `box`: the frames fitted to a box on the glass, `align` within it,
+     * then `box` alone gives the whole glass back; a box with no size or
+     * a bad one is said to be wrong. */
+    put(in, "\x1b_bitwall box at=10,20 size=200x100\x1b\\");
+    pump(0.05);
+    put_qoi(d, 16, 9, green);
+    {
+        SDL_Rect r;
+        int box[4] = {10, 20, 200, 100};
+        pic_fit(s, 16, 9, 1, box, &r);
+        CHECK(r.x >= 10 && r.y >= 20 && r.x + r.w <= 210 && r.y + r.h <= 120
+              && (r.w == 200 || r.h == 100), "box: fitted %dx%d at %d,%d", r.w, r.h, r.x, r.y);
+        CHECK(PUMP_UNTIL(v->n_frames >= 5 && s->pics[1].x == r.x && s->pics[1].y == r.y
+                         && s->pics[1].w == r.w && s->pics[1].h == r.h, 2),
+              "box: %dx%d at %d,%d, not %dx%d at %d,%d", s->pics[1].w, s->pics[1].h,
+              s->pics[1].x, s->pics[1].y, r.w, r.h, r.x, r.y);
+    }
+    put(in, "\x1b_bitwall box\x1b\\");
+    pump(0.05);
+    put_qoi(d, 16, 9, green);
+    {
+        SDL_Rect r;
+        pic_fit(s, 16, 9, 1, NULL, &r);
+        CHECK(PUMP_UNTIL(v->n_frames >= 6 && s->pics[1].w == r.w && s->pics[1].y == r.y, 2),
+              "box alone: %dx%d at %d,%d, not the glass's %dx%d at %d,%d", s->pics[1].w,
+              s->pics[1].h, s->pics[1].x, s->pics[1].y, r.w, r.h, r.x, r.y);
+    }
+    /* A box partly off the glass is drawn where it lands, and in software
+     * only that part is made; one wholly off it makes nothing. */
+    put(in, "\x1b_bitwall box at=-100,-50 size=400x225\x1b\\");
+    pump(0.05);
+    put_qoi(d, 16, 9, green);
+    CHECK(PUMP_UNTIL(v->n_frames >= 7 && s->pics[1].x == -100 && s->pics[1].y == -50, 2),
+          "box off the top left: at %d,%d", s->pics[1].x, s->pics[1].y);
+    CHECK(s->gpu || (s->pics[1].soft && s->pics[1].soft->w == 300 && s->pics[1].soft->h == 175
+                     && s->pics[1].sx == 100 && s->pics[1].sy == 50),
+          "box off the top left: made %dx%d from %d,%d",
+          s->pics[1].soft ? s->pics[1].soft->w : 0, s->pics[1].soft ? s->pics[1].soft->h : 0,
+          s->pics[1].sx, s->pics[1].sy);
+    put(in, "\x1b_bitwall box at=60000,60000 size=4096x4096\x1b\\");
+    pump(0.05);
+    put_qoi(d, 16, 9, green);
+    CHECK(PUMP_UNTIL(v->n_frames >= 8 && s->pics[1].x == 60000, 2), "box off the glass: at %d",
+          s->pics[1].x);
+    CHECK(s->gpu || !s->pics[1].soft || s->pics[1].soft->w <= 300,
+          "box off the glass: made %d wide", s->pics[1].soft->w);
+    put(in, "\x1b_bitwall box\x1b\\");
+    put(in, "\x1b_bitwall box at=1,2\x1b\\");
+    put(in, "\x1b_bitwall box size=0x5\x1b\\");
+    put(in, "\x1b_bitwall box over=1\x1b\\");
+    put(in, "\x1b_bitwall box size\x1b\\");
+    put(in, "\x1b_bitwall box at=,5 size=10x10\x1b\\");
+    put(in, "\x1b_bitwall box at=+1,2 size=10x10\x1b\\");
+    put(in, "\x1b_bitwall box at=65536,0 size=10x10\x1b\\");
+    pump(0.05);
+    {
+        const char *said = out_text(o);
+        CHECK(strstr(said, "error box no size"), "a box with no size was not refused");
+        CHECK(strstr(said, "error box size=0x5: bad value"), "box size=0x5 was not refused");
+        CHECK(strstr(said, "error box over=1: unknown option"), "box over=1 was not refused");
+        CHECK(strstr(said, "error box size: unknown option"), "box size was not refused");
+        CHECK(strstr(said, "error box at=,5: bad value"), "box at=,5 was not refused");
+        CHECK(strstr(said, "error box at=+1,2: bad value"), "box at=+1,2 was not refused");
+        CHECK(strstr(said, "error box at=65536,0: bad value"), "box at=65536,0 was not refused");
+    }
     close(d);
     CHECK(PUMP_UNTIL(!s->pics[1].on, 2), "the end of the stream left the frame up");
     CHECK(v->state == S_OPEN, "the end of the stream ended the session");

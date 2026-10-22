@@ -210,6 +210,26 @@ def _apc(text):
     return (protocol.APC + protocol.MARK + " " + text + protocol.ST).encode()
 
 
+def _box(x, y, w, h):
+    """A box checked as the wall checks it: x and y within 65535 of 0,
+    w and h 1..4096."""
+    for v in (x, y, w, h):
+        if not isinstance(v, int) or isinstance(v, bool):
+            raise ValueError(f"bitwall: a box is four whole numbers, not {(x, y, w, h)!r}")
+    if abs(x) > 65535 or abs(y) > 65535 or not (1 <= w <= 4096 and 1 <= h <= 4096):
+        raise ValueError(f"bitwall: a box is at most 65535 off the glass and 1..4096 "
+                         f"each way, not {(x, y, w, h)!r}")
+    return x, y, w, h
+
+
+def _box_command(box):
+    """`box` as it goes down `in`: the box, or alone for the glass."""
+    if box is None:
+        return protocol.command("box").encode()
+    x, y, w, h = box
+    return _apc(f"box at={x},{y} size={w}x{h}")
+
+
 def _log(msg):
     print(f"bitwall: {msg}", file=sys.stderr, flush=True)
 
@@ -219,7 +239,7 @@ class Layer:
 
     def __init__(self, target, place=None, type="video", user=None, run=None,
                  take=False, data=False, codec=None, fps=None, start=None,
-                 instance=None, align="centre", compress=False):
+                 instance=None, align="centre", box=None, compress=False):
         if place is None:
             # A sender placed `controller` holds no layer of its own: one it
             # opens goes above unless it says where.
@@ -243,6 +263,9 @@ class Layer:
         #: Where the stream's frames sit on a glass of another shape; said
         #: each time the layer opens.
         self._align = align
+        #: The box (x, y, w, h) the stream's frames are fitted to, or None
+        #: for the glass; said each time the layer opens.
+        self._box = _box(*box) if box is not None else None
         #: Whether its ssh compresses: pictures and video are compressed
         #: already, so not unless told.
         self._compress = compress
@@ -283,6 +306,8 @@ class Layer:
         #: The last thing the wall said of each kind, and the errors it
         #: said about our frames, newest last.
         self._said = {}
+        #: Set once the wall has said its `caps` to the session open now.
+        self._caps_said = threading.Event()
         self.errors = collections.deque(maxlen=16)
         self._repaint = threading.Event()
         self._meta = {}
@@ -312,6 +337,7 @@ class Layer:
 
     def _open(self):
         self._settled.clear()
+        self._caps_said.clear()
         # Asked again -- the wall restarted, or the layer reopened -- a layer
         # placed from below asks for the slot it had, which puts it back in
         # its place in the stack whoever comes back first; one placed `top`
@@ -368,6 +394,8 @@ class Layer:
             self._write(protocol.command("report").encode())
             if self._align != "centre":
                 self._write(protocol.command("align", self._align).encode())
+            if self._box is not None:
+                self._write(_box_command(self._box))
             for key, value in self._meta.items():
                 self._write(_apc(f"meta set {key} {value}"))
                 if key == "instance":
@@ -387,6 +415,8 @@ class Layer:
             self.errors.append(said.raw)
         elif name in ("area", "screen", "caps", "watching"):
             self._said[name] = said
+            if name == "caps":
+                self._caps_said.set()
 
     def _ended(self, sess):
         if sess is not self._session or self._stop.is_set():
@@ -596,6 +626,20 @@ class Layer:
             self._write(protocol.command("align", where).encode())
         return self
 
+    def box(self, x=None, y=None, w=None, h=None):
+        """Fit the stream on `data` to the box w by h at x, y in the
+        glass's pixels, from its next frame, or to the whole glass again
+        with no arguments. Its frames are scaled to fit the box with their
+        shape kept, `align` placing them within it, and the layer is
+        transparent outside it. The box is kept through a change of glass,
+        what falls off the glass not drawn. A wall whose `caps` do not say
+        `box` fills the glass, and a sender that needs the box sends
+        `frame`s instead."""
+        self._box = None if (x, y, w, h) == (None,) * 4 else _box(x, y, w, h)
+        if self.open_now:
+            self._write(_box_command(self._box))
+        return self
+
     def meta(self, **keys):
         """Say what this layer is, as a sender's meta says it; said again
         whenever the layer opens again."""
@@ -645,6 +689,16 @@ class Layer:
         """The words and keys of the wall's `caps`, or None before it said."""
         said = self._said.get("caps")
         return said
+
+    def offers(self, word, wait=5.0):
+        """Whether the wall's `caps` says `word`, as `box` from a wall that
+        fits a stream to a box. The layer asks for them once it opens, so
+        this waits up to `wait` seconds for the answer; a wall that has
+        not said them by then offers nothing."""
+        if not self._caps_said.wait(wait):
+            return False
+        said = self._said.get("caps")
+        return said is not None and (word in said.args or word in said.opts)
 
     def takes(self, codec):
         """Whether the wall draws a frame in `codec`, `qoi`, `png` or

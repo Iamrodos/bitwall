@@ -35,8 +35,9 @@ handed each picture and the placements, never the strings.
 says `jpeg`, each called under the wall's lock and each returning at
 once; `done(bytes or None)` comes back later from another thread.
 A glass that decodes films on `data` has `vstart`, `vchunk`, `vend`,
-`vgone`, `vmove`, `films()`, `backlog()` and `look_layer` as well: the
-wall cuts the stream into frames and times it, and the glass decodes.
+`vgone`, `vmove`, `valign`, `vbox`, `films()`, `backlog()` and
+`look_layer` as well: the wall cuts the stream into frames and times it,
+says where they go, and the glass decodes.
 
 Timings are PROTOCOL.md's, scaled by `BITWALL_CLOCK_SCALE` as the
 painter's are, for tests.
@@ -95,6 +96,7 @@ MAY = {
     "frame": frozenset({"video"}),
     "clear": frozenset({"video", "layer"}),
     "align": frozenset({"video"}),
+    "box": frozenset({"video"}),
     "presence": frozenset({"controller"}),
     "stats": frozenset({"controller"}),
     "picture": ALL,
@@ -133,13 +135,38 @@ GOP_MAX = 32 << 20
 BACKLOG = 4 << 20
 
 
+#: `size=`'s value: ASCII digits, an `x`, ASCII digits.
+SIDES = re.compile(r"([0-9]{1,4})x([0-9]{1,4})\Z")
+
+
 def side_pair(word):
     """`<w>x<h>` as (w, h), each 1..FRAME_SIDE, or (0, 0)."""
-    w, sep, h = word.partition("x")
-    if not (sep and w.isdigit() and h.isdigit() and len(w) <= 4 and len(h) <= 4
-            and 1 <= int(w) <= FRAME_SIDE and 1 <= int(h) <= FRAME_SIDE):
+    m = SIDES.match(word)
+    if not (m and 1 <= int(m.group(1)) <= FRAME_SIDE and 1 <= int(m.group(2)) <= FRAME_SIDE):
         return 0, 0
-    return int(w), int(h)
+    return int(m.group(1)), int(m.group(2))
+
+
+#: `at=`'s value: an optional `-` and ASCII digits, twice, a comma between.
+AT = re.compile(r"(-?[0-9]{1,6}),(-?[0-9]{1,6})\Z")
+
+
+def at_pair(word):
+    """`<x>,<y>` as (x, y), each within 65535 of 0 either way, or
+    (None, None)."""
+    m = AT.match(word)
+    if not m:
+        return None, None
+    x, y = int(m.group(1)), int(m.group(2))
+    if abs(x) > 65535 or abs(y) > 65535:
+        return None, None
+    return x, y
+
+
+def plain(word):
+    """A word of a request as an error says it back, as the painter does:
+    at most 47 characters, each outside printable ASCII a `?`."""
+    return "".join(c if " " < c < "\x7f" else "?" for c in word[:47])
 
 
 def frame_words(codec, w, h, x, y, size):
@@ -308,9 +335,12 @@ class Session:
         self.codec = None
         self.fps = None
         self.start = None
-        #: Where the stream's frames leave the glass spare: -1 all below,
+        #: Where the stream's frames leave their box spare: -1 all below,
         #: 0 even, 1 all above, as `align` says.
         self.align = 0
+        #: The box the stream's frames are fitted to, (x, y, w, h) in the
+        #: glass's pixels as `box` says, or None for the glass.
+        self.box = None
         self.data_fd = None
         self.data_idle_until = 0.0
         self.streaming = False
@@ -1032,7 +1062,8 @@ class Wall:
         """What a glass is told of a film as it starts: the stream, its
         codec and rate, and frame 0's time on the Unix clock in ms."""
         t0 = None if s.t0 is None else (s.t0 + time.time() - time.monotonic()) * 1000
-        return {"s": s.streams, "codec": s.codec, "fps": s.fps or 0, "t0": t0, "a": s.align}
+        return {"s": s.streams, "codec": s.codec, "fps": s.fps or 0, "t0": t0, "a": s.align,
+                "b": s.box}
 
     def _hand_on(self, s, i, key, data):
         """A film's frame to the glass, the stream announced first."""
@@ -1045,18 +1076,19 @@ class Wall:
         self._lglass("vchunk", s.z, {"s": s.streams, "i": i, "key": key}, data)
 
     def _data_show(self, s, now, img):
-        """A picture from `data`, QOI or JPEG, up now: filling the glass with
-        its shape kept, centred, or against the top or bottom as `align`
-        says. The cutter has checked its header."""
+        """A picture from `data`, QOI or JPEG, up now: filling its `box`, or
+        the glass where it has none, with its shape kept, centred, or
+        against the top or bottom as `align` says. The cutter has checked
+        its header."""
         if self.above.get(s.z) is not s:
             return
         codec = DATA_PICTURES[s.codec]
         w, h = protocol.image_size(codec, img)
-        gw, gh = self.pixels or NOMINAL_BOX
-        k = min(gw / w, gh / h)
-        dw, dh = max(1, round(w * k)), max(1, round(h * k))
-        x = (gw - dw) // 2
-        y = 0 if s.align < 0 else gh - dh if s.align > 0 else (gh - dh) // 2
+        bx, by, bw, bh = s.box or (0, 0, *(self.pixels or NOMINAL_BOX))
+        k = min(bw / w, bh / h)
+        dw, dh = max(1, int(w * k + 0.5)), max(1, int(h * k + 0.5))
+        x = bx + (bw - dw) // 2
+        y = by + (0 if s.align < 0 else bh - dh if s.align > 0 else (bh - dh) // 2)
         s.frame_count += 1
         self._redraws.append(now)
         size = (dw, dh) if (dw, dh) != (w, h) else None
@@ -1326,7 +1358,7 @@ class Wall:
                   f" images={','.join(IMAGES)}" if "video" in self.types else "")
         words = CAPS if self.kitty_on else CAPS.replace(" kitty", "")
         if self.data_codecs:
-            words += " data align"
+            words += " data align box"
         extra = "".join(" " + c for c in self.commands)
         above = f" above={','.join(self.above_types)}" if self.layers > 1 else ""
         return (f"caps {words}{extra} layers={self.layers} "
@@ -1661,12 +1693,10 @@ class Wall:
         for word in words[3:-1]:
             key, _, value = word.partition("=")
             if key == "at":
-                a, comma, b = value.partition(",")
-                try:
-                    x, y = int(a), int(b)
-                    good = comma and abs(x) < 65536 and abs(y) < 65536
-                except ValueError:
-                    good = False
+                ax, ay = at_pair(value)
+                good = ax is not None
+                if good:
+                    x, y = ax, ay
             elif key == "size":
                 size = side_pair(value)
                 good = bool(size[0])
@@ -1696,8 +1726,37 @@ class Wall:
             self._say(s, f"error align {protocol.word(word)}: not top, centre or bottom{tag}")
             return
         s.align = ALIGN[word]
-        if self.above.get(s.z) is s and s.announced:
+        if self.above.get(s.z) is s:
             self._lglass("valign", s.z, s.align)
+
+    def _cmd_box(self, s, m, tag, now):
+        """`box [at=<x>,<y>] size=<w>x<h>`: the box in the glass's pixels
+        the stream's frames are fitted to, from the next frame; `box`
+        alone, the whole glass again. Kept through a change of glass,
+        what falls off it not drawn."""
+        x = y = 0
+        size = None
+        words = [w for w in m.raw.split()[1:] if not w.startswith("id=")]
+        for word in words:
+            key, eq, value = word.partition("=")
+            if eq and key == "at":
+                x, y = at_pair(value)
+                good = x is not None
+            elif eq and key == "size":
+                size = side_pair(value)
+                good = bool(size[0])
+            else:
+                self._say(s, f"error box {plain(word)}: unknown option{tag}")
+                return
+            if not good:
+                self._say(s, f"error box {plain(word)}: bad value{tag}")
+                return
+        if words and size is None:
+            self._say(s, f"error box no size{tag}")
+            return
+        s.box = (x, y, *size) if size else None
+        if self.above.get(s.z) is s:
+            self._lglass("vbox", s.z, s.box)
 
     def _cmd_close(self, s, m, tag, now):
         self._end(s, "asked")

@@ -80,6 +80,7 @@ MAY = {
     "frame": frozenset({"video", "vbase"}),
     "clear": frozenset({"video", "vbase", "layer"}),
     "align": frozenset({"video", "vbase"}),
+    "box": frozenset({"video", "vbase"}),
     "presence": frozenset({"controller"}),
     "stats": frozenset({"controller"}),
     "picture": ALL,
@@ -91,7 +92,7 @@ MAY = {
 }
 
 CAPS = ("area font grid meta blank want presence repaint watching ping detach "
-        "close screen picture mirror stats sessions follow measures frame clear data align")
+        "close screen picture mirror stats sessions follow measures frame clear data align box")
 #: What a stream on a layer's `data` may be.
 CODECS = ("qoi", "hevc", "h264", "mjpeg")
 #: What a frame on a video layer's `in` may be.
@@ -108,13 +109,33 @@ FRAME_MAX = 16 << 20
 HOLD_MS = 1000
 
 
+#: `size=`'s value: ASCII digits, an `x`, ASCII digits.
+SIDES = re.compile(r"([0-9]{1,4})x([0-9]{1,4})\Z")
+
+
 def side_pair(word):
     """`<w>x<h>` as (w, h), each 1..FRAME_SIDE, or (0, 0)."""
-    w, sep, h = word.partition("x")
-    if not (sep and w.isdigit() and h.isdigit() and len(w) <= 4 and len(h) <= 4
-            and 1 <= int(w) <= FRAME_SIDE and 1 <= int(h) <= FRAME_SIDE):
+    m = SIDES.match(word)
+    if not (m and 1 <= int(m.group(1)) <= FRAME_SIDE and 1 <= int(m.group(2)) <= FRAME_SIDE):
         return 0, 0
-    return int(w), int(h)
+    return int(m.group(1)), int(m.group(2))
+
+
+
+#: `at=`'s value: an optional `-` and ASCII digits, twice, a comma between.
+AT = re.compile(r"(-?[0-9]{1,6}),(-?[0-9]{1,6})\Z")
+
+
+def at_pair(word):
+    """`<x>,<y>` as (x, y), each within 65535 of 0 either way, or
+    (None, None)."""
+    m = AT.match(word)
+    if not m:
+        return None, None
+    x, y = int(m.group(1)), int(m.group(2))
+    if abs(x) > 65535 or abs(y) > 65535:
+        return None, None
+    return x, y
 
 
 def frame_words(codec, w, h, x, y, size):
@@ -264,6 +285,9 @@ class Session:
         #: Where the stream's frames sit on a glass of another shape, as
         #: `align` says: "top", "centre" or "bottom".
         self.align = "centre"
+        #: The box the stream's frames are fitted to, (x, y, w, h), as
+        #: `box` says, or None for the glass.
+        self.box = None
         self.data_fd = None
         self.data_idle_until = 0.0
         self.streaming = False
@@ -859,15 +883,16 @@ class FakeWall:
             self.painted = True
         if self.above.get(s.z) is not s:
             return
-        gw, gh = self.glass_w, self.glass_h
+        bx, by, bw, bh = s.box or (0, 0, self.glass_w, self.glass_h)
         if w and h:
-            k = min(gw / w, gh / h)
-            dw, dh = max(1, round(w * k)), max(1, round(h * k))
-            x = (gw - dw) // 2
-            y = {"top": 0, "bottom": gh - dh}.get(s.align, (gh - dh) // 2)
-            s.vlast = (w, h, x, y, 0, img, "jpeg" if s.codec == "mjpeg" else "qoi", None)
+            k = min(bw / w, bh / h)
+            dw, dh = max(1, int(w * k + 0.5)), max(1, int(h * k + 0.5))
+            x = bx + (bw - dw) // 2
+            y = by + {"top": 0, "bottom": bh - dh}.get(s.align, (bh - dh) // 2)
+            s.vlast = (w, h, x, y, 0, img, "jpeg" if s.codec == "mjpeg" else "qoi",
+                       (dw, dh) if (dw, dh) != (w, h) else None)
         else:
-            x, y, dw, dh = 0, 0, gw, gh
+            x, y, dw, dh = bx, by, bw, bh
         self.pics[s.z] = {"w": dw, "h": dh, "x": x, "y": y, "until": float("inf")}
 
     def _clear(self, z):
@@ -1202,12 +1227,10 @@ class FakeWall:
         for word in words[3:-1]:
             key, _, value = word.partition("=")
             if key == "at":
-                a, comma, b = value.partition(",")
-                try:
-                    x, y = int(a), int(b)
-                    good = comma and abs(x) < 65536 and abs(y) < 65536
-                except ValueError:
-                    good = False
+                ax, ay = at_pair(value)
+                good = ax is not None
+                if good:
+                    x, y = ax, ay
             elif key == "size":
                 size = side_pair(value)
                 good = bool(size[0])
@@ -1234,6 +1257,29 @@ class FakeWall:
             self._say(s, f"error align {word}: not top, centre or bottom{tag}")
             return
         s.align = word
+
+    def _cmd_box(self, s, m, tag, now):
+        x = y = 0
+        size = None
+        words = [w for w in m.raw.split()[1:] if not w.startswith("id=")]
+        for word in words:
+            key, eq, value = word.partition("=")
+            if eq and key == "at":
+                x, y = at_pair(value)
+                good = x is not None
+            elif eq and key == "size":
+                size = side_pair(value)
+                good = bool(size[0])
+            else:
+                self._say(s, f"error box {word}: unknown option{tag}")
+                return
+            if not good:
+                self._say(s, f"error box {word}: bad value{tag}")
+                return
+        if words and size is None:
+            self._say(s, f"error box no size{tag}")
+            return
+        s.box = (x, y, *size) if size else None
 
     def _cmd_close(self, s, m, tag, now):
         self._end(s, "asked")

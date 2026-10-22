@@ -530,6 +530,25 @@ its own clock is told by `when_lost(fn)` and says when with
 `start_at(ms)`.
 `senders/film` does all of this, on one wall or cut across several.
 
+A film fills the glass unless it is given a box, in the glass's pixels:
+
+```python
+inset = bitwall.layer("pi.local", data=True, codec="hevc", fps=25,
+                      box=(1200, 80, 640, 360))
+inset.box(40, 600, 480, 270)   # from the next frame, mid-film or between films
+inset.box()                    # the whole glass again
+```
+
+Its frames keep their shape within the box, `align` placing them, and
+the layer is transparent outside it, so the film plays as an inset over
+whatever is beneath. The box is said again whenever the layer opens, and
+kept through a change of glass; what falls off the glass is not drawn,
+so on `repaint_asked()` work out a new one from `pixels()`. Where
+`inset.offers("box")` is False, the wall fills the glass: send the
+film's frames as JPEGs on `in` instead, each with `at` and `size`.
+`offers` waits a moment for the wall's `caps`, which a layer hears just
+after it opens.
+
 ffmpeg reads its input seconds ahead of what it has decoded, so the writer
 finishes well before the film does: wait for start + length before calling
 it over.

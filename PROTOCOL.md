@@ -317,7 +317,7 @@ wake a dozing wall or end its status page. The base's first paint does.
 | `want` | yes | yes | no |
 | `frame` | a video base | a video layer | no |
 | `clear` | a video base | a video or cells layer | no |
-| `align` | a video base | a video layer | no |
+| `align`, `box` | a video base | a video layer | no |
 | `presence`, `stats`, `follow`, `measures`, `glass` | no | no | yes |
 | `report`, `sessions`, `ping`, `pong`, `picture`, `mirror` | yes | yes | yes |
 | `meta`, `detach`, `close` | its own session | its own session | its own session |
@@ -459,8 +459,8 @@ as the mechanism.
 The words are the commands and announcements it knows: `area`, `font`,
 `grid`, `meta`, `blank`, `want`, `input`, `presence`, `repaint`,
 `watching`, `ping`, `detach`, `close`, `screen`, `picture`, `mirror`,
-`stats`, `sessions`, `follow`, `measures`, `frame`, `clear`, and `data`
-and `align` where it takes a data pipe; `kitty` where its grid carries kitty
+`stats`, `sessions`, `follow`, `measures`, `frame`, `clear`, and `data`,
+`align` and `box` where it takes a data pipe; `kitty` where its grid carries kitty
 graphics (*A grid may carry kitty graphics*); `stream` where it
 streams its glass raw (*The glass as a raw stream*); and `glass` where a
 controller may ask its glass for a size (*`glass` asks for pixels*). A wall may take commands
@@ -1598,8 +1598,10 @@ The codec is one the wall's `images` lists:
 A photograph goes as the JPEG it came as, rather than made into a QOI
 five times its size. `<w>x<h>` is the image's own size, which its
 header must match, at most 4096 each way. `at` is where its top left
-corner goes, in the glass's pixels as `screen pixels=` counts them, 0,0
-when left out; what falls off the glass is not drawn. `size` is the box
+corner goes, in the glass's pixels as `screen pixels=` counts them, each
+a whole number in ASCII digits with `-` before one left of or above the
+glass, at most 65535 either way, 0,0 when left out; what falls off the
+glass is not drawn. `size` is the box
 it is drawn to there, at most 4096 each way, scaled smoothly by the wall
 on its GPU or in the browser, its own size when left out; the wall
 stretches to the box, so the picture's shape is the sender's to keep.
@@ -1679,24 +1681,53 @@ decoded by then is played out, and the layer is cleared. The session
 stays open, and the next writer starts the next stream, so the next clip
 needs no new knock at the door.
 
-**Each frame fills the glass**: it is scaled to the largest size that fits
-the glass's pixels with its shape kept, and centred. A sender wanting
-pixel for pixel sends frames the glass's size, as `screen pixels=` says
-it.
+**Each frame fills its box**, the whole glass unless the layer says
+another: it is scaled to the largest size that fits the box with its
+shape kept, and centred. A sender wanting pixel for pixel sends frames
+the box's size, the glass's as `screen pixels=` says it where there is
+no box.
 
-**Where the glass left over goes** is the layer's to say, on its `in`:
+**The box** is the layer's to say, on its `in`:
+
+    ESC _ bitwall box at=<x>,<y> size=<w>x<h> ESC \
+    ESC _ bitwall box ESC \
+
+`at` is where its top left corner goes, in the glass's pixels, each a
+whole number in ASCII digits with `-` before one left of or above the
+glass, at most 65535 either way, 0,0 when left out; `size` is its width
+and height, at most 4096 each way; `box`
+alone is the whole glass again. So a film plays as an inset over
+whatever is beneath, the layer transparent outside its frame. It holds
+from the next frame, mid-stream or between streams, for the life of the
+session, so a layer that opens again says it again. The box is kept
+through a change of glass, a new mode or a web wall's deciding tab
+settling on a new box, as the pixels it says; what then falls off the
+glass is not drawn, and the layer, cleared and told `screen` and
+`repaint`, may say another. A box it cannot take is said, with the id if
+there was one:
+
+    error box no size                       `at` alone
+    error box size=0x10: bad value
+    error box over=1: unknown option
+
+A wall whose `caps` do not say `box` fills the glass with every frame;
+it drops the command as it drops any it does not know, and a sender
+that needs the box sends its frames on `in` instead, each with `at` and
+`size`.
+
+**Where the box left over goes** is the layer's to say too:
 
     ESC _ bitwall align top|centre|bottom ESC \
 
-`top` puts the frame against the top of a glass taller than its shape,
-the spare glass all below it; `bottom` against the bottom; `centre`, the
-default, in the middle. A glass wider than the frame's shape has its
-spare at the sides, centred, whatever `align` says, so on a glass of the
-frame's own shape it changes nothing. It holds from the next frame, for
-the life of the session, so a layer that opens again says it again. Any
-other word is `error align <word>: not top, centre or bottom`. A wall
-whose `caps` do not say `align` centres every frame; it drops the command
-as it drops any it does not know.
+`top` puts the frame against the top of a box taller than its shape, the
+spare all below it; `bottom` against the bottom; `centre`, the default,
+in the middle. A box wider than the frame's shape has its spare at the
+sides, centred, whatever `align` says, so on a box of the frame's own
+shape it changes nothing. It holds from the next frame, for the life of
+the session, so a layer that opens again says it again. Any other word
+is `error align <word>: not top, centre or bottom`. A wall whose `caps`
+do not say `align` centres every frame; it drops the command as it drops
+any it does not know.
 
 **Timed playback.** With `fps`, the wall plays the stream out rather than
 the sender pacing it: frame i is shown when the wall's clock reaches

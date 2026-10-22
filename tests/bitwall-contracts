@@ -3808,6 +3808,71 @@ def a_stream_sits_where_align_says_on_a_glass_of_another_shape(r):
 
 
 @conformance(known_for=NO_DATA)
+def a_stream_fills_the_box_it_is_given_and_the_glass_again_without_one(r):
+    """`box at=<x>,<y> size=<w>x<h>` on a video layer's `in` fits its
+    stream's frames to that box on the glass, with their shape kept and
+    `align` placing them within it, from the next frame; `box` alone gives
+    back the whole glass; `caps` says `box`, and a box with no size, a bad
+    value or another option is an error."""
+    caps, _ = codecs_of(r)
+    assert "box" in caps, caps
+    ctl = connected(r, "ctl", "controller")
+    gw, gh = glass_pixels(ctl)
+    v = connected(r, "v", z="above", type="video", data="1", codec="qoi")
+    fd = data_in(v)
+    fw, fh = 64, 4
+    bx, by, bw, bh = gw // 4, gh // 4, gw // 2, gh // 2
+    seen = []
+
+    def placed():
+        """Where a picture of the layer says its frame went, and the size
+        it was drawn at."""
+        ctl.frames = []
+        ctl.command("picture v")
+        ctl.wait_frames(lambda f: f, 1.0)
+        for words, _ in ctl.frames[-1:]:
+            at = next((w[3:] for w in words if w.startswith("at=")), None)
+            size = next((w[5:] for w in words if w.startswith("size=")), None)
+            if at:
+                seen[:] = [(tuple(int(n) for n in at.split(",")),
+                            tuple(int(n) for n in size.split("x")) if size else None)]
+        return seen[0] if seen else None
+
+    def fit(x, y, w, h, top=False):
+        k = min(w / fw, h / fh)
+        dw, dh = max(1, int(fw * k + 0.5)), max(1, int(fh * k + 0.5))
+        return (x + (w - dw) // 2, y if top else y + (h - dh) // 2), (dw, dh)
+
+    try:
+        for box, want in ((f"box at={bx},{by} size={bw}x{bh}", fit(bx, by, bw, bh)),
+                          ("box", fit(0, 0, gw, gh))):
+            v.command(box)
+            os.write(fd, qoi_frame(fw, fh, (200, 40, 40, 255)))
+            assert wait_for(lambda: placed() == want, 3), \
+                f"{box}: the frame is {seen}, not {want}, on {gw}x{gh}"
+        v.command("align top")
+        v.command(f"box at={bx},{by} size={bw}x{bh}")
+        os.write(fd, qoi_frame(fw, fh, (200, 40, 40, 255)))
+        want = fit(bx, by, bw, bh, top=True)
+        assert wait_for(lambda: placed() == want, 3), \
+            f"align top in a box: the frame is {seen}, not {want}"
+        v.heard = []
+        for bad in ("box at=1,2", "box size=0x5", "box over=1", "box size",
+                    "box at=,5 size=10x10", "box at=1_0,5 size=10x10", "box at=+1,2 size=10x10",
+                    "box at=65536,0 size=10x10"):
+            v.command(bad)
+        for said in ("error box no size", "error box size=0x5: bad value",
+                     "error box over=1: unknown option", "error box size: unknown option",
+                     "error box at=,5: bad value", "error box at=1_0,5: bad value",
+                     "error box at=+1,2: bad value", "error box at=65536,0: bad value"):
+            assert v.wait(lambda h: any(x.startswith(said) for x in h)), (said, v.heard)
+    finally:
+        os.close(fd)
+        v.close()
+        ctl.close()
+
+
+@conformance(known_for=NO_DATA)
 def a_stream_with_a_start_waits_for_it_and_drops_what_is_late(r):
     """With `fps` and `start`, frame i is shown at start + i/fps: frames
     written before `start` wait for it, and frames already late are
@@ -4009,6 +4074,41 @@ def a_layer_says_its_align_on_opening_and_when_it_changes():
             pass
         else:
             raise AssertionError("align('middle') was taken")
+    finally:
+        layer.close()
+        fake.remove()
+
+
+@check
+def a_layer_says_its_box_on_opening_and_when_it_changes():
+    """`bitwall.layer(..., box=(x, y, w, h))` says its box as the layer
+    opens, `layer.box(...)` says a new one and `layer.box()` the whole
+    glass again; a box that is not four whole numbers the wall would take
+    is refused before anything is asked."""
+    fake = a_fake(20, 4)
+    for bad in ((0, 0, 0, 10), (0, 0, 10), (0.5, 0, 10, 10), (0, 0, 5000, 10)):
+        try:
+            bitwall.video.Layer("localhost", run=fake.dir, data=True, codec="qoi", box=bad)
+        except (ValueError, TypeError):
+            continue
+        raise AssertionError(f"box={bad!r} was taken")
+    layer = bitwall.layer("localhost", run=fake.dir, place="above", data=True, codec="qoi",
+                          box=(10, 20, 300, 200))
+    try:
+        s = fake.session(layer._session.name)
+        assert wait_for(lambda: s.box == (10, 20, 300, 200), 3), s.box
+        layer.box(-5, 0, 40, 30)
+        assert wait_for(lambda: s.box == (-5, 0, 40, 30), 3), s.box
+        layer.box()
+        assert wait_for(lambda: s.box is None, 3), s.box
+        assert layer.offers("box", wait=3), "the fake wall's caps say box"
+        assert not layer.offers("no-such-word", wait=0), "a word caps does not say"
+        try:
+            layer.box(1, 2)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("box(1, 2) was taken")
     finally:
         layer.close()
         fake.remove()

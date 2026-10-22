@@ -1690,7 +1690,7 @@
       this.filmDrop(z);
       this.films[z] = {
         z: z, s: s.s, codec: s.codec, fps: +s.fps || 0, t0: s.t0 == null ? null : +s.t0,
-        a: +s.a || 0,
+        a: +s.a || 0, b: s.b || null,
         dec: null, base: 0, nOut: 0, last: -1, chain: Promise.resolve(),
         queue: [], ended: false, flushed: false, box: null, lastDue: -1,
         joined: s.t0 == null || !s.fps ? 0 : Math.floor((Date.now() - s.t0) * s.fps / 1000),
@@ -1869,14 +1869,16 @@
         this._pump = setTimeout(function () { self.filmPump(); }, Math.max(4, next - now));
     },
 
-    /* A film's frame on its layer, filling the glass with its shape kept:
-     * centred, or against the top (`a` -1) or the bottom (1). */
+    /* A film's frame on its layer, filling its box `b` (x, y, w, h), or the
+     * glass where it has none, with its shape kept: centred, or against
+     * the box's top (`a` -1) or its bottom (1). */
     filmShow: function (F, f) {
       var c = this.layers[F.z], x = c.getContext('2d'), bmp = f.bmp;
-      var k = Math.min(c.width / bmp.width, c.height / bmp.height);
+      var b = F.b || [0, 0, c.width, c.height];
+      var k = Math.min(b[2] / bmp.width, b[3] / bmp.height);
       var w = Math.max(1, Math.round(bmp.width * k)), h = Math.max(1, Math.round(bmp.height * k));
-      var px = (c.width - w) >> 1;
-      var py = F.a < 0 ? 0 : F.a > 0 ? c.height - h : (c.height - h) >> 1;
+      var px = b[0] + ((b[2] - w) >> 1);
+      var py = b[1] + (F.a < 0 ? 0 : F.a > 0 ? b[3] - h : (b[3] - h) >> 1);
       x.clearRect(0, 0, c.width, c.height);
       x.imageSmoothingEnabled = true;
       x.imageSmoothingQuality = 'high';
@@ -1977,6 +1979,7 @@
       if (s.t === 'vstart') { this.filmStart(s); return; }
       if (s.t === 'vend') { this.filmEnd(s.z | 0, s.s); return; }
       if (s.t === 'valign') { var VF = this.films[s.z | 0]; if (VF) VF.a = +s.a || 0; return; }
+      if (s.t === 'vbox') { var BF = this.films[s.z | 0]; if (BF) BF.b = s.b || null; return; }
       if (s.t === 'vgone') { this.filmDrop(s.z | 0); this.clearLayer(s.z | 0); return; }
       if (s.t === 'vmove') { this.filmMove(s.z | 0, s.to | 0); return; }
       if (s.t === 'look') {
