@@ -6660,18 +6660,25 @@ def the_mirror_shows_a_streaming_wall_on_two_others_and_refuses_a_third():
 @check
 def the_mirror_reads_what_each_destination_is_sent_and_plans_its_streams():
     """`--to host:wall@WxH/fps` gives a destination its own most and rate,
-    either left out; an `@` that says neither is part of the host. The
+    either left out, and `+x+y` after `WxH` a box that size at x, y on its
+    glass; an `@` that says none of them is part of the host. The
     painter is asked one stream for each size and rate where its `caps`
     say it runs that many, named for them; otherwise one, unnamed, at the
     largest size and the highest rate, as a v1 painter is asked."""
     m = _mirror()
-    assert m.parse_dest("pi.local:0") == ("pi.local:0", None, None)
-    assert m.parse_dest("pi.local:0@1920x1080/15") == ("pi.local:0", (1920, 1080), 15)
-    assert m.parse_dest("pi.local@640x360") == ("pi.local", (640, 360), None)
-    assert m.parse_dest("pi.local:1@/12") == ("pi.local:1", None, 12)
-    assert m.parse_dest("pi@pi.local:0") == ("pi@pi.local:0", None, None)
-    assert m.parse_dest("pi@pi.local:0@800x480") == ("pi@pi.local:0", (800, 480), None)
-    for bad in ("pi.local:0@8x8", "pi.local:0@640x360/0", "pi.local:0@640x360/x"):
+    assert m.parse_dest("pi.local:0") == ("pi.local:0", None, None, None)
+    assert m.parse_dest("pi.local:0@1920x1080/15") == ("pi.local:0", (1920, 1080), 15, None)
+    assert m.parse_dest("pi.local@640x360") == ("pi.local", (640, 360), None, None)
+    assert m.parse_dest("pi.local:1@/12") == ("pi.local:1", None, 12, None)
+    assert m.parse_dest("pi@pi.local:0") == ("pi@pi.local:0", None, None, None)
+    assert m.parse_dest("pi@pi.local:0@800x480") == ("pi@pi.local:0", (800, 480), None, None)
+    assert m.parse_dest("pi.local:1@1280x720/25+600+180") == \
+        ("pi.local:1", (1280, 720), 25, (600, 180, 1280, 720))
+    assert m.parse_dest("pi.local:1@640x360+0+0") == \
+        ("pi.local:1", (640, 360), None, (0, 0, 640, 360))
+    for bad in ("pi.local:0@8x8", "pi.local:0@640x360/0", "pi.local:0@640x360/x",
+                "pi.local:1@+5+5", "pi.local:1@640x360+5", "pi.local:1@640x360+-5+5",
+                "pi.local:1@640x360+70000+0", "pi.local:1@5000x360+0+0"):
         try:
             m.parse_dest(bad)
         except Exception:                                       # noqa: BLE001

@@ -136,7 +136,7 @@ is.
 
 | option | what it does | default, and why |
 |---|---|---|
-| `--to` | the walls that show it, `host` or `host:wall`, by commas; each may end in what it is sent, `@WxH`, `@WxH/fps` or `@/fps`, in place of `--size` and `--fps` for that one | none: it must be given |
+| `--to` | the walls that show it, `host` or `host:wall`, by commas; each may end in what it is sent, `@WxH`, `@WxH/fps` or `@/fps`, in place of `--size` and `--fps` for that one, and `+x+y` after `WxH` (`@1280x720/25+600+180`) to play it in a box that size at x, y on that wall's glass, the rest of the glass left to the layers beneath and above, where the wall's `caps` say `box` | none: it must be given |
 | `--size WxH` | the most a destination is sent; never more than its glass or the source, the source's shape kept | the destination's glass, at most 1280x720: 720p25 is what a Pi 3 shows without falling behind |
 | `--fps` | frames a second sent | 25. A Pi 3 at 1080p wants 15 |
 | `--lead` | seconds behind the source each frame is shown, on each destination's clock, one for every destination so they show each frame together; `0` shows each as soon as it is decoded | the most any destination wants, and the log says which. 0.25 s. 0.5 s where a frame is held on its way: by VideoToolbox encoding it (a Mac source, whose frames leave it 206 to 230 ms after drawn at 720p25, and 336 ms in HEVC at 15 fps), or by a destination whose `threads` line says above 2 for what it is sent (`decoder=` in hardware, `software=` on the CPU: a painter given `--decoder-threads` above 2). 0.8 s above 720p on a destination that decodes H.264 in hardware and not HEVC, a Pi 3, whose decoder is late with every frame at 0.25 s at 1080p and smooth at 0.8 |

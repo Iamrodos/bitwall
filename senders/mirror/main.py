@@ -27,6 +27,10 @@ jump of more than a second is the stream begun again, and is not filled.
 **Each destination may say what it is sent**, `host:wall@WxH/fps` in
 `--to`: `WxH` the most it is sent, in place of `--size`, and `fps` its
 rate, in place of `--fps`; either may be left out (`pi.local:0@/15`).
+`+x+y` after them plays it in a box `WxH` at x, y on that wall's glass
+(`pi.local:1@1280x720/25+600+180`), the rest of its glass left to the
+layers beneath and above, a run sheet beside a confidence monitor; a
+destination whose `caps` do not say `box` is refused.
 
 **Each destination is paired with a codec**, first that works: one this
 machine encodes in hardware and the destination decodes in hardware
@@ -95,6 +99,7 @@ import math
 import os
 import posixpath
 import queue
+import re
 import select
 import shlex
 import signal
@@ -1740,6 +1745,9 @@ class Mirror:
         self.enc = Encoders()
         self.force = None if args.codec == "auto" else args.codec
         self.most = args.size or CAP
+        #: Where each destination's stream goes on its glass, (x, y, w, h),
+        #: where its `--to` says a box.
+        self.boxes = {}
         #: One for every destination; None until the first is chosen,
         #: where `--lead` does not say.
         self.lead = args.lead
@@ -1764,6 +1772,9 @@ class Mirror:
         if name is None:
             log(f"{t}: refused: {why}")
             return None
+        if want[2] and "box" not in got["words"]:
+            log(f"{t}: refused: its glass takes no box (its caps do not say `box`)")
+            return None
         size = size_for(self.src["pixels"], got["pixels"], want[0] or self.most)
         fps = want[1] or self.args.fps
         threads = got["decoder"] if codec in got["hw"] else got["software"]
@@ -1776,6 +1787,10 @@ class Mirror:
         if self.place == "auto":
             log(f"{t}: " + (f"above its base, which {got['base']} holds" if got["base"]
                             else "on its base, which nobody holds"))
+        if want[2]:
+            self.boxes[t] = want[2]
+            log(f"{t}: in a box {want[2][2]}x{want[2][3]} at {want[2][0]},{want[2][1]}, "
+                f"the rest of its glass left to the layers beneath and above")
         return codec, name, size, fps, wanted, got["base"]
 
     def _stream(self, size, fps, codec=None):
@@ -1866,7 +1881,8 @@ class Mirror:
                 at, take = placing.choose(mine)
             return bitwall.video.Layer(t, place=at, take=take, data=True,
                                        codec=codec, fps=timed,
-                                       start=start if timed else None, instance=instance)
+                                       start=start if timed else None, instance=instance,
+                                       box=self.boxes.get(t))
         d = Dest(t, g, opener, self.stop, fps=timed, lead=lead, offset=offset,
                  cap=int(g.mbps * 1e6 / 8 * QUEUE_SECS) + (256 << 10),
                  describe=f"{self.args.target}'s glass, {codec} {size[0]}x{size[1]}")
@@ -1915,24 +1931,43 @@ def parse_size(text):
     return int(w), int(h)
 
 
+#: What may follow a destination's `@`: `WxH`, `/fps` and `+x+y`, in that
+#: order, each left out where it is not said.
+DEST_SPEC = re.compile(r"([0-9]+[xX][0-9]+)?(/[^+]*)?(\+.*)?")
+#: A box's place: two numbers, each after a `+`.
+DEST_AT = re.compile(r"\+([0-9]{1,5})\+([0-9]{1,5})")
+
+
 def parse_dest(text):
-    """A destination as `--to` names it, (target, size, fps): `host:wall`,
-    and after `@` the most it is sent and its rate, `WxH`, `WxH/fps` or
-    `/fps`, each None where it is not said. An `@` followed by anything
-    else is part of the target, as in `pi@pi.local`."""
+    """A destination as `--to` names it, (target, size, fps, box):
+    `host:wall`, and after `@` the most it is sent, its rate and where on
+    its glass it goes, `WxH`, `/fps` and `+x+y`, each None where it is not
+    said. A box is `WxH` at x, y, so `+x+y` needs `WxH` before it. An `@`
+    followed by anything else is part of the target, as in `pi@pi.local`."""
     target, at, spec = text.rpartition("@")
-    size_s, slash, fps_s = spec.partition("/")
-    looks = bool(size_s or slash) and (not size_s or "x" in size_s.lower()) \
-        and all(x.isdigit() for x in size_s.lower().split("x") if size_s)
-    if not at or not target or not looks:
-        return text, None, None
+    m = DEST_SPEC.fullmatch(spec)
+    if not at or not target or not spec or not m:
+        return text, None, None, None
+    size_s, fps_s, box_s = m.groups()
     size = parse_size(size_s) if size_s else None
     fps = None
-    if slash:
+    if fps_s is not None:
+        fps_s = fps_s[1:]
         if not fps_s.isdigit() or not 1 <= int(fps_s) <= 60:
             raise argparse.ArgumentTypeError(f"a destination's fps is 1 to 60: {text!r}")
         fps = int(fps_s)
-    return target, size, fps
+    box = None
+    if box_s is not None:
+        where = DEST_AT.fullmatch(box_s)
+        if not size or size[0] > 4096 or size[1] > 4096:
+            raise argparse.ArgumentTypeError(
+                f"a destination's box is its size, at most 4096x4096, at x, y, "
+                f"@WxH+x+y: {text!r}")
+        if not where or int(where[1]) > 65535 or int(where[2]) > 65535:
+            raise argparse.ArgumentTypeError(
+                f"a destination's box is at +x+y, each 0 to 65535: {text!r}")
+        box = (int(where[1]), int(where[2]), size[0], size[1])
+    return target, size, fps, box
 
 
 def main():
@@ -1995,13 +2030,13 @@ def main():
         if not x:
             continue
         try:
-            t, size, fps = parse_dest(x)
+            t, size, fps, box = parse_dest(x)
         except argparse.ArgumentTypeError as e:
             ap.error(str(e))
         t = here(t)
         if t not in dests:
             dests.append(t)
-            wants[t] = (size, fps)
+            wants[t] = (size, fps, box)
     if source in dests:
         log(f"{source} is the source; it is not shown on itself")
         dests.remove(source)
