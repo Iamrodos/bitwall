@@ -1,6 +1,7 @@
 #!/usr/bin/env -S uv run --quiet --script
 # /// script
 # requires-python = ">=3.14"
+# dependencies = ["pyte"]
 # ///
 """What bitwall must keep being true.
 
@@ -16,7 +17,7 @@ that is decided. These cover the things that break silently instead: a
 contract two implementations depend on, and a boundary that stops a screen
 from telling a sender what to do.
 
-Eight groups:
+Nine groups:
 
     the wire       what `serialise` emits, including the frame delimiter
                    the receivers paint on
@@ -30,6 +31,8 @@ Eight groups:
                    made-up catalogue of links, loops and bad files
     the letters    bitwall.letters: sizes, spacing, turns, fit, smoothing,
                    ghosts, cut edges, and the faint cell they travel in
+    the terminal   a terminal program read into cells, through tmux and the
+                   emulator TmuxSource decodes it with
     the contracts  every receiver that runs here, and a real Wall against
                    a fake one; its own checks are in tests/bitwall-contracts
     the GPU painter
@@ -37,8 +40,8 @@ Eight groups:
                    GPU with no screen: the contracts again, and its pixels
                    (tests/painter-pixels), against v1's on a Pi among them
 
-Both ends needs node, the painter needs a C compiler, the contracts need
-uv, and the GPU painter a machine the Makefile builds one for, a Mac.
+Both ends needs node, the painter needs a C compiler, the terminal needs
+tmux, the contracts need uv, and the GPU painter a machine the Makefile builds one for, a Mac.
 Without one, that group is skipped and said to be.
 """
 import json
@@ -2243,6 +2246,134 @@ def the_faces_fill_a_height_and_fall_back_to_dots():
     got = L.draw(g, "Neo", 0, 0, "33ff66", font=L.VT323, height=2,
                  wall=Plain())
     assert got == L.size("Neo", L.DOTS, height=2, wall=Plain()), got
+
+
+# --------------------------------------------------------------- terminal
+#
+# A terminal program read into cells: the bytes it writes, through an
+# emulator, into the grid a wall is sent. Each row of the program's output
+# is one thing an emulator can get wrong on the way.
+
+_PROGRAM = (
+    "plain\r\n"
+    "\x1b[1mbold\x1b[0m \x1b[3mital\x1b[0m \x1b[4munder\x1b[0m "
+    "\x1b[9mstrike\x1b[0m \x1b[7mrev\x1b[0m\r\n"
+    "\x1b[31mred\x1b[0m \x1b[38;5;196midx\x1b[0m "
+    "\x1b[38;2;10;20;30mtrue\x1b[0m \x1b[48;5;21mbg\x1b[0m\r\n"
+    "漢字x\r\n"
+)
+
+#: The program, then its size each time it is told it changed.
+_PROGRAM_SH = """cat "$1"
+trap 'printf "\\033[6;1Hsize %s" "$(stty size)"' WINCH
+while :; do sleep 0.05; done
+"""
+
+
+def _shown(colour):
+    """A colour as a wall shows it, (r, g, b), or 'default'.
+
+    Emulators spell one colour differently -- an index, a name, hex -- and
+    the wall shows each spelling the same, so that is what is compared.
+    """
+    from bitwall import stream
+    if colour == "default":
+        return colour
+    if isinstance(colour, int) and colour >= 16:
+        return stream.palette_256(colour)
+    return stream._rgb(colour)
+
+
+def _program_cells_are_right(cells, cols, rows):
+    """What a wall must be sent for _PROGRAM, in a grid cols x rows."""
+    assert len(cells) == rows and all(len(r) == cols for r in cells), \
+        (len(cells), {len(r) for r in cells})
+
+    def text(y, x, n):
+        return "".join(c[0] for c in cells[y][x:x + n])
+
+    def look(y, x):
+        c = cells[y][x]
+        return (_shown(c[1]), _shown(c[2])) + tuple(bool(a) for a in c[3:8])
+
+    plain = ("default", "default", False, False, False, False, False)
+    assert text(0, 0, 5) == "plain" and look(0, 0) == plain, cells[0][:6]
+    assert text(1, 0, 26) == "bold ital under strike rev", text(1, 0, 26)
+    for x, attr in ((0, 2), (5, 3), (10, 4), (16, 5), (23, 6)):
+        want = list(plain)
+        want[attr] = True
+        assert look(1, x) == tuple(want), (x, cells[1][x])
+    assert look(1, 4) == plain, cells[1][4]
+    assert text(2, 0, 16) == "red idx true bg ", text(2, 0, 16)
+    assert look(2, 0)[0] == (205, 0, 0), cells[2][0]
+    assert look(2, 4)[0] == (255, 0, 0), cells[2][4]
+    assert look(2, 8)[0] == (10, 20, 30), cells[2][8]
+    assert look(2, 13)[:2] == ("default", (0, 0, 255)), cells[2][13]
+    # A double-width glyph is its cell and an empty one after it, which
+    # serialise skips, so the next glyph lands two columns on.
+    assert [c[0] for c in cells[3][:5]] == ["漢", "", "字", "", "x"], \
+        cells[3][:5]
+
+
+def _tmux_scene(work, cols, rows):
+    """A tmux server of its own, its one pane running the program."""
+    sock = os.path.join(work, "tmux.sock")
+    with open(os.path.join(work, "shows"), "w") as fh:
+        fh.write(_PROGRAM)
+    with open(os.path.join(work, "program.sh"), "w") as fh:
+        fh.write(_PROGRAM_SH)
+    t = ["tmux", "-f", "/dev/null", "-S", sock]
+    subprocess.run(t + ["new-session", "-d", "-s", "golden", "-x", str(cols),
+                        "-y", str(rows), "sh",
+                        os.path.join(work, "program.sh"),
+                        os.path.join(work, "shows")], check=True)
+    subprocess.run(t + ["set-option", "-g", "status", "off"], check=True)
+    subprocess.run(t + ["set-option", "-t", "golden", "window-size",
+                        "manual"], check=True)
+    subprocess.run(t + ["set-option", "-as", "terminal-features",
+                        ",xterm-256color:RGB"], check=True)
+    return sock
+
+
+def _pumped(src, cols, rows, until, seconds=5.0):
+    """The source's cells once `until` holds of them, or the last seen."""
+    import select
+    end = time.monotonic() + seconds
+    cells = src.cells(cols, rows)
+    while time.monotonic() < end:
+        if select.select([src.fileno()], [], [], 0.05)[0]:
+            src.pump()
+            cells = src.cells(cols, rows)
+        if until(cells):
+            break
+    return cells
+
+
+@check
+def a_tmux_source_reads_a_program_into_the_cells_it_drew():
+    """A program in a tmux pane, read through TmuxSource: its text, its
+    attributes, its colours as the wall shows them, a double-width glyph,
+    and a resize that reaches the program and the grid both."""
+    if not shutil.which("tmux") or not hasattr(os, "fork"):
+        return "skipped: no tmux"
+    work = tempfile.mkdtemp(prefix="bwt-tmux-")
+    sock = _tmux_scene(work, 30, 6)
+    src = bitwall.TmuxSource("golden", sock)
+    try:
+        src.start(30, 6)
+        cells = _pumped(src, 30, 6, lambda c: c[3][4][0] == "x")
+        _program_cells_are_right(cells, 30, 6)
+        src.resize(40, 8)
+        cells = _pumped(src, 40, 8,
+                        lambda c: "size 8 40" in "".join(x[0] for x in c[5]))
+        assert "".join(x[0] for x in cells[5]).startswith("size 8 40"), \
+            "".join(x[0] for x in cells[5])
+        _program_cells_are_right(cells, 40, 8)
+    finally:
+        src.close()
+        subprocess.run(["tmux", "-S", sock, "kill-server"],
+                       capture_output=True)
+        shutil.rmtree(work, ignore_errors=True)
 
 
 # ---------------------------------------------------------------- machine
