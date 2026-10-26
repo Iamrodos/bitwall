@@ -1,6 +1,6 @@
 {
- "target": "pi.local:1",
- "version": "46cbc97a1e83",
+ "target": "tres.rodos.net:1",
+ "version": "c1c190bd1f15",
  "env": {
   "BITWALL_EVEN_CELLS": "1"
  },
@@ -17,5 +17,5 @@
   240,
   54
  ],
- "taken": "2026-10-11"
+ "taken": "2026-10-26"
 }
