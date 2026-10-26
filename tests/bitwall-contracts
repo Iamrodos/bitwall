@@ -5034,7 +5034,8 @@ _JS_SGR = _JS_PRELUDE + """
 const g = new B.Grid(4, 1);
 const p = new B.Parser(g);
 p.feed(enc.encode(d.text));
-console.log(JSON.stringify({ fg: g.fg[0], bold: (g.at[0] & 1) === 1 }));
+console.log(JSON.stringify({ fg: g.fg[0], bold: (g.at[0] & 1) === 1,
+                             faint: (g.at[0] & 32) === 32 }));
 """
 
 
@@ -5065,7 +5066,7 @@ int main(void)
     Pen p;
     pen_reset(&p);
     pen_take(&p, v, 4);
-    printf("%%d %%d %%02x%%02x%%02x\n", p.bold, p.fg_set,
+    printf("%%d %%d %%d %%02x%%02x%%02x\n", p.bold, p.faint, p.fg_set,
            p.fg.r, p.fg.g, p.fg.b);
     return 0;
 }
@@ -5095,9 +5096,10 @@ def _c_pen():
             capture_output=True, text=True, timeout=60)
         if built.returncode != 0:
             raise AssertionError(f"cc failed: {built.stderr[:400]}")
-        bold, fg_set, rgb = subprocess.run(
+        bold, faint, fg_set, rgb = subprocess.run(
             [exe], capture_output=True, text=True, timeout=10).stdout.split()
-        return {"bold": bold == "1", "fg": rgb if fg_set == "1" else None}
+        return {"bold": bold == "1", "faint": faint == "1",
+                "fg": rgb if fg_set == "1" else None}
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -5137,11 +5139,11 @@ def a_truncated_truecolour_sgr_means_the_same_to_every_reader():
         t.write(text.encode())
         c = t.cells()[0][0]
         t.close()
-        readers["emulator"] = {"bold": bool(c[3]),
+        readers["emulator"] = {"bold": bool(c[3]), "faint": len(c) > 8 and bool(c[8]),
                                "fg": None if c[1] == "default" else c[1]}
     if shutil.which("node"):
         js = _node(_JS_SGR, {"text": text})
-        readers["page"] = {"bold": js["bold"],
+        readers["page"] = {"bold": js["bold"], "faint": js["faint"],
                            "fg": None if js["fg"] == -1
                            else f"{js['fg']:06x}"}
     c_pen = _c_pen()
@@ -5152,6 +5154,10 @@ def a_truncated_truecolour_sgr_means_the_same_to_every_reader():
     answers = {json.dumps(v, sort_keys=True) for v in readers.values()}
     assert len(answers) == 1, "; ".join(f"{k} {v}" for k, v in
                                         readers.items())
+    missing = {"emulator", "page", "painter"} - set(readers)
+    if missing:
+        return f"skipped in part: {', '.join(sorted(readers))} agree; " \
+            f"no {' or '.join(sorted(missing))} here"
 
 
 # ------------------------------------------- the fake wall, as a Wall sees it
