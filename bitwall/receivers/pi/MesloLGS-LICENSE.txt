@@ -1,8 +1,9 @@
-MesloLGSNerdFontMono-Regular.ttf: Meslo LG S, by André Berg, a customised
-Menlo-Regular (itself a customised Bitstream Vera Sans Mono), patched with
-icon glyphs by Nerd Fonts (github.com/ryanoasis/nerd-fonts,
-patched-fonts/Meslo). The painter draws every wall's cells in it, the same
-file on every machine.
+MesloLGSNerdFontMono-Regular.ttf and MesloLGSNerdFontMono-Bold.ttf: Meslo
+LG S, by André Berg, a customised Menlo (itself a customised Bitstream Vera
+Sans Mono), patched with icon glyphs by Nerd Fonts
+(github.com/ryanoasis/nerd-fonts, release v3.5.1, patched-fonts/Meslo).
+The painter draws every wall's cells in the Regular, the same file on
+every machine, and its bold cells in the Bold.
 
 Meslo LG:
 

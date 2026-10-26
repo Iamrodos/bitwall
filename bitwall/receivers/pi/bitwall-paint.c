@@ -244,6 +244,13 @@
  * record of what a cell shows all know it without a field of their own. */
 #define FAINT 0x40000000u
 
+/* A character the font draws, in a cell the sender marked bold (SGR 1):
+ * drawn in the font's bold weight where the painter has it. Carried in
+ * the code point as FAINT is. What the painter draws as geometry -- box
+ * lines, blocks, shades, braille -- is the same bold or not, so it never
+ * carries it. */
+#define BOLD 0x20000000u
+
 /* The four diagonal halves of a cell, U+25E2-25E5: lower right, lower
  * left, upper left, upper right. Drawn as geometry out to the cell's own
  * corners, so a row of them makes one slope with no seam where a glyph
@@ -1250,7 +1257,7 @@ typedef struct LGrid {
  * holds one here, and face_swap trades it in while the layer is made and
  * drawn, so every function that paints a cell paints in that face. */
 typedef struct Face {
-    TTF_Font *font;
+    TTF_Font *font, *bold;
     int size, cw, ch, tx, ty, cols, rows, ox, oy;
     SDL_Rect (*px)[MAXRECTS];
     uint8_t *pn, *ptile;
@@ -1297,7 +1304,9 @@ typedef struct Screen {
 
     /* the grid */
     const char *font_path;
+    const char *bold_path;      /* the font's bold weight, or NULL where there is none */
     TTF_Font *font;
+    TTF_Font *bold;             /* at `size`; NULL draws bold in the regular weight */
     int size;
     int cw, ch, cols, rows;
     int tx, ty;                 /* where a typed glyph sits in its cell, when the cell is bigger than the font's */
@@ -3867,6 +3876,24 @@ static Glyph *glyph_slot(Screen *s, uint32_t cp, uint32_t kf, uint32_t kb, int *
     return g;
 }
 
+/* A code point as a cell with `bold` set keeps it: marked BOLD where the
+ * font draws it, and as it was where the painter draws it as geometry. */
+static uint32_t bolded(uint32_t cp, int bold)
+{
+    if (!bold || cp == ' ' || (cp & (FAINT | TAIL)) || shape_index(cp) >= 0
+        || shade_of(cp) > 0 || (cp >= TRIANGLE && cp < TRIANGLE + 4)
+        || (cp >= ARC && cp < ARC + 4))
+        return cp;
+    return cp | BOLD;
+}
+
+/* The font a glyph is drawn in: the bold weight for one marked BOLD,
+ * where there is one. */
+static TTF_Font *font_of(Screen *s, uint32_t cp)
+{
+    return (cp & BOLD) && s->bold ? s->bold : s->font;
+}
+
 /* How many cells a glyph takes: two when the font advances past it by
  * well over one, which is the sender's cell model for wide characters. */
 static int glyph_cells(Screen *s, const char *u8)
@@ -3939,7 +3966,7 @@ static const Glyph *mask_of(Screen *s, uint32_t cp)
         return g;
     }
     if (!ghost)
-        utf8_encode(cp, u8);
+        utf8_encode(cp & ~BOLD, u8);
     idx = ghost ? -1 : shape_index(cp);
     t = ghost ? 0 : shade_of(cp);
     cells = (idx >= 0 || t > 0 || cp == ' ' || ghost || tri || arc) ? 1 : glyph_cells(s, u8);
@@ -4005,7 +4032,7 @@ static const Glyph *mask_of(Screen *s, uint32_t cp)
     } else if (t > 0) {
         memset(gl->mask, (int)(t * 255 + 0.5), (size_t)w * h);
     } else if (cp != ' ') {
-        SDL_Surface *surf = TTF_RenderUTF8_Blended(s->font, u8, WHITE);
+        SDL_Surface *surf = TTF_RenderUTF8_Blended(font_of(s, cp), u8, WHITE);
         if (surf) {
             const SDL_PixelFormat *f = surf->format;
             int x, y;
@@ -4042,9 +4069,9 @@ static Glyph *glyph_get(Screen *s, uint32_t cp, Rgb fg, Rgb bg)
     SDL_Color f = {fg.r, fg.g, fg.b, 255}, b = {bg.r, bg.g, bg.b, 255};
     if (!fresh)
         return g;
-    utf8_encode(cp, u8);
+    utf8_encode(cp & ~BOLD, u8);
     g->cells = glyph_cells(s, u8);
-    surf = TTF_RenderUTF8_Shaded(s->font, u8, f, b);
+    surf = TTF_RenderUTF8_Shaded(font_of(s, cp), u8, f, b);
     if (!surf)
         return g;
     g->w = surf->w;
@@ -4362,6 +4389,7 @@ static void face_swap(Screen *s, Face *f)
 {
     Gl *g = &s->gl;
     FSWAP(s->font, f->font);
+    FSWAP(s->bold, f->bold);
     FSWAP(s->size, f->size);
     FSWAP(s->cw, f->cw);
     FSWAP(s->ch, f->ch);
@@ -4400,6 +4428,8 @@ static void face_free(Screen *s, Face *f)
         return;
     if (f->font)
         TTF_CloseFont(f->font);
+    if (f->bold)
+        TTF_CloseFont(f->bold);
     if (f->atlas && s->gpu) {
         gl_use(s);
         glDeleteTextures(1, &f->atlas);
@@ -4468,6 +4498,9 @@ static int face_load(Screen *s, int size)
     if (s->font)
         TTF_CloseFont(s->font);
     s->font = f;
+    if (s->bold)
+        TTF_CloseFont(s->bold);
+    s->bold = s->bold_path ? TTF_OpenFont(s->bold_path, size) : NULL;
     s->size = size;
     TTF_SizeUTF8(f, "M", &w, &h);
     s->cw = w > 1 ? w : 1;
@@ -4781,7 +4814,7 @@ static void draw_text(Screen *s, const uint8_t *p, size_t n)
             continue;
         if (s->pen.faint && cp >= BRAILLE && cp < BRAILLE + 0x100)
             cp |= FAINT;
-        cps[k++] = cp;
+        cps[k++] = bolded(cp, s->pen.bold);
         if (k == RUN_CHUNK) {
             paint_run(s, cps, k);
             k = 0;
@@ -6490,7 +6523,7 @@ static char *grid_picture(Screen *s, size_t *len)
                 dim = !dim;
                 n += (size_t)snprintf(buf + n, cap - n, dim ? "\033[2m" : "\033[22m");
             }
-            cp &= ~FAINT;
+            cp &= ~(FAINT | BOLD);
             have = 1;
             n += (size_t)utf8_encode(cp && cp < 0x110000 ? cp : ' ', buf + n);
         }
@@ -6552,7 +6585,7 @@ static char *lgrid_picture(const LGrid *g, size_t *len)
                 n += (size_t)snprintf(buf + n, cap - n, dim ? "\033[2m" : "\033[22m");
             }
             have = 1;
-            n += (size_t)utf8_encode((cp & ~FAINT) < 0x110000 ? cp & ~FAINT : ' ', buf + n);
+            n += (size_t)utf8_encode((cp & ~(FAINT | BOLD)) < 0x110000 ? cp & ~(FAINT | BOLD) : ' ', buf + n);
             cx = x + (x + 1 < g->cols && (g->cp[i + 1] & TAIL) ? 2 : 1);
             cy = y;
         }
@@ -6611,7 +6644,7 @@ static char *mirror_frame(Screen *s, Mirror *t, size_t *len, int *full)
                 dim = !dim;
                 n += (size_t)snprintf(buf + n, cap - n, dim ? "\033[2m" : "\033[22m");
             }
-            cp &= ~FAINT;
+            cp &= ~(FAINT | BOLD);
             have = 1;
             n += (size_t)utf8_encode(cp && cp < 0x110000 ? cp : ' ', buf + n);
             /* Where the reader's cursor is now, so the next cell along
@@ -9676,6 +9709,7 @@ static void lgrid_text(Screen *s, LGrid *g, const uint8_t *p, size_t n)
             continue;
         if (g->pen.faint && cp >= BRAILLE && cp < BRAILLE + 0x100)
             cp |= FAINT;
+        cp = bolded(cp, g->pen.bold);
         if (g->y < 0 || g->y >= g->rows || g->x < 0 || g->x >= g->cols) {
             if (g->x > g->cols)
                 g->x = g->cols;
@@ -10860,6 +10894,8 @@ static void screens_free(Screen **s, int n)
         glyphs_clear(sc);
         if (sc->font)
             TTF_CloseFont(sc->font);
+        if (sc->bold)
+            TTF_CloseFont(sc->bold);
         if (sc->st.font)
             TTF_CloseFont(sc->st.font);
         SDL_FreeSurface(sc->st.soft);
@@ -10956,6 +10992,21 @@ static const char *font_found(const char *argv0)
     return NULL;
 }
 
+/* The bold weight of the font at `regular`: the same file with Bold for
+ * Regular in its name, as the family is shipped
+ * (MesloLGSNerdFontMono-Bold.ttf beside -Regular.ttf). NULL where there
+ * is none, and bold is drawn in the regular weight. */
+static const char *bold_found(const char *regular)
+{
+    static char path[1024];
+    const char *at = strstr(regular, "-Regular.");
+    if (!at || strlen(regular) + 1 > sizeof path)
+        return NULL;
+    snprintf(path, sizeof path, "%.*s-Bold.%s", (int)(at - regular), regular,
+             at + strlen("-Regular."));
+    return access(path, R_OK) == 0 ? path : NULL;
+}
+
 /* A wall's name as a target writes it after the host (`host:hdmi`): lower
  * case letters, digits, `_` and `-`, starting with a letter or digit, at
  * most 32 (bitwall/session.py WALL_TOKEN). */
@@ -10990,7 +11041,8 @@ static void usage(void)
             "  --name 0=hdmi` is a wall with no screen that senders reach as\n"
             "  <host>:hdmi. The font is\n"
             "  " FONT_NAME ", beside the painter or among the user's\n"
-            "  fonts, unless --font-file says.\n"
+            "  fonts, unless --font-file says; bold cells are drawn in the file\n"
+            "  beside it with Bold for Regular in its name, where there is one.\n"
             "  --workers is how many threads decode pictures and encode snapshots\n"
             "  (0: the main thread does), --decoder-threads ffmpeg's -threads and\n"
             "  --decoder-nice its nice (0-19); by default half the cores (1-4),\n"
@@ -11181,6 +11233,7 @@ int main(int argc, char **argv)
             return 1;
         }
         s[i]->font_path = font_file;
+        s[i]->bold_path = bold_found(font_file);
         s[i]->nodraw = getenv("BITWALL_PAINT_NODRAW") != NULL;
         s[i]->turn = turn[di];
         if (screen_open(s[i], di, mode_w[di], mode_h[di]) < 0)

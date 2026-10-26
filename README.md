@@ -259,10 +259,12 @@ A Pi is a wall and needs only the painter: `bitwall/receivers/pi/` in
 `~/bitwall/`, built there from a clone of the repo. Every `.c` and `.h`
 beside `bitwall-paint.c` goes with it: a Pi builds only its own seams, but
 the version is worked out from them all. The font beside them,
-`MesloLGSNerdFontMono-Regular.ttf` (Apache 2.0, `MesloLGS-LICENSE.txt`),
-goes in `~/.local/share/fonts/`; it is the one font the painter draws
-cells in on every machine, and on a Mac the painter finds it beside
-itself.
+`MesloLGSNerdFontMono-Regular.ttf`, and its bold weight,
+`MesloLGSNerdFontMono-Bold.ttf` (Apache 2.0, `MesloLGS-LICENSE.txt`), go
+in `~/.local/share/fonts/`; it is the one font the painter draws cells in
+on every machine, bold cells in the bold weight, which it finds beside
+the regular, and on a Mac it finds both beside itself. Without the bold,
+bold is drawn in the regular weight.
 
 ```sh
 sudo apt install git libsdl2-dev libsdl2-ttf-dev libdrm-dev libgles2-mesa-dev libpng-dev \
@@ -270,7 +272,7 @@ sudo apt install git libsdl2-dev libsdl2-ttf-dev libdrm-dev libgles2-mesa-dev li
 git clone <this repository> ~/bitwall-src
 cp -r ~/bitwall-src/bitwall/receivers/pi ~/bitwall
 mkdir -p ~/.local/share/fonts
-cp ~/bitwall/MesloLGSNerdFontMono-Regular.ttf ~/.local/share/fonts/
+cp ~/bitwall/MesloLGSNerdFontMono-*.ttf ~/.local/share/fonts/
 make -C ~/bitwall
 printf '#!/bin/sh\nexec ~/bitwall/bitwall-screen --font 14\n' > ~/bitwall/start
 chmod +x ~/bitwall/start
@@ -287,8 +289,8 @@ picture half a turn, for a screen mounted upside down, and `90` or `270`
 a quarter clockwise or anticlockwise, for one on its side, which the wall
 then says is taller than wide. Each is `WALL=VALUE`, as `--presence` is,
 since one painter drives every screen on the Pi. Films need ffmpeg on the
-Pi. To update it, pull the clone, copy the painter's sources again and
-`make`; a painter at another version than the repo's is shown so on the
+Pi. To update it, pull the clone, copy the painter's sources and fonts
+again and `make`; a painter at another version than the repo's is shown so on the
 control page.
 
 A sender can run on a Pi too, from its clone, as on any sender host: its

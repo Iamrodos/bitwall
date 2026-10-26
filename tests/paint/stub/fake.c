@@ -535,7 +535,7 @@ void SDL_DetachThread(SDL_Thread *t)
 
 /* ---------------------------------------------------------------- font */
 
-struct TTF_Font { int size; };
+struct TTF_Font { int size, bold; };
 
 static uint32_t first_cp(const char *u8)
 {
@@ -553,9 +553,10 @@ void TTF_Quit(void) {}
 TTF_Font *TTF_OpenFont(const char *path, int size)
 {
     TTF_Font *f = calloc(1, sizeof *f);
-    (void)path;
-    if (f)
+    if (f) {
         f->size = size;
+        f->bold = path && strstr(path, "Bold") != NULL;
+    }
     return f;
 }
 
@@ -570,11 +571,12 @@ int TTF_SizeUTF8(TTF_Font *f, const char *text, int *w, int *h)
 
 int TTF_FontLineSkip(const TTF_Font *f) { return f->size + 2; }
 
-static void stamp(SDL_Surface *s, int x, uint32_t cp, int tail)
+static void stamp(SDL_Surface *s, int x, uint32_t cp, int tail, int bold)
 {
     Uint32 *row = s->pixels;
     uint8_t mark[3] = {(uint8_t)cp, (uint8_t)(cp >> 8),
-                       (uint8_t)(FAKE_MARK | (tail ? FAKE_TAIL : 0) | (cp >> 16 & 0x1F))};
+                       (uint8_t)(FAKE_MARK | (tail ? FAKE_TAIL : 0) | (bold ? FAKE_BOLD : 0)
+                                 | (cp >> 16 & 0x1F))};
     int i;
     for (i = 0; i < 3 && x + i < s->w; i++)
         row[x + i] = (Uint32)mark[i] << 24;
@@ -590,9 +592,9 @@ SDL_Surface *TTF_RenderUTF8_Blended(TTF_Font *f, const char *text, SDL_Color c)
     s = SDL_CreateRGBSurfaceWithFormat(0, w, h, 32, SDL_PIXELFORMAT_ARGB8888);
     if (!s)
         return NULL;
-    stamp(s, 0, cp, 0);
+    stamp(s, 0, cp, 0, f->bold);
     if (fake_wide(cp))
-        stamp(s, f->size / 2 + 1, cp, 1);
+        stamp(s, f->size / 2 + 1, cp, 1, f->bold);
     return s;
 }
 

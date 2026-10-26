@@ -13,6 +13,7 @@
  * second half of a wide glyph carries it too, marked as the tail. */
 #define FAKE_MARK 0x80
 #define FAKE_TAIL 0x40
+#define FAKE_BOLD 0x20   /* drawn by a font opened from a path naming Bold */
 
 /* How many of each the fakes keep. A test that makes more is told. */
 #define FAKE_CONTEXTS 64

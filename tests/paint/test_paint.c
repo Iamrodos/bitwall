@@ -2062,6 +2062,57 @@ static void a_picture_says_which_braille_is_faint(void)
     free(pic);
 }
 
+/* Whether what cell x,y shows was drawn by the bold font. */
+static int shown_bold(Screen *s, int x, int y)
+{
+    const Vert *v = vert_at(s, x, y);
+    const FakeTexture *t = fake_texture(s->gl.atlas);
+    long px = ((long)v->u * t->w + 32767) / 65535;
+    long py = ((long)v->v * t->h + 32767) / 65535;
+    const uint8_t *a = t->pixels + (size_t)py * t->w + px;
+    return (a[2] & FAKE_MARK) && a[2] != 255 && (a[2] & FAKE_BOLD);
+}
+
+static void bold_text_is_drawn_in_the_bold_font_and_geometry_is_not(void)
+{
+    Screen *s = gpu_screen(14);
+    s->bold_path = "fake-Bold.ttf";
+    CHECK(set_font(s, 14) == 0, "set_font failed");
+    CHECK(s->bold, "the bold font was not opened with the face");
+    /* bold A, plain A, a bold full block, bold B */
+    write_text(s, "\x1b[1;1H\x1b[0;1mA\x1b[22mA\x1b[1m\xe2\x96\x88" "B");
+    CHECK(shown(s, 0, 0) == 'A' && shown_bold(s, 0, 0), "bold A is not in the bold font");
+    CHECK(shown(s, 1, 0) == 'A' && !shown_bold(s, 1, 0), "SGR 22 did not end bold");
+    CHECK(shown(s, 2, 0) == NOT_TYPE, "a bold block was asked of the font");
+    CHECK(shown(s, 3, 0) == 'B' && shown_bold(s, 3, 0), "bold B is not in the bold font");
+    /* and again at another size, the bold face made with it */
+    CHECK(set_font(s, 20) == 0 && s->bold, "the bold font did not follow the size");
+    write_text(s, "\x1b[1;1H\x1b[0;1mC");
+    CHECK(shown(s, 0, 0) == 'C' && shown_bold(s, 0, 0), "bold C after a font change");
+}
+
+static void bold_text_without_a_bold_font_is_drawn_regular(void)
+{
+    Screen *s = gpu_screen(14);
+    CHECK(!s->bold, "a bold font came from nowhere");
+    write_text(s, "\x1b[1;1H\x1b[0;1mA");
+    CHECK(shown(s, 0, 0) == 'A' && !shown_bold(s, 0, 0), "bold A with no bold font");
+}
+
+static void a_picture_of_bold_text_is_its_characters(void)
+{
+    Screen *s = gpu_screen(14);
+    size_t len = 0;
+    char *pic;
+    s->bold_path = "fake-Bold.ttf";
+    CHECK(set_font(s, 14) == 0, "set_font failed");
+    write_text(s, "\x1b[1;1H\x1b[0;1mAB\x1b[22mC");
+    pic = grid_picture(s, &len);
+    CHECK(pic, "no picture");
+    CHECK(holds(pic, len, "ABC", 3), "the bold characters did not come back as sent");
+    free(pic);
+}
+
 static void triangles_fill_to_their_corners_and_complete_each_other(void)
 {
     Screen *g = gpu_screen(14), *w = soft_screen(14);
@@ -4948,6 +4999,9 @@ static const Test TESTS[] = {
     T(faint_braille_shows_its_unlit_dots_on_the_gpu),
     T(faint_braille_shows_its_unlit_dots_in_software),
     T(a_picture_says_which_braille_is_faint),
+    T(bold_text_is_drawn_in_the_bold_font_and_geometry_is_not),
+    T(bold_text_without_a_bold_font_is_drawn_regular),
+    T(a_picture_of_bold_text_is_its_characters),
     T(triangles_fill_to_their_corners_and_complete_each_other),
     /* the software picture, stats, want, restart and meta */
     T(the_software_picture_of_each_scene_is_unchanged),
