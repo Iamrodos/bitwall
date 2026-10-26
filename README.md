@@ -93,7 +93,11 @@ Extras: `arrays` (numpy), `letters` (Pillow, for TILE and the outline
 fonts), `all`. A terminal program on a wall, `CommandSource` or
 `TmuxSource`, needs the emulator built once from a clone: `bitwall/vt/build`
 (git and zig), which builds Ghostty's libghostty-vt at a pinned commit
-into `bitwall/vt/lib/`. A sender can be one script:
+into `bitwall/vt/lib/`. For a Pi it is built on the Mac and copied with
+the repo: `bitwall/vt/build aarch64-linux-gnu` (or `arm-linux-gnueabihf`
+for a 32-bit Pi OS) puts it in `bitwall/vt/lib/<target>/`, where a sender on
+that Pi finds it. A package installed without the repo is told where the
+library is with `BITWALL_VT_LIB`. A sender can be one script:
 
 ```python
 # /// script

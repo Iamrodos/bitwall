@@ -4,7 +4,11 @@
 # nothing else to install.
 #
 #     bitwall/vt/build                       lib/libbitwall-vt.<so|dylib>
-#     bitwall/vt/build aarch64-linux-gnu     lib/aarch64-linux-gnu/..., for a Pi
+#     bitwall/vt/build aarch64-linux-gnu     lib/aarch64-linux-gnu/..., a 64-bit Pi
+#     bitwall/vt/build arm-linux-gnueabihf   lib/arm-linux-gnueabihf/..., a 32-bit one
+#
+# A copy of the repo on a Pi with the cross-built lib/ in it finds its own
+# (bitwall/terminal.py, library()).
 #
 # Needs git and zig (the version Ghostty's build.zig.zon names). Ghostty's
 # source is kept in ghostty/ beside this, or where BITWALL_GHOSTTY_SRC says.

@@ -2,8 +2,8 @@
 
 What a terminal program writes goes in, and the screen it drew comes out as
 cells. Inside is libghostty-vt, Ghostty's own emulator, behind the few calls
-in `bitwall/vt/bwvt.c`, built by `bitwall/vt/build` into one library. It is
-looked for in `bitwall/vt/lib/`, or wherever `BITWALL_VT_LIB` says.
+in `bitwall/vt/bwvt.c`, built by `bitwall/vt/build` into one library, which
+`library()` says where to find.
 
 A program asks its terminal questions -- where the cursor is, what the
 terminal is -- and expects answers on its input. `said()` is what is owed,
@@ -11,6 +11,7 @@ for the host to write back to the program's pty.
 """
 import ctypes
 import os
+import platform
 import struct
 import sys
 import threading
@@ -25,10 +26,30 @@ _RECORD = struct.Struct("<IIBBBB")
 _lib = None
 
 
+#: The zig target `bitwall/vt/build <target>` is given for a machine, by
+#: what Python calls it: the folder of lib/ a cross-built library is in.
+_TARGETS = {("linux", "aarch64"): "aarch64-linux-gnu",
+            ("linux", "armv7l"): "arm-linux-gnueabihf",
+            ("linux", "armv6l"): "arm-linux-gnueabihf",
+            ("linux", "x86_64"): "x86_64-linux-gnu",
+            ("darwin", "arm64"): "aarch64-macos",
+            ("darwin", "x86_64"): "x86_64-macos"}
+
+
 def library():
-    """Where the emulator is looked for."""
-    return os.environ.get("BITWALL_VT_LIB") or os.path.join(
-        _HERE, "vt", "lib", _NAME)
+    """Where the emulator is looked for: `BITWALL_VT_LIB`, else one built
+    here in `bitwall/vt/lib/`, else one cross-built for this machine in
+    `bitwall/vt/lib/<target>/`."""
+    if os.environ.get("BITWALL_VT_LIB"):
+        return os.environ["BITWALL_VT_LIB"]
+    lib = os.path.join(_HERE, "vt", "lib")
+    here = os.path.join(lib, _NAME)
+    target = _TARGETS.get((sys.platform.rstrip("0123456789"),
+                           platform.machine()))
+    crossed = os.path.join(lib, target, _NAME) if target else None
+    if not os.path.exists(here) and crossed and os.path.exists(crossed):
+        return crossed
+    return here
 
 
 def _load():
