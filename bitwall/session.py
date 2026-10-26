@@ -275,7 +275,7 @@ class Link:
         """Run a command on the wall's host; what it printed."""
         try:
             r = subprocess.run(self.argv(cmd), capture_output=True,
-                               text=True, timeout=timeout)
+                               stdin=subprocess.DEVNULL, text=True, timeout=timeout)
             return r.stdout.strip()
         except Exception:
             return ""
