@@ -560,6 +560,11 @@
       else if (v === 38 || v === 48) {
         var mode = parseInt(ps[i + 1], 10);
         var col = DEFAULT, alpha = 255;
+        /* A form short of its numbers, or of no mode known, sets no
+         * colour, and what follows the 38 is read as attributes of its
+         * own: what the painter does, and Ghostty. */
+        var wants = mode === 6 ? 5 : mode === 5 ? 2 : mode === 2 ? 4 : -1;
+        if (wants < 0 || i + wants >= ps.length) continue;
         if (mode === 6) {
           /* a colour with an alpha, as a cells layer above the base sends it */
           col = ((parseInt(ps[i + 2], 10) & 255) << 16) |
@@ -575,7 +580,7 @@
                 ((parseInt(ps[i + 3], 10) & 255) << 8) |
                 (parseInt(ps[i + 4], 10) & 255);
           i += 4;
-        } else { i += 1; }
+        }
         if (v === 38) { this.fg = col; this.fa = alpha; }
         else { this.bg = col; this.ba = alpha; }
       }

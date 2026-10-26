@@ -5084,9 +5084,14 @@ def _c_pen():
             fh.write(_C_PEN % PAINT_C)
         stub = os.path.join(HERE, "paint", "stub")
         exe = os.path.join(work, "pen")
+        # libpng as tests/paint/run finds it, where pkg-config knows it.
+        png = subprocess.run(["pkg-config", "--cflags", "--libs", "libpng"],
+                             capture_output=True, text=True) \
+            if shutil.which("pkg-config") else None
+        png = png.stdout.split() if png and png.returncode == 0 else ["-lpng"]
         built = subprocess.run(
             [cc, "-std=c99", "-w", "-DBITWALL_TEST", "-I" + stub, src,
-             os.path.join(stub, "fake.c"), "-pthread", "-o", exe],
+             os.path.join(stub, "fake.c"), *png, "-pthread", "-o", exe],
             capture_output=True, text=True, timeout=60)
         if built.returncode != 0:
             raise AssertionError(f"cc failed: {built.stderr[:400]}")
@@ -5115,15 +5120,14 @@ def serialise_never_writes_a_truecolour_sgr_short_of_its_three_numbers():
 
 
 @check
-@known("the readers disagree on 38;2;1;2: the C painter and the emulator "
-       "make it bold with no colour, the page makes it colour 010200")
 def a_truncated_truecolour_sgr_means_the_same_to_every_reader():
     """`ESC[38;2;1;2m`, one number short, read by each thing that reads.
 
     The C painter on the Pi, the JavaScript in a tab, and the terminal
     emulator, which the terminal sources read through. Nothing sends this,
-    so any answer will do; different ones mean one stream is different
-    pictures.
+    so any answer will do, as long as it is one: each reads the 38 as
+    nothing and the numbers after it as attributes, bold and faint here,
+    with no colour.
     """
     from bitwall import terminal
     text = "\x1b[38;2;1;2mX"
