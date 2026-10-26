@@ -18,6 +18,7 @@ import select
 import signal
 import struct
 import subprocess
+import threading
 import time
 
 
@@ -310,6 +311,8 @@ class _TerminalSource:
     def __init__(self):
         self.pid = self.fd = None
         self.term = None
+        self._owed = b""
+        self._owing = threading.Lock()
 
     def argv(self):
         raise NotImplementedError
@@ -332,6 +335,9 @@ class _TerminalSource:
                 os.execvp(argv[0], argv)
             finally:
                 os._exit(127)
+        # Never blocked on the program: a reply it does not read must not
+        # stop the wall (`_answer`).
+        os.set_blocking(self.fd, False)
         self.resize(cols, rows)
 
     def fileno(self):
@@ -345,6 +351,7 @@ class _TerminalSource:
         self.term.resize(cols, rows)
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ,
                     struct.pack("HHHH", rows, cols, 0, 0))
+        self._answer()
 
     def pump(self):
         got = False
@@ -360,13 +367,25 @@ class _TerminalSource:
             rr, _, _ = select.select([self.fd], [], [], 0)
             if self.fd not in rr:
                 break
-        said = self.term.said() if got else b""
-        if said:
-            try:
-                os.write(self.fd, said)
-            except OSError:
-                pass
+        self._answer()
         return got
+
+    #: The most a program may be owed before what it has not taken is let go.
+    OWED = 4096
+
+    def _answer(self):
+        """Write the program the replies it is owed, as much as its input
+        takes now. One that never reads its input -- asking where the cursor
+        is and never looking -- fills it, and is let go its replies rather
+        than left to stop the thread that writes them, and the wall."""
+        with self._owing:
+            owed = self._owed + self.term.said()
+            if owed and self.fd is not None:
+                try:
+                    owed = owed[os.write(self.fd, owed):]
+                except OSError:
+                    pass
+            self._owed = owed if len(owed) <= self.OWED else b""
 
     def cells(self, cols, rows):
         grid = self.term.cells()
@@ -383,12 +402,13 @@ class _TerminalSource:
         # The pty goes first. A program stuck writing to a pty nobody reads
         # never gets round to a SIGTERM; with its terminal gone, its write
         # fails and it hangs up. One that still lingers is killed.
-        if self.fd is not None:
-            try:
-                os.close(self.fd)
-            except OSError:
-                pass
-            self.fd = None
+        with self._owing:
+            if self.fd is not None:
+                try:
+                    os.close(self.fd)
+                except OSError:
+                    pass
+                self.fd = None
         if self.pid:
             try:
                 os.kill(self.pid, signal.SIGTERM)

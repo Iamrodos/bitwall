@@ -2473,6 +2473,35 @@ def a_terminal_source_closes_on_a_program_that_never_stops_writing():
     assert src.exited() and took < 3, f"close took {took:.1f}s"
 
 
+@check
+def a_program_that_asks_and_never_reads_the_answers_does_not_stop_the_wall():
+    """Where the cursor is, what the terminal is, asked without end by a
+    program that never reads its input: the answers are let go once its
+    input is full, and its screen goes on being read."""
+    from bitwall import terminal
+    if not hasattr(os, "fork"):
+        return "skipped: no pty here"
+    if not terminal.available():
+        return f"skipped: no emulator at {terminal.library()}"
+    asks = ("stty raw -echo; i=0; while :; do i=$((i+1)); "
+            "printf '\\033[6n\\033[c\\033[H%d ' $i; done")
+    src = bitwall.CommandSource(["sh", "-c", asks])
+    import select
+    try:
+        src.start(40, 4)
+        seen, end = [], time.monotonic() + 2.0
+        while time.monotonic() < end:
+            if select.select([src.fileno()], [], [], 0.05)[0]:
+                src.pump()
+            seen.append("".join(c[0] for c in src.cells(40, 4)[0]).split()[:1])
+        late = {tuple(x) for x in seen[-20:]}
+        assert len(late) > 1, f"the screen stopped at {seen[-1]}"
+    finally:
+        began = time.monotonic()
+        src.close()
+    assert time.monotonic() - began < 3, "close waited on the program"
+
+
 _RACE = """
 import sys, threading, time
 sys.path.insert(0, sys.argv[1])
