@@ -2598,6 +2598,28 @@ def a_frame_drawn_in_synchronized_output_is_read_only_when_whole():
         t.close()
 
 
+@check
+def the_terminal_emulator_reads_long_graphemes_and_keeps_its_size_when_refused():
+    """A row of graphemes longer than its first buffer allows for comes
+    back whole, read again into a larger one; and a size it refuses
+    leaves the screen the size it was, still read."""
+    from bitwall import terminal
+    if not terminal.available():
+        return f"skipped: no emulator at {terminal.library()}"
+    t = terminal.Terminal(6, 2)
+    long = "e" + "\u0301\u0302\u0303\u0304\u0306\u0307\u0308\u030a"
+    try:
+        t.write(("a" + long * 5).encode())
+        got = [c[0] for c in t.cells()[0]]
+        assert got == ["a"] + [long] * 5, [len(x.encode()) for x in got]
+        t.resize(0, 0)
+        cells = t.cells()
+        assert (t.cols, t.rows) == (6, 2) and len(cells) == 2 \
+            and len(cells[0]) == 6, (t.cols, t.rows, len(cells))
+    finally:
+        t.close()
+
+
 _RACE = """
 import sys, threading, time
 sys.path.insert(0, sys.argv[1])

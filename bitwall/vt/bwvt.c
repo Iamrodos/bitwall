@@ -197,14 +197,19 @@ static void colour(GhosttyStyleColor c, uint32_t *value, uint8_t *kind)
     }
 }
 
+/* What a read that took no rows says went wrong. */
+#define BWVT_SHORT  -1     /* a buffer was too small */
+#define BWVT_FAILED -2     /* the terminal could not be read */
+
 /* The screen's size, and the rows that changed since the last read: their
  * numbers in `ys`, their records in `recs` (cols of them a row) and their
- * text in `text`. Returns how many rows, or -1 when a buffer is too small,
- * in which case the rows already read are marked as read: ask again with
- * larger buffers and `all`. `all` asks for every row whether it changed or
- * not. */
+ * text in `text`. Returns how many rows; BWVT_SHORT when a buffer is too
+ * small for the screen whose size it has said, in which case the rows
+ * already read are marked as read: ask again with larger buffers and
+ * `all`; or BWVT_FAILED, when asking again will not help. `all` asks for
+ * every row whether it changed or not. */
 BWVT_API int bwvt_read(Bwvt *v, int all, uint16_t *cols_out, uint16_t *rows_out,
-                       uint16_t *ys, uint8_t *recs, size_t recs_cap,
+                       uint16_t *ys, size_t ys_cap, uint8_t *recs, size_t recs_cap,
                        uint8_t *text, size_t text_cap, size_t *text_len)
 {
     if (v->held && now_ms() - v->held_since >= HOLD_MS) {
@@ -214,7 +219,7 @@ BWVT_API int bwvt_read(Bwvt *v, int all, uint16_t *cols_out, uint16_t *rows_out,
         v->held = false;
     }
     if (!v->held && ghostty_render_state_update(v->state, v->term) != GHOSTTY_SUCCESS)
-        return -1;
+        return BWVT_FAILED;
     uint16_t cols = 0, rows = 0;
     ghostty_render_state_get(v->state, GHOSTTY_RENDER_STATE_DATA_COLS, &cols);
     ghostty_render_state_get(v->state, GHOSTTY_RENDER_STATE_DATA_ROWS, &rows);
@@ -224,11 +229,11 @@ BWVT_API int bwvt_read(Bwvt *v, int all, uint16_t *cols_out, uint16_t *rows_out,
     ghostty_render_state_get(v->state, GHOSTTY_RENDER_STATE_DATA_DIRTY, &dirty);
     if (dirty == GHOSTTY_RENDER_STATE_DIRTY_FULL)
         all = 1;
-    if (recs_cap < (size_t)cols * rows * 12)
-        return -1;
+    if (recs_cap < (size_t)cols * rows * 12 || ys_cap < rows)
+        return BWVT_SHORT;
     if (ghostty_render_state_get(v->state, GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR,
                                  &v->rows) != GHOSTTY_SUCCESS)
-        return -1;
+        return BWVT_FAILED;
 
     int n = 0;
     size_t at = 0;
@@ -244,13 +249,13 @@ BWVT_API int bwvt_read(Bwvt *v, int all, uint16_t *cols_out, uint16_t *rows_out,
             continue;
         if (ghostty_render_state_row_get(v->rows, GHOSTTY_RENDER_STATE_ROW_DATA_CELLS,
                                          &v->cells) != GHOSTTY_SUCCESS)
-            return -1;
+            return BWVT_FAILED;
         uint8_t *rec = recs + (size_t)n * cols * 12;
         for (uint16_t x = 0; x < cols; x++, rec += 12) {
             if (!ghostty_render_state_row_cells_next(v->cells)) {
                 memset(rec, 0, 12);
                 if (at + 2 > text_cap)
-                    return -1;
+                    return BWVT_SHORT;
                 text[at++] = ' ';
                 text[at++] = 0;
                 continue;
@@ -297,26 +302,30 @@ BWVT_API int bwvt_read(Bwvt *v, int all, uint16_t *cols_out, uint16_t *rows_out,
 
             if (w == 2) {
                 if (at + 1 > text_cap)
-                    return -1;
+                    return BWVT_SHORT;
                 text[at++] = 0;
                 continue;
             }
             GhosttyBuffer buf = { .ptr = text + at, .cap = text_cap - at, .len = 0 };
             if (style.invisible)
                 buf.len = 0;
-            else if (ghostty_render_state_row_cells_get(
-                         v->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8,
-                         &buf) != GHOSTTY_SUCCESS)
-                return -1;
+            else {
+                GhosttyResult got = ghostty_render_state_row_cells_get(
+                    v->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8, &buf);
+                if (got == GHOSTTY_OUT_OF_SPACE)
+                    return BWVT_SHORT;
+                if (got != GHOSTTY_SUCCESS)
+                    return BWVT_FAILED;
+            }
             if (buf.len == 0) {
                 if (at + 1 > text_cap)
-                    return -1;
+                    return BWVT_SHORT;
                 text[at++] = ' ';
             } else {
                 at += buf.len;
             }
             if (at + 1 > text_cap)
-                return -1;
+                return BWVT_SHORT;
             text[at++] = 0;
         }
         ys[n++] = y;

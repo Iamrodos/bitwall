@@ -27,6 +27,14 @@ _NAME = {"darwin": "libbitwall-vt.dylib",
 #: The record bwvt.c writes for a cell: fg, bg, their kinds, flags, wide.
 _RECORD = struct.Struct("<IIBBBB")
 
+#: What bwvt_read says when it took no rows: a buffer was too small, or
+#: the terminal could not be read and asking again will not help.
+_SHORT, _FAILED = -1, -2
+
+#: Bytes of text a cell is allowed at first, and at most: a grapheme of a
+#: few code points fits the first, and the most is past any that is drawn.
+_TEXT_FIRST, _TEXT_MOST = 8, 512
+
 _lib = None
 
 
@@ -76,7 +84,7 @@ def _load():
         lib.bwvt_take_said.argtypes = [ptr, ctypes.c_char_p, size]
         lib.bwvt_take_said.restype = size
         lib.bwvt_read.argtypes = [ptr, ctypes.c_int, ctypes.POINTER(u16),
-                                  ctypes.POINTER(u16), ctypes.POINTER(u16),
+                                  ctypes.POINTER(u16), ctypes.POINTER(u16), size,
                                   ctypes.c_char_p, size, ctypes.c_char_p,
                                   size, ctypes.POINTER(size)]
         lib.bwvt_read.restype = ctypes.c_int
@@ -121,11 +129,12 @@ class Terminal:
         self._grid = []
         self._shape = None
         self._looks = {}
-        self._buffers(cols, rows, 8)
+        self._per = _TEXT_FIRST
+        self._buffers(cols, rows)
 
-    def _buffers(self, cols, rows, text_per_cell):
-        self._recs = ctypes.create_string_buffer(cols * rows * _RECORD.size)
-        self._text = ctypes.create_string_buffer(cols * rows * text_per_cell)
+    def _buffers(self, cols, rows):
+        self._recs = ctypes.create_string_buffer(max(1, cols * rows) * _RECORD.size)
+        self._text = ctypes.create_string_buffer(max(1, cols * rows) * self._per)
         self._ys = (ctypes.c_uint16 * max(1, rows))()
 
     def write(self, data):
@@ -140,10 +149,11 @@ class Terminal:
         with self._lock:
             if not self._vt:
                 return
+            if self._lib.bwvt_resize(self._vt, cols, rows) != 0:
+                return                  # refused: the screen is as it was
             self.cols, self.rows = cols, rows
-            self._lib.bwvt_resize(self._vt, cols, rows)
             if len(self._ys) < rows or len(self._recs) < cols * rows * _RECORD.size:
-                self._buffers(cols, rows, 8)
+                self._buffers(cols, rows)
 
     def said(self):
         """The replies the program is owed, as bytes; each is given once."""
@@ -174,12 +184,18 @@ class Terminal:
         used = ctypes.c_size_t()
         every = self._shape != (self.cols, self.rows)
         n = self._read(every, cols, rows, used)
-        while n < 0:
-            # A buffer was short: grapheme clusters longer than were
-            # allowed for. Every row is read again into larger ones.
-            self._buffers(self.cols, self.rows, len(self._text)
-                          // max(1, self.cols * self.rows) * 4)
+        while n == _SHORT and self._per < _TEXT_MOST:
+            # A buffer was short, for the screen the read said it has or
+            # for graphemes longer than allowed for. Every row is read
+            # again into larger ones, a few times at most.
+            self._per *= 4
+            self._buffers(cols.value, rows.value)
             n = self._read(True, cols, rows, used)
+        if n < 0:
+            # Nothing more can be read of it: the screen stands as it was
+            # last read, and the next read starts whole.
+            self._shape = None
+            return list(self._grid)
         cols, rows = cols.value, rows.value
         if self._shape != (cols, rows):
             self._grid = [None] * rows
@@ -212,7 +228,8 @@ class Terminal:
     def _read(self, every, cols, rows, used):
         return self._lib.bwvt_read(self._vt, 1 if every else 0,
                                    ctypes.byref(cols), ctypes.byref(rows),
-                                   self._ys, self._recs, len(self._recs),
+                                   self._ys, len(self._ys),
+                                   self._recs, len(self._recs),
                                    self._text, len(self._text),
                                    ctypes.byref(used))
 
