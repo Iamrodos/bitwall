@@ -31,8 +31,8 @@ Nine groups:
                    made-up catalogue of links, loops and bad files
     the letters    bitwall.letters: sizes, spacing, turns, fit, smoothing,
                    ghosts, cut edges, and the faint cell they travel in
-    the terminal   a terminal program read into cells, through tmux and the
-                   emulator TmuxSource decodes it with
+    the terminal   a terminal program read into cells, by bitwall.terminal
+                   and through tmux
     the contracts  every receiver that runs here, and a real Wall against
                    a fake one; its own checks are in tests/bitwall-contracts
     the GPU painter
@@ -41,8 +41,9 @@ Nine groups:
                    (tests/painter-pixels), against v1's on a Pi among them
 
 Both ends needs node, the painter needs a C compiler, the terminal needs
-tmux, the contracts need uv, and the GPU painter a machine the Makefile builds one for, a Mac.
-Without one, that group is skipped and said to be.
+tmux and bitwall/vt/build run, the contracts need uv, and the GPU painter
+a machine the Makefile builds one for, a Mac. Without one, that group is
+skipped and said to be.
 """
 import json
 import os
@@ -2347,6 +2348,30 @@ def _pumped(src, cols, rows, until, seconds=5.0):
         if until(cells):
             break
     return cells
+
+
+@check
+def the_terminal_emulator_reads_a_program_into_the_cells_it_drew():
+    """bitwall.terminal on the program's own bytes: the same cells as
+    through tmux, a question answered once, a background erased in a
+    colour, hidden text hidden, and a resize."""
+    from bitwall import terminal
+    if not terminal.available():
+        return f"skipped: no emulator at {terminal.library()}"
+    t = terminal.Terminal(30, 6)
+    try:
+        t.write(_PROGRAM.encode())
+        _program_cells_are_right(t.cells(), 30, 6)
+        t.write(b"\x1b[44m\x1b[K\x1b[0m\x1b[8mhidden\x1b[0m\x1b[6n")
+        cells = t.cells()
+        assert _shown(cells[4][20][2]) == (0, 0, 238), cells[4][20]
+        assert "".join(c[0] for c in cells[4][:6]) == " " * 6, cells[4][:6]
+        assert t.said() == b"\x1b[5;7R", "the cursor's position was not told"
+        assert t.said() == b"", "an answer was given twice"
+        t.resize(40, 8)
+        _program_cells_are_right(t.cells(), 40, 8)
+    finally:
+        t.close()
 
 
 @check

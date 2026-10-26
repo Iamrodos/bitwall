@@ -7,3 +7,8 @@ bitwall/receivers/pi/bitwall-paint
 dist/
 build/
 *.egg-info/
+
+# The terminal emulator, built where it runs (bitwall/vt/build).
+bitwall/vt/ghostty/
+bitwall/vt/out/
+bitwall/vt/lib/

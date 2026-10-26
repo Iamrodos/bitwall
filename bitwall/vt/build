@@ -1,0 +1,40 @@
+#!/bin/sh
+# Builds the terminal emulator TmuxSource and CommandSource read through:
+# libghostty-vt at the commit below, linked into bwvt.c as one library with
+# nothing else to install.
+#
+#     bitwall/vt/build                       lib/libbitwall-vt.<so|dylib>
+#     bitwall/vt/build aarch64-linux-gnu     lib/aarch64-linux-gnu/..., for a Pi
+#
+# Needs git and zig (the version Ghostty's build.zig.zon names). Ghostty's
+# source is kept in ghostty/ beside this, or where BITWALL_GHOSTTY_SRC says.
+set -eu
+
+GHOSTTY=https://github.com/ghostty-org/ghostty
+COMMIT=3aec9443422758d2cadb90d50ede788a599d633f
+
+here=$(cd "$(dirname "$0")" && pwd)
+src=${BITWALL_GHOSTTY_SRC:-$here/ghostty}
+target=${1:-}
+
+if [ ! -d "$src/.git" ]; then
+    git clone --quiet --filter=blob:none --no-checkout "$GHOSTTY" "$src"
+fi
+git -C "$src" cat-file -e "$COMMIT^{commit}" 2>/dev/null \
+    || git -C "$src" fetch --quiet origin "$COMMIT"
+git -C "$src" checkout --quiet --detach "$COMMIT"
+
+case "${target:-$(uname -s)}" in
+    *darwin* | *macos* | Darwin) name=libbitwall-vt.dylib ;;
+    *windows* | MINGW* | MSYS*)  name=bitwall-vt.dll ;;
+    *)                           name=libbitwall-vt.so ;;
+esac
+out=$here/out/${target:-native}
+lib=$here/lib${target:+/$target}
+mkdir -p "$out" "$lib"
+
+(cd "$src" && zig build -Demit-lib-vt -Doptimize=ReleaseFast \
+    ${target:+-Dtarget=$target} --prefix "$out")
+zig cc -shared -O2 -Wall -Wextra -fvisibility=hidden ${target:+-target $target} \
+    -I"$out/include" -o "$lib/$name" "$here/bwvt.c" "$out/lib/libghostty-vt.a"
+echo "$lib/$name"
