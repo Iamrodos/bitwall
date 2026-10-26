@@ -2353,7 +2353,8 @@ def _pumped(src, cols, rows, until, seconds=5.0):
 def the_terminal_emulator_reads_a_program_into_the_cells_it_drew():
     """bitwall.terminal on the program's own bytes: the same cells as
     through tmux, a question answered once, a background erased in a
-    colour, hidden text hidden, and a resize."""
+    colour, hidden text hidden, a resize, and the size told when asked
+    and, where the program wants it, when it changes."""
     from bitwall import terminal
     if not terminal.available():
         return f"skipped: no emulator at {terminal.library()}"
@@ -2369,6 +2370,13 @@ def the_terminal_emulator_reads_a_program_into_the_cells_it_drew():
         assert t.said() == b"", "an answer was given twice"
         t.resize(40, 8)
         _program_cells_are_right(t.cells(), 40, 8)
+        t.write(b"\x1b[18t")
+        assert t.said() == b"\x1b[8;8;40t", "the size asked for was not told"
+        t.write(b"\x1b[?2048h")
+        t.said()
+        t.resize(50, 9)
+        assert t.said().startswith(b"\x1b[48;9;50;"), \
+            "a resize was not reported in band"
     finally:
         t.close()
 

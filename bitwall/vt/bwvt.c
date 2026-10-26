@@ -34,8 +34,10 @@
 #define BWVT_API __attribute__((visibility("default")))
 #endif
 
-/* What a cell is drawn at, for the size reports a program may ask for.
- * No pixels are drawn here, so any size will do. */
+/* What a cell is said to be in pixels, when a program asks the terminal
+ * its size (XTWINOPS, CSI 14/16/18/19 t, and mode 2048's reports). Cells
+ * are all that is drawn here, so the pixels are a stand-in; the cells
+ * reported are the screen's own. */
 #define CELL_W 10
 #define CELL_H 20
 
@@ -58,7 +60,19 @@ typedef struct {
      * stood when the frame began is what is read until it ends. */
     bool held;
     uint64_t held_since;
+    uint16_t size_cols, size_rows;   /* the screen, as a size report says it */
 } Bwvt;
+
+static bool size(GhosttyTerminal t, void *user, GhosttySizeReportSize *out)
+{
+    (void)t;
+    Bwvt *v = user;
+    out->columns = v->size_cols;
+    out->rows = v->size_rows;
+    out->cell_width = CELL_W;
+    out->cell_height = CELL_H;
+    return true;
+}
 
 static uint64_t now_ms(void)
 {
@@ -128,6 +142,9 @@ BWVT_API Bwvt *bwvt_new(uint16_t cols, uint16_t rows)
     ghostty_terminal_set(v->term, GHOSTTY_TERMINAL_OPT_USERDATA, v);
     ghostty_terminal_set(v->term, GHOSTTY_TERMINAL_OPT_WRITE_PTY, (const void *)said);
     ghostty_terminal_set(v->term, GHOSTTY_TERMINAL_OPT_RENDER_HOLD, (const void *)hold);
+    ghostty_terminal_set(v->term, GHOSTTY_TERMINAL_OPT_SIZE, (const void *)size);
+    v->size_cols = cols;
+    v->size_rows = rows;
     ghostty_terminal_resize(v->term, cols, rows, CELL_W, CELL_H);
     return v;
 }
@@ -139,7 +156,16 @@ BWVT_API void bwvt_write(Bwvt *v, const uint8_t *data, size_t n)
 
 BWVT_API int bwvt_resize(Bwvt *v, uint16_t cols, uint16_t rows)
 {
-    return ghostty_terminal_resize(v->term, cols, rows, CELL_W, CELL_H);
+    /* Before the resize, which sends mode 2048's report of the new size. */
+    uint16_t was_cols = v->size_cols, was_rows = v->size_rows;
+    v->size_cols = cols;
+    v->size_rows = rows;
+    int r = ghostty_terminal_resize(v->term, cols, rows, CELL_W, CELL_H);
+    if (r != GHOSTTY_SUCCESS) {
+        v->size_cols = was_cols;
+        v->size_rows = was_rows;
+    }
+    return r;
 }
 
 /* The replies the program is owed, up to cap bytes; the rest stay for the
