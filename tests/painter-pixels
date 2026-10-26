@@ -661,8 +661,9 @@ class _Reader:
         self.thread.start()
 
     def run(self):
+        import select
         fd = gpupainter.Reader(self.path)
-        buf, last = b"", -1
+        buf, last = bytearray(), -1
         try:
             while not self.stop:
                 try:
@@ -670,14 +671,22 @@ class _Reader:
                 except BlockingIOError:
                     data = None
                 if not data:
-                    time.sleep(0.003)
+                    # Waiting on the fifo, as the mirror sender does, not a
+                    # sleep: a fifo hands a stream over a few KB at a time,
+                    # and a fixed pause between pieces caps what is read
+                    # below what the painter streams, which then lets frames
+                    # go for want of room.
+                    if gpupainter.WINDOWS:
+                        time.sleep(0.003)
+                    else:
+                        select.select([fd.fd], [], [], 0.2)
                     continue
                 buf += data
                 while len(buf) >= 32:
-                    _, w, h, num, _, length = struct.unpack("<4sIIQQI", buf[:32])
+                    _, w, h, num, _, length = struct.unpack("<4sIIQQI", bytes(buf[:32]))
                     if len(buf) < 32 + length:
                         break
-                    buf = buf[32 + length:]
+                    del buf[:32 + length]
                     self.frames += 1
                     if (w, h) != self.size or num <= last:
                         self.bad.append((w, h, num, last))
@@ -740,11 +749,8 @@ def the_glass_resized_again_and_again_is_drawn_right_and_holds_its_memory():
     each: the answer is the area at the size the glass now is, and nothing
     between was said; `picture glass` is that size, every cell the colour
     the base drew there, the margins black and the layer's frame where it
-    was put; the streams keep their own sizes, frames numbered in order,
-    at the rates they keep on this machine with nothing being resized,
-    measured first, since what a machine's GPU can stream is its own and
-    what is checked here is that resizing takes no share of it. The
-    painter's memory, and the GPU's part of it, measured
+    was put; the streams keep their own sizes, frames numbered in order, at
+    their rates. The painter's memory, and the GPU's part of it, measured
     at one size after the first ten and at the end: what grows is a leak.
     A Mac's GL keeps memory for the biggest glass it has drawn, so the
     biggest is among the first ten; beyond that a few MB come and go."""
@@ -759,12 +765,6 @@ def the_glass_resized_again_and_again_is_drawn_right_and_holds_its_memory():
         paths = {k: os.path.join(ctl.dir, f"glass-{k}") for k in streams}
         assert gpupainter.wait_for(lambda: all(map(gpupainter.there, paths.values())), 3), ctl.heard
         readers = {k: _Reader(paths[k], streams[k][:2]) for k in streams}
-        time.sleep(1)
-        b0, f0 = time.monotonic(), {k: r.frames for k, r in readers.items()}
-        time.sleep(5)
-        steady = {k: (r.frames - f0[k]) / (time.monotonic() - b0)
-                  for k, r in readers.items()}
-        assert all(steady.values()), f"a stream sent nothing: {steady}"
         sizes, before, t0, frames0, said = _sizes(n), None, None, None, 0
         try:
             for i, (gw, gh) in enumerate(sizes):
@@ -824,18 +824,13 @@ def the_glass_resized_again_and_again_is_drawn_right_and_holds_its_memory():
         for k, r in readers.items():
             assert not r.bad, f"stream {k}: {r.bad[:3]}"
             rates[k] = (frames1[k] - frames0[k]) / took
-            # A tenth or so either way is the machine's own wander from
-            # one second to the next; a stream resizing starves is far
-            # below that.
-            assert rates[k] >= 0.7 * steady[k], \
-                f"stream {k}: {rates[k]:.1f} fps resizing, of {steady[k]:.1f} " \
-                f"with nothing resized (asked {streams[k][2]})"
+            assert rates[k] >= 0.8 * streams[k][2], \
+                f"stream {k}: {rates[k]:.1f} fps of {streams[k][2]}"
         grew = (after[0] - before[0]) / 2**20, (after[1] - before[1]) / 2**20
         assert grew[0] < 6 and grew[1] < 4, \
             f"after {n - 10} resizes the painter grew {grew[0]:.1f} MB, the GPU's part {grew[1]:.1f} MB"
         return (f"{said} resizes ({n // 10} drags) 320-1920 x 180-1080, every picture right; "
-                f"streams {rates['a']:.1f} of {steady['a']:.1f} (asked 25) and "
-                f"{rates['b']:.1f} of {steady['b']:.1f} (asked 15) fps; footprint "
+                f"streams {rates['a']:.1f}/25 and {rates['b']:.1f}/15 fps; footprint "
                 f"{before[0] / 2**20:.1f} -> {after[0] / 2**20:.1f} MB, GPU "
                 f"{before[1] / 2**20:.1f} -> {after[1] / 2**20:.1f} MB, RSS "
                 f"{before[2] / 2**20:.1f} -> {after[2] / 2**20:.1f} MB")
