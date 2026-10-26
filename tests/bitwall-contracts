@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --quiet --script
 # /// script
 # requires-python = ">=3.14"
-# dependencies = ["aiohttp", "numpy", "pillow", "pyte", "pygame-ce", "websocket-client"]
+# dependencies = ["aiohttp", "numpy", "pillow", "pygame-ce", "websocket-client"]
 # ///
 """What a receiver and a sender each promise the other.
 
@@ -428,8 +428,8 @@ class TermReceiver(ShellReceiver):
     """`bitwall-term`, built for this machine with `cargo build --release`,
     on a pty of the size the check wants, as the shell receiver is. It
     reads the stream into a grid and draws what changed, so the screen is
-    the pty's master as pyte reads it, and a resize is told to it as a
-    terminal tells it, by SIGWINCH."""
+    the pty's master as the terminal emulator reads it, and a resize is
+    told to it as a terminal tells it, by SIGWINCH."""
 
     name = "term"
     title = "the term receiver"
@@ -1997,10 +1997,10 @@ def a_picture_of_a_cells_layer_is_its_grid_to_whoever_asks(r):
     assert words[:3] == ["picture", "base", "grid"] and words[-1] == "id=a", words
     cols, rows = map(int, words[3].split("x"))
     assert int(words[4]) == len(data) and data.endswith(b"\x1b[0m"), words
-    text, screen = shown(ctl.frames, cols, rows)
+    text, grid = shown(ctl.frames, cols, rows)
     assert text[0][0].startswith("hello"), text[0][0][:20]
     assert text[2][0][4:9] == "world", text[2][0][:20]
-    assert screen.buffer[0][0].fg == "c80a0a", screen.buffer[0][0].fg
+    assert grid[0][0][1] == "c80a0a", grid[0][0]
     base.pump()
     assert not base.frames, "the base was sent the picture"
     base.command("picture base id=b")
@@ -2559,15 +2559,30 @@ def a_session_keeps_two_mirrors_and_a_wall_four(r):
     ctl.close()
 
 
+class NoEmulator(Exception):
+    """The terminal emulator a check reads a stream through is not built."""
+
+
+def emulator(cols, rows):
+    """bitwall.terminal at cols x rows, the emulator the terminal sources
+    read through; a check that needs one and finds none is skipped."""
+    from bitwall import terminal
+    if not terminal.available():
+        raise NoEmulator(f"skipped: no emulator at {terminal.library()}")
+    return terminal.Terminal(cols, rows)
+
+
 def shown(frames, cols, rows):
-    """The screen after painting frames in order, as pyte reads them: each
-    cell's character and ink."""
-    import pyte
-    screen = pyte.Screen(cols, rows)
-    stream = pyte.ByteStream(screen)
-    for _, data in frames:
-        stream.feed(data)
-    return [["".join(screen.buffer[y][x].data for x in range(cols))] for y in range(rows)], screen
+    """The screen after painting frames in order, as the terminal emulator
+    reads them: each row's text, and the cells."""
+    t = emulator(cols, rows)
+    try:
+        for _, data in frames:
+            t.write(data)
+        grid = t.cells()
+    finally:
+        t.close()
+    return [["".join(c[0] for c in row)] for row in grid], grid
 
 
 # ------------------------------------------------------- a video layer
@@ -5100,24 +5115,26 @@ def serialise_never_writes_a_truecolour_sgr_short_of_its_three_numbers():
 
 
 @check
-@known("the three readers disagree on 38;2;1;2: the C painter makes it bold "
-       "with no colour, the page makes it colour 010200, pyte ignores it")
+@known("the readers disagree on 38;2;1;2: the C painter and the emulator "
+       "make it bold with no colour, the page makes it colour 010200")
 def a_truncated_truecolour_sgr_means_the_same_to_every_reader():
     """`ESC[38;2;1;2m`, one number short, read by each thing that reads.
 
-    The C painter on the Pi, the JavaScript in a tab, and pyte, which the
-    tkinter receiver and a tmux source both read through. Nothing sends
-    this, so any answer will do; three different ones mean one stream is
-    three different pictures.
+    The C painter on the Pi, the JavaScript in a tab, and the terminal
+    emulator, which the terminal sources read through. Nothing sends this,
+    so any answer will do; different ones mean one stream is different
+    pictures.
     """
-    import pyte
+    from bitwall import terminal
     text = "\x1b[38;2;1;2mX"
     readers = {}
-    s = pyte.Screen(4, 1)
-    pyte.Stream(s).feed(text)
-    c = s.buffer[0][0]
-    readers["pyte"] = {"bold": bool(c.bold),
-                       "fg": None if c.fg == "default" else c.fg}
+    if terminal.available():
+        t = terminal.Terminal(4, 1)
+        t.write(text.encode())
+        c = t.cells()[0][0]
+        t.close()
+        readers["emulator"] = {"bold": bool(c[3]),
+                               "fg": None if c[1] == "default" else c[1]}
     if shutil.which("node"):
         js = _node(_JS_SGR, {"text": text})
         readers["page"] = {"bold": js["bold"],
@@ -5383,33 +5400,31 @@ covers = fakewall.covers
 
 
 def decode(text, cols, rows):
-    """What a stream paints, as cells, read by pyte.
+    """What a stream paints, as cells, read by the terminal emulator.
 
-    pyte is the emulator the tmux source already reads through, so this
-    is bitwall reading its own wire rather than a decoder written for it.
+    It is the emulator the terminal sources read through, so this is
+    bitwall reading its own wire rather than a decoder written for it.
     """
-    import pyte
-    screen = pyte.Screen(cols, rows)
-    pyte.Stream(screen).feed(text)
-    return [[(screen.buffer[y][x].data, screen.buffer[y][x].fg,
-              screen.buffer[y][x].bg, screen.buffer[y][x].bold)
-             for x in range(cols)] for y in range(rows)]
+    t = emulator(cols, rows)
+    try:
+        t.write(text.encode())
+        return [[c[:4] for c in row] for row in t.cells()]
+    finally:
+        t.close()
 
 
 def pictures(text, cols, rows):
     """What the screen held after each frame of a stream, in order."""
-    import pyte
-    screen = pyte.Screen(cols, rows)
-    stream = pyte.Stream(screen)
+    t = emulator(cols, rows)
     out = []
-    for body in text.split(RESET):
-        stream.feed(body + RESET)
-        if body:
-            out.append(tuple(tuple((screen.buffer[y][x].data,
-                                    screen.buffer[y][x].fg,
-                                    screen.buffer[y][x].bg)
-                                   for x in range(cols))
-                             for y in range(rows)))
+    try:
+        for body in text.split(RESET):
+            t.write((body + RESET).encode())
+            if body:
+                out.append(tuple(tuple(c[:3] for c in row)
+                                 for row in t.cells()))
+    finally:
+        t.close()
     return out
 
 
@@ -7832,6 +7847,8 @@ def run_one(fn):
             note = fn()
     except AssertionError as exc:
         status, text = ("known", str(exc)) if reason else ("fail", str(exc))
+    except NoEmulator as exc:
+        status, text = "skip", str(exc)
     except Exception as exc:                           # noqa: BLE001
         status, text = "error", f"{type(exc).__name__}: {exc}"
     else:
