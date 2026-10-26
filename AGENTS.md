@@ -396,6 +396,11 @@ for whoever works on the library, a receiver or a controller.
   a process already running, as `relay clock` answers once a line; and
   that host's own clock ran 0.55 s ahead of NTP's, so never take a host's
   clock to be right.
+- **Close a program's pty before waiting for it to end.** A program blocked
+  writing to a pty nobody reads -- a tmux client mid-redraw -- never gets
+  round to a SIGTERM, and a `close()` that then waits for it hangs the
+  wall's `detach()` for good. With the pty closed its write fails and it
+  ends; one still there a second later is killed (`stream.py`).
 - **Assert your patches applied.** A `str.replace` that matches nothing
   fails silently. Two edits here reported success and changed nothing, and
   the wrong behaviour was blamed on other code for half an hour.

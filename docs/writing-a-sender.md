@@ -162,9 +162,10 @@ here.
 **Choose a terminal program when you want one that already exists**:
 `btop`, `lazygit`, a log tailer, something with its own layout and key
 handling. `CommandSource("btop")` runs it in a pty of its own, sized to the
-wall. The price is a pty and a terminal emulation on every frame, about 30%
-slower on the same content, and worse if the program repaints in full. Both
-terminal sources need the emulator built once, `bitwall/vt/build`.
+wall. The price is a pty and a terminal emulation, paid for the rows that
+change: btop at 240x67 through tmux costs the sender about 2% of a core,
+and cmatrix, which changes every row every frame, about 21%. Both terminal
+sources need the emulator built once, `bitwall/vt/build`.
 
 **Choose tmux when the scene is a session**: one someone else is attached
 to as well, several panes laid out by a tmux config, or a program that must
@@ -429,6 +430,10 @@ window. Your program inside receives **SIGWINCH** and should redraw at its
 new size exactly as it would in a real terminal. A program that ignores
 SIGWINCH looks wrong on a wall, and that is a bug in the program.
 
+**A terminal program run by `CommandSource`.** The library sets the pty's
+size (`TIOCSWINSZ`) and its emulator's screen, with no tmux between, and the
+program receives **SIGWINCH** as above.
+
 **A terminal program run directly at a desk.** No wall involved. It reads
 `os.get_terminal_size()` and handles SIGWINCH itself. Turn autowrap off
 (`ESC[?7l`) if your grid is exactly as wide as the screen, or the last
@@ -453,7 +458,11 @@ source.close()               # when it is replaced or the sender leaves
 | Wrapper | `fileno()` | Idle cost | `resize()` does |
 |---|---|---|---|
 | `FunctionSource` | `None` | polls every `min_frame` | nothing; `render` is told the area |
+| `CommandSource(argv)` | the pty | nothing; blocks in `select` | TIOCSWINSZ |
 | `TmuxSource(session, sock)` | the pty | nothing; blocks in `select` | resize-window, then TIOCSWINSZ |
+
+`CommandSource.exited()` says whether its program has ended, by itself or
+otherwise; `close()` ends it if it has not.
 
 A plain `render(cols, rows)` function is accepted anywhere a source is,
 and is wrapped in `FunctionSource` for you. `set_source` swaps what feeds

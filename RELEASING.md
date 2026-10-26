@@ -36,7 +36,8 @@ release says which protocol it speaks.
 
 ## Making a release
 
-1. Run the full tests on a Mac with uv, node and a C compiler:
+1. Run the full tests on a Mac with uv, node, a C compiler, tmux and zig,
+   after `bitwall/vt/build`, without which the terminal checks are skipped:
    `tests/bitwall-tests` (which runs `tests/bitwall-contracts` and
    `tests/paint/run` among its groups), and `cargo test` in each crate:
    `bitwall/rust`, `bitwall/receivers/core-rs`, `bitwall/receivers/term`,

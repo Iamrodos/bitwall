@@ -632,6 +632,8 @@ bitwall/                 the tool: import this
   protocol.py            the commands and what they mean
   stream.py              sources, compose, serialise
   arrays.py              the same, for a picture held as numpy arrays
+  terminal.py            the terminal emulator a terminal program is read through
+  vt/                    its C and its build: libghostty-vt at a pinned commit
   video.py               a video layer: frames, a film on `data`
   capture.py             pictures and mirrors of what a wall shows
   letters.py             big text: block, braille, segment and outline fonts
@@ -684,7 +686,8 @@ tests/bitwall-contracts     # every receiver that runs here held to PROTOCOL.md
 They cover what breaks silently -- a contract two implementations depend
 on, a boundary between a screen and a sender -- not how a wall looks, which
 is still decided by looking at it. A group whose tool is missing (node, a C
-compiler, uv, Chrome) is skipped and says so.
+compiler, uv, Chrome, tmux, or the emulator `bitwall/vt/build` makes) is
+skipped and says so.
 
 ## Hardware notes
 
