@@ -461,8 +461,10 @@ source.close()               # when it is replaced or the sender leaves
 | `CommandSource(argv)` | the pty | nothing; blocks in `select` | TIOCSWINSZ |
 | `TmuxSource(session, sock)` | the pty | nothing; blocks in `select` | resize-window, then TIOCSWINSZ |
 
-`CommandSource.exited()` says whether its program has ended, by itself or
-otherwise; `close()` ends it if it has not.
+`exited()` says whether a terminal source's program has ended, by itself
+or otherwise; `close()` ends it if it has not. One that ends leaves its
+last screen on the wall and is reaped, and from then its `fileno()` is
+`None`, so the wall polls it as it would a `FunctionSource`.
 
 A plain `render(cols, rows)` function is accepted anywhere a source is,
 and is wrapped in `FunctionSource` for you. `set_source` swaps what feeds

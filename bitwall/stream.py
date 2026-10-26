@@ -364,12 +364,18 @@ class _TerminalSource:
 
     def pump(self):
         got = False
-        while True:
+        while self.fd is not None:
             try:
                 data = os.read(self.fd, 65536)
-            except (OSError, BlockingIOError):
+            except BlockingIOError:
+                break
+            except OSError:
                 data = b""
             if not data:
+                # The program's end of the pty is gone: it has ended, or
+                # closed its terminal. Read as an end rather than left
+                # readable for ever, and the screen stays as it was left.
+                self._hung_up()
                 break
             self.term.write(data)
             got = True
@@ -378,6 +384,32 @@ class _TerminalSource:
                 break
         self._answer()
         return got
+
+    def exited(self):
+        """Whether the program has ended, by itself or otherwise."""
+        if not self.pid:
+            return True
+        try:
+            pid, _ = os.waitpid(self.pid, os.WNOHANG)
+        except ChildProcessError:
+            return True
+        if pid:
+            self.pid = None
+        return bool(pid)
+
+    def _hung_up(self):
+        with self._owing:
+            if self.fd is not None:
+                try:
+                    os.close(self.fd)
+                except OSError:
+                    pass
+                self.fd = None
+        # Reaped now if it ends with its pty, as it nearly always does, so
+        # it is not left a zombie for the life of the wall.
+        end = time.monotonic() + 0.05
+        while not self.exited() and time.monotonic() < end:
+            time.sleep(0.005)
 
     #: The most a program may be owed before what it has not taken is let go.
     OWED = 4096
@@ -500,18 +532,6 @@ class CommandSource(_TerminalSource):
 
     def environ(self):
         return {"TERM": "xterm-256color", "COLORTERM": "truecolor", **self.env}
-
-    def exited(self):
-        """Whether the program has ended, by itself or otherwise."""
-        if not self.pid:
-            return True
-        try:
-            pid, _ = os.waitpid(self.pid, os.WNOHANG)
-        except ChildProcessError:
-            return True
-        if pid:
-            self.pid = None
-        return bool(pid)
 
 
 class FunctionSource:

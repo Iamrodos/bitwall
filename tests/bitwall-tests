@@ -2484,6 +2484,37 @@ def a_terminal_source_closes_on_a_program_that_never_stops_writing():
 
 
 @check
+def a_program_that_ends_leaves_its_screen_and_no_zombie():
+    """Its last screen stays on the wall, it is reaped as it ends, and the
+    source stops offering an fd that would be readable for ever."""
+    from bitwall import terminal
+    if not hasattr(os, "fork"):
+        return "skipped: no pty here"
+    if not terminal.available():
+        return f"skipped: no emulator at {terminal.library()}"
+    import select
+    src = bitwall.CommandSource(["sh", "-c", "echo bye"])
+    try:
+        src.start(20, 2)
+        pid = src.pid
+        end = time.monotonic() + 5
+        while src.fileno() is not None and time.monotonic() < end:
+            if select.select([src.fileno()], [], [], 0.05)[0]:
+                src.pump()
+        assert src.fileno() is None, "the ended program's pty is still offered"
+        said = "".join(c[0] for c in src.cells(20, 2)[0]).rstrip()
+        assert said == "bye", said
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+        else:
+            raise AssertionError("the ended program was left a zombie")
+    finally:
+        src.close()
+
+
+@check
 def a_command_that_cannot_run_says_so_on_the_wall():
     """A program that is not there is a wall that says so, not a blank one."""
     from bitwall import terminal
