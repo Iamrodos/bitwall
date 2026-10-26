@@ -2563,6 +2563,33 @@ def a_program_that_asks_and_never_reads_the_answers_does_not_stop_the_wall():
     assert time.monotonic() - began < 3, "close waited on the program"
 
 
+@check
+def a_frame_drawn_in_synchronized_output_is_read_only_when_whole():
+    """Mode 2026: while a program draws a frame it wants seen whole, the
+    screen reads as it stood when the frame began; a frame that ends and
+    a next that begins between two reads leaves the finished one; and a
+    hold that is never let go is let go after a second."""
+    from bitwall import terminal
+    if not terminal.available():
+        return f"skipped: no emulator at {terminal.library()}"
+    t = terminal.Terminal(20, 2)
+    row = lambda: "".join(c[0] for c in t.cells()[0]).rstrip()  # noqa: E731
+    try:
+        t.write(b"old frame")
+        assert row() == "old frame", row()
+        t.write(b"\x1b[?2026h\x1b[H\x1b[2Jnew fr")
+        assert row() == "old frame", f"a half frame was read: {row()!r}"
+        t.write(b"ame\x1b[?2026l")
+        assert row() == "new frame", row()
+        t.write(b"\x1b[?2026h\x1b[2J\x1b[Hone\x1b[?2026l"
+                b"\x1b[?2026h\x1b[2J\x1b[Htwo, half")
+        assert row() == "one", f"the finished frame was lost: {row()!r}"
+        time.sleep(1.1)
+        assert row() == "two, half", "a hold never let go froze the screen"
+    finally:
+        t.close()
+
+
 _RACE = """
 import sys, threading, time
 sys.path.insert(0, sys.argv[1])

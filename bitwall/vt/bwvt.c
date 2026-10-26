@@ -24,6 +24,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <ghostty/vt.h>
 
@@ -38,6 +39,12 @@
 #define CELL_W 10
 #define CELL_H 20
 
+/* How long a program may hold the screen while it draws a frame
+ * (synchronized output, mode 2026) before the hold is let go: one that
+ * crashes or forgets mid-frame must not freeze the wall. Ghostty's own
+ * renderer and kitty give up after a second too. */
+#define HOLD_MS 1000
+
 typedef struct {
     GhosttyTerminal term;
     GhosttyRenderState state;
@@ -47,7 +54,31 @@ typedef struct {
      * device's attributes -- until the host takes it to the pty. */
     uint8_t *said;
     size_t said_len, said_cap;
+    /* A program drawing a frame it wants seen whole: the screen as it
+     * stood when the frame began is what is read until it ends. */
+    bool held;
+    uint64_t held_since;
 } Bwvt;
+
+static uint64_t now_ms(void)
+{
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+/* Taken when a hold begins rather than at the next read, so a frame that
+ * ends and a next that begins between two reads leaves the finished one
+ * to be read, not the start of the next. */
+static void hold(GhosttyTerminal t, void *user, bool held)
+{
+    Bwvt *v = user;
+    if (held && !v->held) {
+        ghostty_render_state_update(v->state, t);
+        v->held_since = now_ms();
+    }
+    v->held = held;
+}
 
 static void said(GhosttyTerminal t, void *user, const uint8_t *data, size_t n)
 {
@@ -96,6 +127,7 @@ BWVT_API Bwvt *bwvt_new(uint16_t cols, uint16_t rows)
     ghostty_terminal_set(v->term, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES, &none);
     ghostty_terminal_set(v->term, GHOSTTY_TERMINAL_OPT_USERDATA, v);
     ghostty_terminal_set(v->term, GHOSTTY_TERMINAL_OPT_WRITE_PTY, (const void *)said);
+    ghostty_terminal_set(v->term, GHOSTTY_TERMINAL_OPT_RENDER_HOLD, (const void *)hold);
     ghostty_terminal_resize(v->term, cols, rows, CELL_W, CELL_H);
     return v;
 }
@@ -149,7 +181,13 @@ BWVT_API int bwvt_read(Bwvt *v, int all, uint16_t *cols_out, uint16_t *rows_out,
                        uint16_t *ys, uint8_t *recs, size_t recs_cap,
                        uint8_t *text, size_t text_cap, size_t *text_len)
 {
-    if (ghostty_render_state_update(v->state, v->term) != GHOSTTY_SUCCESS)
+    if (v->held && now_ms() - v->held_since >= HOLD_MS) {
+        GhosttyTerminalModeConfig off = { .mode = GHOSTTY_MODE_SYNC_OUTPUT,
+                                          .value = false };
+        ghostty_terminal_set(v->term, GHOSTTY_TERMINAL_OPT_MODE, &off);
+        v->held = false;
+    }
+    if (!v->held && ghostty_render_state_update(v->state, v->term) != GHOSTTY_SUCCESS)
         return -1;
     uint16_t cols = 0, rows = 0;
     ghostty_render_state_get(v->state, GHOSTTY_RENDER_STATE_DATA_COLS, &cols);

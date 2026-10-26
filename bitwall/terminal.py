@@ -5,6 +5,10 @@ cells. Inside is libghostty-vt, Ghostty's own emulator, behind the few calls
 in `bitwall/vt/bwvt.c`, built by `bitwall/vt/build` into one library, which
 `library()` says where to find.
 
+A program drawing a frame it wants seen whole (synchronized output, mode
+2026) is read as the screen stood before the frame, until it is done, or
+for a second at most.
+
 A program asks its terminal questions -- where the cursor is, what the
 terminal is -- and expects answers on its input. `said()` is what is owed,
 for the host to write back to the program's pty.
