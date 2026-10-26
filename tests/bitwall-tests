@@ -2859,6 +2859,35 @@ def a_sender_finds_the_base_by_name_and_reads_its_cells():
 
 
 @check
+def a_source_slow_to_close_holds_up_nothing_else_on_the_wall():
+    """A source that takes a second to close -- a program slow to end --
+    is closed after it is replaced without the Wall's lock held, so the
+    next set_source does not wait on it."""
+    fake, w, _ = _fake_and_wall("A")
+
+    class Slow(bitwall.FunctionSource):
+        closed = None
+
+        def close(self):
+            time.sleep(1.0)
+            Slow.closed = time.monotonic()
+
+    try:
+        assert _until(lambda: w.talking and fake.painted), "the sender never painted"
+        w.set_source(Slow(lambda c, r: grid_of(c, r, "s")))
+        w.set_source(bitwall.FunctionSource(lambda c, r: grid_of(c, r, "b")))
+        time.sleep(0.2)                     # the render loop is closing Slow
+        began = time.monotonic()
+        w.set_source(bitwall.FunctionSource(lambda c, r: grid_of(c, r, "c")))
+        took = time.monotonic() - began
+        assert took < 0.5, f"set_source waited {took:.2f}s on a source closing"
+        assert _until(lambda: Slow.closed is not None, 2.0), "the slow source was never closed"
+    finally:
+        w.detach()
+        fake.remove()
+
+
+@check
 def a_mirror_keeps_a_current_copy_and_says_when_it_changed():
     fake, w, shown = _fake_and_wall("one")
     try:

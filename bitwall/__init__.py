@@ -1438,14 +1438,15 @@ class Wall:
         for t in self._threads:
             t.join(timeout=0.3)
         with self._lock:
-            while self._retire:
-                try:
-                    self._retire.pop().close()
-                except Exception:
-                    pass
+            retired, self._retire = self._retire, []
             if self._src:
-                self._src.close()
+                retired.append(self._src)
                 self._src = None
+        for old in retired:
+            try:
+                old.close()
+            except Exception:
+                pass
         # Under the write lock, so a recovery under way cannot open a
         # session after this one has gone and leave a base behind.
         with self._wlock:
@@ -1653,12 +1654,17 @@ class Wall:
         built, built_gen = None, None
         while not self._stop.is_set() and not self._broken.is_set():
             with self._lock:
-                # Safe point: we are not inside any source's pump().
-                while self._retire:
-                    try:
-                        self._retire.pop().close()
-                    except Exception:
-                        pass
+                # Safe point: we are not inside any source's pump(). They
+                # are closed once the lock is let go, since a source may
+                # wait a moment for its program to end, and set_source and
+                # a new area wait on the lock meanwhile.
+                retired, self._retire = self._retire, []
+            for old in retired:
+                try:
+                    old.close()
+                except Exception:
+                    pass
+            with self._lock:
                 src = self._src
                 blanked = self._blanked or self._hold > 0
                 unwatched = self._watching == 0
