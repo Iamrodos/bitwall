@@ -2455,6 +2455,24 @@ def a_command_source_runs_a_program_and_reads_the_cells_it_drew():
         shutil.rmtree(work, ignore_errors=True)
 
 
+@check
+def a_terminal_source_closes_on_a_program_that_never_stops_writing():
+    """A program blocked writing to a pty nobody reads still ends, and so
+    does the close that waits for it, as a wall's detach does."""
+    from bitwall import terminal
+    if not hasattr(os, "fork"):
+        return "skipped: no pty here"
+    if not terminal.available():
+        return f"skipped: no emulator at {terminal.library()}"
+    src = bitwall.CommandSource(["sh", "-c", "trap '' TERM; yes"])
+    src.start(40, 10)
+    time.sleep(0.3)
+    began = time.monotonic()
+    src.close()
+    took = time.monotonic() - began
+    assert src.exited() and took < 3, f"close took {took:.1f}s"
+
+
 # ---------------------------------------------------------------- machine
 
 @check

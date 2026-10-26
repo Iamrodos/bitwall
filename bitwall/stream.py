@@ -18,6 +18,7 @@ import select
 import signal
 import struct
 import subprocess
+import time
 
 
 from .cells import BLANK
@@ -379,19 +380,28 @@ class _TerminalSource:
         return ["".join(c[0] for c in row) for row in self.term.cells()]
 
     def close(self):
-        if self.pid:
-            try:
-                os.kill(self.pid, signal.SIGTERM)
-                os.waitpid(self.pid, 0)
-            except (ProcessLookupError, ChildProcessError):
-                pass
-            self.pid = None
+        # The pty goes first. A program stuck writing to a pty nobody reads
+        # never gets round to a SIGTERM; with its terminal gone, its write
+        # fails and it hangs up. One that still lingers is killed.
         if self.fd is not None:
             try:
                 os.close(self.fd)
             except OSError:
                 pass
             self.fd = None
+        if self.pid:
+            try:
+                os.kill(self.pid, signal.SIGTERM)
+                end = time.monotonic() + 1.0
+                while not os.waitpid(self.pid, os.WNOHANG)[0]:
+                    if time.monotonic() > end:
+                        os.kill(self.pid, signal.SIGKILL)
+                        os.waitpid(self.pid, 0)
+                        break
+                    time.sleep(0.01)
+            except (ProcessLookupError, ChildProcessError):
+                pass
+            self.pid = None
         if self.term is not None:
             self.term.close()
             self.term = None
