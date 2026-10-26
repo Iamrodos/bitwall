@@ -13,6 +13,7 @@ import ctypes
 import os
 import struct
 import sys
+import threading
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _NAME = {"darwin": "libbitwall-vt.dylib",
@@ -76,9 +77,17 @@ def _colour(kind, value):
 
 
 class Terminal:
-    """One screen of cols x rows, fed with what a program writes."""
+    """One screen of cols x rows, fed with what a program writes.
+
+    Safe to use from several threads: a Wall resizes it on one while it is
+    fed and read on another. ctypes lets go of the GIL inside the library,
+    which allows only one call at a time on a terminal, so every call holds
+    the terminal's own lock. Once closed, it takes nothing and reads as it
+    last stood.
+    """
 
     def __init__(self, cols, rows):
+        self._lock = threading.Lock()
         self._lib = _load()
         self._vt = self._lib.bwvt_new(cols, rows)
         if not self._vt:
@@ -96,24 +105,32 @@ class Terminal:
 
     def write(self, data):
         """What the program wrote, as bytes, in any pieces."""
-        if data:
-            self._lib.bwvt_write(self._vt, data, len(data))
+        if not data:
+            return
+        with self._lock:
+            if self._vt:
+                self._lib.bwvt_write(self._vt, data, len(data))
 
     def resize(self, cols, rows):
-        self.cols, self.rows = cols, rows
-        self._lib.bwvt_resize(self._vt, cols, rows)
-        if len(self._ys) < rows or len(self._recs) < cols * rows * _RECORD.size:
-            self._buffers(cols, rows, 8)
+        with self._lock:
+            if not self._vt:
+                return
+            self.cols, self.rows = cols, rows
+            self._lib.bwvt_resize(self._vt, cols, rows)
+            if len(self._ys) < rows or len(self._recs) < cols * rows * _RECORD.size:
+                self._buffers(cols, rows, 8)
 
     def said(self):
         """The replies the program is owed, as bytes; each is given once."""
         out = b""
         buf = ctypes.create_string_buffer(4096)
-        while True:
-            n = self._lib.bwvt_take_said(self._vt, buf, len(buf))
-            out += buf.raw[:n]
-            if n < len(buf):
-                return out
+        with self._lock:
+            while self._vt:
+                n = self._lib.bwvt_take_said(self._vt, buf, len(buf))
+                out += buf.raw[:n]
+                if n < len(buf):
+                    break
+        return out
 
     def cells(self):
         """The screen, a list of rows of cells, as `bitwall.cells` has them.
@@ -122,6 +139,12 @@ class Terminal:
         rest are the same row objects as before, which a caller must not
         change.
         """
+        with self._lock:
+            if not self._vt:
+                return list(self._grid)
+            return self._cells()
+
+    def _cells(self):
         cols, rows = ctypes.c_uint16(), ctypes.c_uint16()
         used = ctypes.c_size_t()
         every = self._shape != (self.cols, self.rows)
@@ -169,9 +192,10 @@ class Terminal:
                                    ctypes.byref(used))
 
     def close(self):
-        if self._vt:
-            self._lib.bwvt_free(self._vt)
-            self._vt = None
+        with self._lock:
+            if self._vt:
+                self._lib.bwvt_free(self._vt)
+                self._vt = None
 
     def __del__(self):
         try:

@@ -403,8 +403,8 @@ class _TerminalSource:
                 pass
             self.pid = None
         if self.term is not None:
+            # Kept, closed: the render thread may still be reading it.
             self.term.close()
-            self.term = None
 
 
 class TmuxSource(_TerminalSource):

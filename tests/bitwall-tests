@@ -2473,6 +2473,42 @@ def a_terminal_source_closes_on_a_program_that_never_stops_writing():
     assert src.exited() and took < 3, f"close took {took:.1f}s"
 
 
+_RACE = """
+import sys, threading, time
+sys.path.insert(0, sys.argv[1])
+from bitwall import terminal
+t = terminal.Terminal(80, 24)
+end = time.monotonic() + 1.5
+def feed():
+    while time.monotonic() < end:
+        t.write(b"\\x1b[H" + b"\\x1b[31mX\\x1b[42mY" * 900)
+        t.cells()
+def size():
+    i = 0
+    while time.monotonic() < end:
+        i += 1
+        t.resize(40 + i % 120, 10 + i % 50)
+threads = [threading.Thread(target=feed), threading.Thread(target=size)]
+for th in threads: th.start()
+time.sleep(0.75)
+t.close()
+for th in threads: th.join()
+"""
+
+
+@check
+def the_terminal_emulator_takes_a_resize_while_another_thread_reads_it():
+    """A Wall resizes its source on one thread while the render thread
+    feeds and reads it, and closes it with that thread still going. Run in
+    a process of its own, since what goes wrong is the process dying."""
+    from bitwall import terminal
+    if not terminal.available():
+        return f"skipped: no emulator at {terminal.library()}"
+    out = subprocess.run([sys.executable, "-c", _RACE, ROOT],
+                         capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, (out.returncode, out.stderr[-400:])
+
+
 # ---------------------------------------------------------------- machine
 
 @check
