@@ -326,13 +326,22 @@ class _TerminalSource:
         from . import terminal
         self.term = terminal.Terminal(cols, rows)
         argv = self.argv()
+        # Everything the child needs is made before the fork. The process
+        # has threads, and a child that allocated or took a lock between
+        # fork and exec could wait for good on one held by a thread that
+        # did not come with it.
+        env = {"LANG": "en_AU.UTF-8", "LC_ALL": "en_AU.UTF-8",
+               **os.environ, **self.environ()}
+        failed = f"bitwall: cannot run {argv[0]}\r\n".encode(errors="replace")
+        import shutil
+        path = shutil.which(argv[0], path=env.get("PATH")) or argv[0]
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
-            os.environ.update(self.environ())
-            os.environ.setdefault("LANG", "en_AU.UTF-8")
-            os.environ.setdefault("LC_ALL", "en_AU.UTF-8")
             try:
-                os.execvp(argv[0], argv)
+                os.execve(path, argv, env)
+            except BaseException:
+                # On the wall, where whoever is looking will see it.
+                os.write(1, failed)
             finally:
                 os._exit(127)
         # Never blocked on the program: a reply it does not read must not

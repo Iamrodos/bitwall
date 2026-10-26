@@ -2484,6 +2484,26 @@ def a_terminal_source_closes_on_a_program_that_never_stops_writing():
 
 
 @check
+def a_command_that_cannot_run_says_so_on_the_wall():
+    """A program that is not there is a wall that says so, not a blank one."""
+    from bitwall import terminal
+    if not hasattr(os, "fork"):
+        return "skipped: no pty here"
+    if not terminal.available():
+        return f"skipped: no emulator at {terminal.library()}"
+    src = bitwall.CommandSource(["/no/such/program"])
+    try:
+        src.start(50, 3)
+        cells = _pumped(src, 50, 3, lambda c: "cannot run" in
+                        "".join(x[0] for x in c[0]))
+        said = "".join(x[0] for x in cells[0]).rstrip()
+        assert said == "bitwall: cannot run /no/such/program", said
+        assert _until(src.exited), "the failed child was not seen to end"
+    finally:
+        src.close()
+
+
+@check
 def a_program_that_asks_and_never_reads_the_answers_does_not_stop_the_wall():
     """Where the cursor is, what the terminal is, asked without end by a
     program that never reads its input: the answers are let go once its
