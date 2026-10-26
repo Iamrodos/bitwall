@@ -2457,8 +2457,10 @@ def a_command_source_runs_a_program_and_reads_the_cells_it_drew():
 
 @check
 def a_terminal_source_closes_on_a_program_that_never_stops_writing():
-    """A program blocked writing to a pty nobody reads still ends, and so
-    does the close that waits for it, as a wall's detach does."""
+    """A program blocked writing to a pty nobody reads, deaf to SIGTERM,
+    ends as soon as its pty is closed under it -- well inside the second
+    after which a close would kill it -- and is reaped, so a wall's detach
+    neither waits on it nor leaves it behind."""
     from bitwall import terminal
     if not hasattr(os, "fork"):
         return "skipped: no pty here"
@@ -2467,10 +2469,18 @@ def a_terminal_source_closes_on_a_program_that_never_stops_writing():
     src = bitwall.CommandSource(["sh", "-c", "trap '' TERM; yes"])
     src.start(40, 10)
     time.sleep(0.3)
+    pid = src.pid
     began = time.monotonic()
     src.close()
     took = time.monotonic() - began
-    assert src.exited() and took < 3, f"close took {took:.1f}s"
+    assert took < 0.5, f"close took {took:.2f}s: the program was killed, " \
+        "not ended by its pty closing"
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        pass
+    else:
+        raise AssertionError(f"the program, {pid}, was left behind")
 
 
 @check
