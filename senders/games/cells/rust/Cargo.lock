@@ -4,14 +4,14 @@ version = 4
 
 [[package]]
 name = "bitwall"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "rayon",
 ]
 
 [[package]]
 name = "cells"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "bitwall",
  "rayon",

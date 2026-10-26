@@ -1,6 +1,6 @@
 [package]
 name = "bitwall-term"
-version = "1.3.0"
+version = "1.3.1"
 edition = "2021"
 description = "a bitwall wall on the terminal it runs in, on Windows, a Mac or Linux"
 publish = false

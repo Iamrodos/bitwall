@@ -1,6 +1,6 @@
 [package]
 name = "bitwall"
-version = "1.3.0"
+version = "1.3.1"
 edition = "2024"
 description = "bitwall's sender library in Rust: the same contract as bitwall/, the same bytes on the wire"
 publish = false
