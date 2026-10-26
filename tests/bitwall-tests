@@ -1,7 +1,6 @@
 #!/usr/bin/env -S uv run --quiet --script
 # /// script
 # requires-python = ">=3.14"
-# dependencies = ["pyte"]
 # ///
 """What bitwall must keep being true.
 
@@ -2379,8 +2378,11 @@ def a_tmux_source_reads_a_program_into_the_cells_it_drew():
     """A program in a tmux pane, read through TmuxSource: its text, its
     attributes, its colours as the wall shows them, a double-width glyph,
     and a resize that reaches the program and the grid both."""
+    from bitwall import terminal
     if not shutil.which("tmux") or not hasattr(os, "fork"):
         return "skipped: no tmux"
+    if not terminal.available():
+        return f"skipped: no emulator at {terminal.library()}"
     work = tempfile.mkdtemp(prefix="bwt-tmux-")
     sock = _tmux_scene(work, 30, 6)
     src = bitwall.TmuxSource("golden", sock)
@@ -2398,6 +2400,58 @@ def a_tmux_source_reads_a_program_into_the_cells_it_drew():
         src.close()
         subprocess.run(["tmux", "-S", sock, "kill-server"],
                        capture_output=True)
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@check
+def a_command_source_runs_a_program_and_reads_the_cells_it_drew():
+    """The program with no tmux between: the same cells, a resize told to
+    it as SIGWINCH, truecolour offered, a full-screen program's screen
+    while it runs and the one beneath once it leaves, and its end seen."""
+    from bitwall import terminal
+    if not hasattr(os, "fork"):
+        return "skipped: no pty here"
+    if not terminal.available():
+        return f"skipped: no emulator at {terminal.library()}"
+    work = tempfile.mkdtemp(prefix="bwt-cmd-")
+    shows = os.path.join(work, "shows")
+    with open(shows, "w") as fh:
+        fh.write(_PROGRAM)
+    with open(os.path.join(work, "program.sh"), "w") as fh:
+        fh.write(_PROGRAM_SH)
+    src = bitwall.CommandSource(["sh", os.path.join(work, "program.sh"), shows])
+    try:
+        src.start(30, 6)
+        cells = _pumped(src, 30, 6, lambda c: c[3][4][0] == "x")
+        _program_cells_are_right(cells, 30, 6)
+        src.resize(40, 8)
+        cells = _pumped(src, 40, 8,
+                        lambda c: "size 8 40" in "".join(x[0] for x in c[5]))
+        assert "".join(x[0] for x in cells[5]).startswith("size 8 40"), \
+            "".join(x[0] for x in cells[5])
+        _program_cells_are_right(cells, 40, 8)
+    finally:
+        src.close()
+    assert src.exited(), "a closed source left its program running"
+
+    # A full-screen program draws on the alternate screen and gives the
+    # one beneath back when it leaves, as btop and less do.
+    full = ('printf "under\\n$COLORTERM"; sleep 0.3; '
+            'printf "\\033[?1049h\\033[2J\\033[Hover"; sleep 0.3; '
+            'printf "\\033[?1049l"; sleep 0.3')
+    src = bitwall.CommandSource(["sh", "-c", full])
+    try:
+        src.start(20, 3)
+        rows = lambda c: ["".join(x[0] for x in r).rstrip() for r in c]  # noqa: E731
+        cells = _pumped(src, 20, 3, lambda c: rows(c)[1] == "truecolor")
+        assert rows(cells)[:2] == ["under", "truecolor"], rows(cells)
+        cells = _pumped(src, 20, 3, lambda c: rows(c)[0] == "over")
+        assert rows(cells) == ["over", "", ""], rows(cells)
+        cells = _pumped(src, 20, 3, lambda c: rows(c)[0] == "under")
+        assert rows(cells)[:2] == ["under", "truecolor"], rows(cells)
+        assert _until(src.exited), "the program's end was not seen"
+    finally:
+        src.close()
         shutil.rmtree(work, ignore_errors=True)
 
 

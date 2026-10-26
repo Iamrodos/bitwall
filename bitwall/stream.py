@@ -2,8 +2,9 @@
 
 Three steps, all on grids of cells (see `bitwall.cells` for the format):
 
-    source   a python profile, or a tmux session read through a terminal
-             emulator -- both yield a grid
+    source   a python profile, or a terminal program -- run here, or in a
+             tmux session -- read through a terminal emulator; both
+             yield a grid
     compose  place the grid in the receiver's area and draw the border
     serialise  emit the cells that differ from the last frame
 
@@ -11,7 +12,6 @@ Sources are interchangeable because they meet at the grid, so a sender can
 compute cells directly or host a terminal program, and what leaves here is
 the same either way.
 """
-import codecs
 import functools
 import os
 import select
@@ -25,10 +25,10 @@ from .cells import BLANK
 
 # ----------------------------------------------------------------- colours
 # A cell is (text, fg, bg, bold, italics, underscore, strikethrough,
-# reverse), and faint after them where it is set (cells.py). fg/bg are 'default', a pyte colour name, a 'rrggbb' hex string,
-# or an int meaning a 256-palette index. That is the emulator's own
-# vocabulary, so a grid computed in python and one decoded from tmux are the
-# same kind of thing.
+# reverse), and faint after them where it is set (cells.py). fg/bg are
+# 'default', one of the eight colour names, a 'rrggbb' hex string, or an
+# int meaning a 256-palette index, so a grid computed in python and one
+# decoded from a terminal are the same kind of thing.
 
 NAMED = {"black": 0, "red": 1, "green": 2, "brown": 3,
          "blue": 4, "magenta": 5, "cyan": 6, "white": 7}
@@ -163,8 +163,7 @@ def _colour_params(colour, base, depth="true"):
             r, g, b = (int(colour[i:i + 2], 16) for i in (0, 2, 4))
         except ValueError:
             return [str(base + 9)]
-        # Truecolour reproduces exactly what the emulator kept. pyte folds
-        # 256-palette indices into hex, so this is the lossless way back.
+        # Truecolour reproduces exactly what the source kept.
         return [str(base + 8), "2", str(r), str(g), str(b)]
     return [str(base + 9)]
 
@@ -298,44 +297,119 @@ def serialise(grid, prev, full, cols, rows, depth="true"):
 
 # ----------------------------------------------------------------- sources
 
-_SCREEN = None
+class _TerminalSource:
+    """A program in a pty of its own, its screen read by bitwall.terminal.
 
-
-def _screen_class():
-    """The emulator screen, built on first use.
-
-    pyte is imported here rather than at module scope so that knowing the
-    cell format, or running a python source, needs no terminal emulator
-    installed. Only a tmux source pulls it in.
+    What the program asks of its terminal -- where the cursor is, what the
+    terminal is -- is answered on the pty, as a terminal would.
     """
-    global _SCREEN
-    if _SCREEN is None:
-        import pyte
 
-        class _Screen(pyte.Screen):
-            """pyte raises on a couple of things tmux legitimately emits."""
+    kind = "terminal"
 
-            def report_device_status(self, *a, **k):
+    def __init__(self):
+        self.pid = self.fd = None
+        self.term = None
+
+    def argv(self):
+        raise NotImplementedError
+
+    def environ(self):
+        return {"TERM": "xterm-256color"}
+
+    def start(self, cols, rows):
+        # A pty is Unix's: only a terminal source asks for one.
+        import pty
+        from . import terminal
+        self.term = terminal.Terminal(cols, rows)
+        argv = self.argv()
+        self.pid, self.fd = pty.fork()
+        if self.pid == 0:
+            os.environ.update(self.environ())
+            os.environ.setdefault("LANG", "en_AU.UTF-8")
+            os.environ.setdefault("LC_ALL", "en_AU.UTF-8")
+            try:
+                os.execvp(argv[0], argv)
+            finally:
+                os._exit(127)
+        self.resize(cols, rows)
+
+    def fileno(self):
+        return self.fd
+
+    def resize(self, cols, rows):
+        if self.fd is None:
+            return
+        import fcntl
+        import termios
+        self.term.resize(cols, rows)
+        fcntl.ioctl(self.fd, termios.TIOCSWINSZ,
+                    struct.pack("HHHH", rows, cols, 0, 0))
+
+    def pump(self):
+        got = False
+        while True:
+            try:
+                data = os.read(self.fd, 65536)
+            except (OSError, BlockingIOError):
+                data = b""
+            if not data:
+                break
+            self.term.write(data)
+            got = True
+            rr, _, _ = select.select([self.fd], [], [], 0)
+            if self.fd not in rr:
+                break
+        said = self.term.said() if got else b""
+        if said:
+            try:
+                os.write(self.fd, said)
+            except OSError:
                 pass
+        return got
 
-            def define_charset(self, *a, **k):
+    def cells(self, cols, rows):
+        grid = self.term.cells()
+        if len(grid) == rows and grid and len(grid[0]) == cols:
+            return grid
+        return compose(grid, cols, rows)
+
+    def dump(self):
+        if self.term is None:
+            return []
+        return ["".join(c[0] for c in row) for row in self.term.cells()]
+
+    def close(self):
+        if self.pid:
+            try:
+                os.kill(self.pid, signal.SIGTERM)
+                os.waitpid(self.pid, 0)
+            except (ProcessLookupError, ChildProcessError):
                 pass
+            self.pid = None
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+        if self.term is not None:
+            self.term.close()
+            self.term = None
 
-        _SCREEN = _Screen
-    return _SCREEN
 
-
-class TmuxSource:
-    """A read-only tmux client in a pty, decoded by a headless emulator.
+class TmuxSource(_TerminalSource):
+    """A read-only tmux client in a pty, its screen read into cells.
 
     tmux is kept because it hosts arbitrary TUIs -- btop, lazygit, a log
-    tailer -- for the price of one line of config. Nothing we wrote
-    ourselves would give that away for free.
+    tailer -- for the price of one line of config, and keeps a session
+    someone else may be attached to as well. A program the wall alone
+    shows needs no tmux: that is CommandSource.
     """
 
     kind = "tmux"
 
     def __init__(self, session, sock=None, readonly=True):
+        super().__init__()
         self.session = session
         self.sock = sock or os.environ.get("BITWALL_SOCK", "")
         #: Read-only keeps a wall from ever typing into what it is showing.
@@ -343,32 +417,12 @@ class TmuxSource:
         #: kind: tmux refuses `send-keys` while a read-only client is the
         #: one the command resolves to.
         self.readonly = readonly
-        self.pid = self.fd = None
-        self.screen = self.stream = None
-        self.decoder = None
 
-    def start(self, cols, rows):
-        # A pty is Unix's, and so is tmux: only this source asks for one.
-        import pty
-        self.pid, self.fd = pty.fork()
-        if self.pid == 0:
-            os.environ["TERM"] = "xterm-256color"
-            os.environ.setdefault("LANG", "en_AU.UTF-8")
-            os.environ.setdefault("LC_ALL", "en_AU.UTF-8")
-            argv = ["tmux", "-u", "-S", self.sock, "attach"]
-            if self.readonly:
-                argv.append("-r")
-            os.execvp("tmux", argv + ["-t", self.session])
-        import pyte
-        self.screen = _screen_class()(cols, rows)
-        self.stream = pyte.Stream(self.screen)
-        # A multi-byte character split across two reads is held until the
-        # rest arrives rather than becoming replacement characters.
-        self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
-        self.resize(cols, rows)
-
-    def fileno(self):
-        return self.fd
+    def argv(self):
+        argv = ["tmux", "-u", "-S", self.sock, "attach"]
+        if self.readonly:
+            argv.append("-r")
+        return argv + ["-t", self.session]
 
     def resize(self, cols, rows):
         if self.fd is None:
@@ -379,53 +433,46 @@ class TmuxSource:
             subprocess.run(["tmux", "-S", self.sock, "resize-window",
                             "-t", self.session, "-x", str(cols), "-y", str(rows)],
                            capture_output=True)
-        import fcntl
-        import termios
-        fcntl.ioctl(self.fd, termios.TIOCSWINSZ,
-                    struct.pack("HHHH", rows, cols, 0, 0))
-        self.screen.resize(rows, cols)
+        super().resize(cols, rows)
 
-    def pump(self):
-        text = ""
-        while True:
-            try:
-                data = os.read(self.fd, 65536)
-            except (OSError, BlockingIOError):
-                data = b""
-            if not data:
-                break
-            text += self.decoder.decode(data)
-            rr, _, _ = select.select([self.fd], [], [], 0)
-            if self.fd not in rr:
-                break
-        if text:
-            self.stream.feed(text)
+
+class CommandSource(_TerminalSource):
+    """A program run in a pty of its own, its screen read into cells.
+
+        CommandSource(["btop"])
+        CommandSource("htop -d 10")
+
+    The program is the wall's alone: it starts with the source, is told
+    the wall's area as its terminal's size, and ends when the source is
+    closed. It is told it may use truecolour, which the wall shows as is.
+    """
+
+    kind = "command"
+
+    def __init__(self, command, env=None):
+        super().__init__()
+        import shlex
+        self.command = shlex.split(command) if isinstance(command, str) \
+            else list(command)
+        self.env = dict(env or {})
+
+    def argv(self):
+        return self.command
+
+    def environ(self):
+        return {"TERM": "xterm-256color", "COLORTERM": "truecolor", **self.env}
+
+    def exited(self):
+        """Whether the program has ended, by itself or otherwise."""
+        if not self.pid:
             return True
-        return False
-
-    def cells(self, cols, rows):
-        buf = self.screen.buffer
-        return [[(ch.data, ch.fg, ch.bg, ch.bold, ch.italics,
-                  ch.underscore, ch.strikethrough, ch.reverse)
-                 for ch in (buf[y][x] for x in range(cols))]
-                for y in range(rows)]
-
-    def dump(self):
-        return list(self.screen.display) if self.screen else []
-
-    def close(self):
-        if self.pid:
-            try:
-                os.kill(self.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+        try:
+            pid, _ = os.waitpid(self.pid, os.WNOHANG)
+        except ChildProcessError:
+            return True
+        if pid:
             self.pid = None
-        if self.fd is not None:
-            try:
-                os.close(self.fd)
-            except OSError:
-                pass
-            self.fd = None
+        return bool(pid)
 
 
 class FunctionSource:

@@ -70,7 +70,8 @@ A Python sender written as a script names it in its PEP 723 header:
 or, for a project, `uv add "bitwall @ git+https://github.com/iamrodos/bitwall@v1"`
 or `pip install "bitwall[all] @ git+https://github.com/iamrodos/bitwall@v1"`.
 The extras are `arrays` (numpy), `letters` (Pillow, for TILE and the
-outline fonts), `tmux` (pyte, for TmuxSource) and `all`.
+outline fonts) and `all`. TmuxSource and CommandSource need the terminal
+emulator built from a clone, `bitwall/vt/build`.
 
 A Rust sender takes the library crate from the same branch. Cargo finds a
 crate in a subdirectory of a git repository by its name, and the library's

@@ -6,8 +6,9 @@ The unit both sides of bitwall agree on: a sender produces a grid of these,
     (text, fg, bg, bold, italics, underscore, strikethrough, reverse[, faint])
 
 `text` is a single character, or "" for the second half of a double-width
-one. Colours are pyte's names or a hex string, so a grid decoded from a
-terminal and one computed in python carry attributes the same way.
+one. Colours are "default", one of the eight colour names, a 256-palette
+index or a hex string, so a grid decoded from a terminal and one computed
+in python carry attributes the same way.
 
 `faint` is a ninth field, there only when it is set, so every grid built
 of eight-field cells is still a grid of cells. On a braille character it

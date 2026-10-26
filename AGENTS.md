@@ -328,10 +328,11 @@ for whoever works on the library, a receiver or a controller.
 - **tmux `set -g` is server-wide, not session-wide.** Two receivers sharing
   one tmux server share pane borders, status and terminal type, and the last
   scene built wins for all of them. Give each receiver its own socket.
-- **A tmux pane costs a full-screen terminal emulation per frame.** The game
-  renders to ANSI, a pty carries it, pyte parses every cell back. Calling a
-  game's `frame()` directly instead was 30% faster while doubling the area.
-  Use tmux only when you actually need a real TUI in the scene.
+- **A terminal program costs a terminal emulation per frame.** The game
+  renders to ANSI, a pty carries it, the emulator parses every cell back.
+  Calling a game's `frame()` directly instead was 30% faster while doubling
+  the area. Host a program only when you actually need a real TUI in the
+  scene, and tmux only when the scene needs a session someone else shares.
 - **A frame bigger than the pipe buffer arrives in pieces.** macOS gives a
   fifo 64KB, so at roughly 24 bytes a cell in truecolor anything past about
   2700 cells is split. Paint a piece as it lands and the picture wipes down

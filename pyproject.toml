@@ -18,9 +18,7 @@ dependencies = []
 arrays = ["numpy"]
 # The letters drawn as pictures: TILE and the outline fonts.
 letters = ["pillow"]
-# TmuxSource, which reads a tmux pane through a terminal emulator.
-tmux = ["pyte"]
-all = ["numpy", "pillow", "pyte"]
+all = ["numpy", "pillow"]
 
 [project.urls]
 Homepage = "https://github.com/iamrodos/bitwall"

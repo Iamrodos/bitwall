@@ -90,7 +90,10 @@ pip install "bitwall[all] @ git+https://github.com/iamrodos/bitwall@v1"
 ```
 
 Extras: `arrays` (numpy), `letters` (Pillow, for TILE and the outline
-fonts), `tmux` (pyte, for TmuxSource), `all`. A sender can be one script:
+fonts), `all`. A terminal program on a wall, `CommandSource` or
+`TmuxSource`, needs the emulator built once from a clone: `bitwall/vt/build`
+(git and zig), which builds Ghostty's libghostty-vt at a pinned commit
+into `bitwall/vt/lib/`. A sender can be one script:
 
 ```python
 # /// script
@@ -152,8 +155,9 @@ w.detach()                                 # tells the wall it is free
 ```
 
 A source is a function of the area, `bitwall.FunctionSource(arrays=...)`
-for one that already holds numpy arrays, or `bitwall.TmuxSource(session,
-sock)` to host any terminal program. Big text is `bitwall.letters`; a
+for one that already holds numpy arrays, `bitwall.CommandSource("btop")`
+to run any terminal program, or `bitwall.TmuxSource(session, sock)` to show
+a tmux session. Big text is `bitwall.letters`; a
 picture goes on a layer with `bitwall.layer(target).frame(jpeg, ...)`. A
 simple sender is a single file (`senders/hello.py`); a complex one is a
 directory. docs/writing-a-sender.md has the rest: what to print, how to
@@ -210,7 +214,7 @@ makes a connection of its own; what else is different there is in
 painter ("The painter on Windows", below), and with `bitwall-web`
 (WINDOWS.md, *A web wall on Windows*), and runs the control page,
 `bitwall-control` (WINDOWS.md, *The control page on
-Windows*). Not on Windows: the tmux source and the `pane-*` terminal
+Windows*). Not on Windows: the terminal sources and the `pane-*` terminal
 front ends.
 
 ## Controllers
@@ -513,7 +517,7 @@ terminal ignores, and each session hears only what concerns it on its own
 ```mermaid
 flowchart LR
     subgraph sender["sender (trusted)"]
-        src["a python render(cols, rows),<br/>numpy arrays, or a tmux session"]
+        src["a python render(cols, rows),<br/>numpy arrays, or a terminal program"]
         lib["bitwall<br/>compose → cells → serialise"]
         vid["pictures and films<br/>QOI · PNG · JPEG · HEVC · H.264"]
         src --> lib
@@ -561,7 +565,7 @@ machine.
 **A wall needs only something that paints cells.** Whatever makes the
 picture runs on the sender, so a wall never needs a program, its libraries
 or a matching version of anything. Even a terminal program is run on the
-sender: `TmuxSource` runs it there and reads its screen into cells.
+sender: `CommandSource` runs it there and reads its screen into cells.
 
 **The receiver owns its area.** The sender requests a font size; the area
 that produces is a fact the receiver publishes, and it can change without
@@ -599,7 +603,7 @@ the same path from there on:
 
 ```mermaid
 flowchart LR
-    tmux["a tmux session<br/>(btop, a log tailer)"] --> pty --> pyte["headless emulator<br/>(pyte)"] --> grid
+    prog["a terminal program<br/>(btop, a log tailer),<br/>or a tmux session"] --> pty --> vt["headless emulator<br/>(libghostty-vt)"] --> grid
     py["render(cols, rows)"] --> grid
     np["numpy arrays"] --> grid
     grid["grid of cells"] --> compose["compose<br/>into the area"] --> serialise["serialise<br/>what changed"] --> wall
@@ -607,9 +611,11 @@ flowchart LR
 
 A headless emulator on the sender turns a terminal's byte stream into a
 grid bitwall owns, so a receiver consumes cells without implementing a
-terminal: the sender does that job once, for everyone. tmux stays entirely
-sender-side, a session per scene, since tmux pins size per window and
-sessions of different sizes share one server.
+terminal: the sender does that job once, for everyone. The emulator is
+Ghostty's own, so what a program draws is what Ghostty would show. tmux,
+where a scene uses it, stays entirely sender-side, a session per scene,
+since tmux pins size per window and sessions of different sizes share one
+server.
 
 **Changing font and source together.** Between a font change and a new
 source, the wall holds a source built for the other area; painting it there

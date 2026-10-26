@@ -7,7 +7,7 @@ hands it grids. That is the whole surface:
 
     w = bitwall.attach("display.local")     # any ssh-reachable wall
     w.set_font_size(18)
-    w.set_source(bitwall.FunctionSource(my_render))  # or TmuxSource(session, sock)
+    w.set_source(bitwall.FunctionSource(my_render))  # or CommandSource("btop")
     w.blank(); w.unblank()
     w.detach()
 
@@ -24,8 +24,8 @@ produces is a fact the receiver publishes, and it may change without us
 asking -- someone drags a window. A watcher follows whatever it reports and
 the render loop adopts it.
 
-**Sources are interchangeable.** tmux is one content source, not the
-architecture. A python profile computes cells directly with no pty and no
+**Sources are interchangeable.** A terminal program is one content source,
+not the architecture. A python profile computes cells directly with no pty and no
 subprocess, and composites through exactly the same path, so nothing
 downstream can tell them apart.
 
@@ -57,12 +57,12 @@ from .capture import CaptureError, SessionInfo               # noqa: F401
 from . import capture as _capture
 from .cells import BLANK, cell                                # noqa: F401
 from .stream import (compose, serialise, DEPTHS,              # noqa: F401
-                     TmuxSource, FunctionSource)
+                     TmuxSource, CommandSource, FunctionSource)
 from .session import (Link, Session, Controller, LOCAL, RUN_HERE,  # noqa: F401
                       WALL_TOKEN, address, wall_run, session_name)
 
-__all__ = ["attach", "Wall", "TmuxSource", "FunctionSource",
-           "cell", "BLANK",
+__all__ = ["attach", "Wall", "TmuxSource", "CommandSource",
+           "FunctionSource", "cell", "BLANK",
            "compose", "serialise",
            "Controller", "Session", "Link", "address", "wall_run",
            "session_name", "layer", "CellsLayer", "CaptureError", "SessionInfo"]

@@ -1,6 +1,6 @@
 #!/usr/bin/env -S uv run --quiet --script
 # /// script
-# dependencies = ["pyte"]
+# dependencies = []
 # ///
 """A tmux session on the wall, with the keyboard wired back to it.
 

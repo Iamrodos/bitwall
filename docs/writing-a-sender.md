@@ -150,22 +150,28 @@ Everything in it is there for a reason:
 | | You write | It is wrapped by | Frames driven by |
 |---|---|---|---|
 | **Pure Python** | `render(cols, rows)` returning a grid | `FunctionSource` | a tick, every `min_frame` |
-| **A terminal program** | a program that draws with ANSI | a tmux session + `TmuxSource` | the program's own output |
-| **A TUI you did not write** | a tmux config that launches it | the same | the program's own output |
+| **A terminal program** | a program that draws with ANSI | `CommandSource` | the program's own output |
+| **A TUI you did not write** | the command that starts it | the same | the program's own output |
+| **A tmux session** | a session, or a tmux config that builds one | `TmuxSource` | the session's own output |
 
 **Choose pure Python unless you have a reason not to.** It is the fastest
 path, with no pty, no second process and no terminal emulator, and the
 only one where you control every cell exactly. A dashboard should start
 here.
 
-**Choose tmux when you want a program that already exists**: `btop`,
-`lazygit`, a log tailer, something with its own layout and key handling.
-You get it for one line of config. The price is a pty and a full terminal
-emulation on every frame: about 30% slower on the same content, and worse
-if the program repaints in full.
+**Choose a terminal program when you want one that already exists**:
+`btop`, `lazygit`, a log tailer, something with its own layout and key
+handling. `CommandSource("btop")` runs it in a pty of its own, sized to the
+wall. The price is a pty and a terminal emulation on every frame, about 30%
+slower on the same content, and worse if the program repaints in full. Both
+terminal sources need the emulator built once, `bitwall/vt/build`.
+
+**Choose tmux when the scene is a session**: one someone else is attached
+to as well, several panes laid out by a tmux config, or a program that must
+outlive the sender.
 
 **Never do both.** If you were going to write the program anyway, do not
-write it as a terminal program and host it in tmux: you would be rendering
+write it as a terminal program and host it: you would be rendering
 your grid to ANSI so that an emulator can parse it back into a grid.
 Compute the cells directly.
 
@@ -227,7 +233,7 @@ When the source is slow or missing, **show the last good numbers with a
 staleness marker**. A wall that freezes looks identical to a wall that is
 working, which is the one failure a viewer cannot see.
 
-**A terminal program in tmux: you own your own clock.** bitwall waits on
+**A terminal program: you own your own clock.** bitwall waits on
 the pty and only ever sees what you chose to write. If a refresh takes
 three seconds the wall keeps showing the previous picture until you are
 done; nothing stalls, because nothing is waiting on you.

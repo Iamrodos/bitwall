@@ -1,6 +1,6 @@
 #!/usr/bin/env -S uv run --quiet --script
 # /// script
-# dependencies = ["pyte"]
+# dependencies = []
 # ///
 """Classic terminal ASCII animations on a wall, as a playlist.
 
@@ -30,8 +30,8 @@ of fish is a few dozen and no tank.
 
 The animations run in a tmux pane and reach the wall through a read-only
 TmuxSource. Most of them come off the internet (parrot.live, ascii.live),
-and pyte decodes their output into cells before anything is serialised, so
-no escape sequence they send can become a bitwall command.
+and the emulator decodes their output into cells before anything is
+serialised, so no escape sequence they send can become a bitwall command.
 """
 import os
 import signal
