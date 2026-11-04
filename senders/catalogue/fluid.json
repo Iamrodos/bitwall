@@ -39,7 +39,7 @@
       "type": "bool",
       "label": "Notes",
       "description": "A black bar along the bottom naming what is showing, with a live figure, in LED lettering",
-      "default": true
+      "default": false
     }
   }
 }
