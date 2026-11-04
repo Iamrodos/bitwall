@@ -2277,16 +2277,16 @@ def a_mirror_of_the_glass_may_be_jpeg(r):
 @conformance(known_for=SHELL_NO_CONTROLLERS)
 def a_glass_stream_is_raw_frames_on_a_fifo_of_its_own(r):
     """`mirror glass stream=i420 size=<w>x<h> fps=<n>`, on a wall whose
-    `caps` says `stream`, makes `s/<name>/glass`, and frames come on it:
+    `caps` says `feeds=`, makes `s/<name>/glass`, and frames come on it:
     each a header of 32 bytes -- `BWG1`, its size, its number, its time and
     how many bytes follow -- then the I420 planes at exactly that size. A
     second stream is `busy`; `off` ends it and the fifo goes."""
     ctl = connected(r, "ctl", "controller")
     ctl.command("report id=c")
     assert ctl.wait(lambda h: any(x.startswith("caps ") for x in h)), ctl.heard
-    if "stream" not in next(x for x in ctl.heard if x.startswith("caps ")).split():
+    if not any(w.startswith("feeds=") for w in next(x for x in ctl.heard if x.startswith("caps ")).split()):
         ctl.close()
-        return f"skipped: {r.name} does not offer stream"
+        return f"skipped: {r.name} says no feeds="
     ctl.command("mirror glass stream=i420 size=64x36 fps=20")
     path = os.path.join(ctl.dir, "glass")
     assert wait_for(lambda: os.path.exists(path) and stat.S_ISFIFO(os.stat(path).st_mode), 2), \
@@ -2346,18 +2346,17 @@ def glass_frames(ctl, paths, n, timeout=4.0):
 
 def streams_offered(ctl):
     """How many glass streams a wall runs at once, as its `caps` says: the
-    number after `streams=`, 1 where it says `stream` alone, 0 where it
-    does not stream."""
+    number after `feeds=`, 0 where it says none."""
     ctl.command("report id=c")
     assert ctl.wait(lambda h: any(x.startswith("caps ") for x in h)), ctl.heard
     words = next(x for x in ctl.heard if x.startswith("caps ")).split()
-    said = next((w.split("=", 1)[1] for w in words if w.startswith("streams=")), None)
-    return int(said) if said and said.isdigit() else int("stream" in words)
+    said = next((w.split("=", 1)[1] for w in words if w.startswith("feeds=")), None)
+    return int(said) if said and said.isdigit() else 0
 
 
 @conformance(known_for=SHELL_NO_CONTROLLERS)
 def a_wall_that_says_streams_runs_several_each_at_its_own_size(r):
-    """On a wall whose `caps` says `streams=<n>`, a controller may hold
+    """On a wall whose `caps` says `feeds=<n>`, a controller may hold
     several streams at once by `name=`, each on `s/<name>/glass-<name>` at
     the size and rate it asked for, beside another controller's on
     `glass`; the same name asked again is `busy`, `off name=` ends that
@@ -2401,12 +2400,12 @@ def a_wall_that_says_streams_runs_several_each_at_its_own_size(r):
 @conformance(known_for=SHELL_NO_CONTROLLERS)
 def a_glass_stream_with_the_overlay_is_asked_with_overlay(r):
     """`overlay=1` asks for the receiver's own overlay in a stream, where
-    `caps` says `streams=`; anything but 0 or 1 is refused, and a stream
+    `caps` says `feeds=` above 1; anything but 0 or 1 is refused, and a stream
     asked with it comes at its size as any other does."""
     ctl = connected(r, "ctl", "controller")
     if streams_offered(ctl) < 2:
         ctl.close()
-        return f"skipped: {r.name} says no streams="
+        return f"skipped: {r.name} says no feeds= above 1"
     ctl.command("mirror glass stream=i420 size=64x36 fps=10 overlay=2 id=e")
     assert ctl.wait(lambda h: "error mirror overlay=2: not 0 or 1 id=e" in h), ctl.heard
     ctl.command("stats 1")
@@ -3916,6 +3915,52 @@ def a_stream_with_a_start_waits_for_it_and_drops_what_is_late(r):
 
 
 @conformance(known_for=NO_DATA)
+def a_stream_start_times_the_next_stream_alone(r):
+    """`stream start=<ms>` on a timed layer's `in`, said before a stream's
+    first byte, is when that stream's first frame is shown: it waits for
+    it, and the stream after it, with none said, plays as soon as it is
+    decoded. `caps` says `stream`; a layer without `fps`, no start,
+    a bad value or another option is an error."""
+    caps, _ = codecs_of(r)
+    assert "stream" in caps, caps
+    v = connected(r, "v", z="above", type="video", data="1", codec="qoi", fps="10")
+    fd = data_in(v)
+    os.write(fd, qoi_frame(8, 8, (0, 0, 200, 255)))
+    assert wait_for(lambda: layer_up(r, "v"), 3), "an untimed stream was not shown"
+    os.close(fd)
+    assert wait_for(lambda: not layer_up(r, "v"), 3), "the stream's end left it up"
+    start = int(time.time() * 1000) + 1500
+    v.command(f"stream start={start}")
+    fd = data_in(v)
+    for k in range(3):
+        os.write(fd, qoi_frame(8, 8, (50 * k, 0, 0, 255)))
+    time.sleep(0.4)
+    assert not layer_up(r, "v"), "a frame was shown before its stream start"
+    assert wait_for(lambda: layer_up(r, "v"), 3), "nothing was shown once its start had come"
+    assert time.time() * 1000 >= start - 50, "shown before its stream start"
+    os.close(fd)
+    assert wait_for(lambda: not layer_up(r, "v"), 3), "the stream's end left it up"
+    fd = data_in(v)
+    os.write(fd, qoi_frame(8, 8, (0, 200, 0, 255)))
+    began = time.monotonic()
+    assert wait_for(lambda: layer_up(r, "v"), 3), "the stream after a timed one was not shown"
+    assert time.monotonic() - began < 1.2, "the stream after a timed one waited"
+    os.close(fd)
+    v.heard = []
+    for bad in ("stream", "stream start=soon", "stream at=5"):
+        v.command(bad)
+    for said in ("error stream no start", "error stream start=soon: bad value",
+                 "error stream at=5: unknown option"):
+        assert v.wait(lambda h: any(x.startswith(said) for x in h)), (said, v.heard)
+    u = connected(r, "u", z="above", type="video", data="1", codec="qoi")
+    u.command("stream start=1790000000000")
+    said = "error stream start=1790000000000: only for data with fps"
+    assert u.wait(lambda h: any(x.startswith(said) for x in h)), u.heard
+    for x in (u, v):
+        x.close()
+
+
+@conformance(known_for=NO_DATA)
 def a_qoi_stream_that_does_not_decode_is_said_once(r):
     """Bytes on a `qoi` stream that are no QOI image end the stream with
     `error data qoi: does not decode`, said once, and the session stays."""
@@ -4159,6 +4204,33 @@ def a_timed_stream_asked_for_again_is_not_timed_from_its_first_start():
             assert back_after(layer._session.name), "the layer did not come back twice"
             assert fake.base.start == fresh, (fake.base.start, fresh)
         finally:
+            layer.close()
+            fake.remove()
+
+
+@check
+def a_layer_gives_its_next_stream_its_start():
+    """`stream_start(ms)` says `stream start=<ms>` on a layer with `fps`,
+    for the next stream on its `data`; a layer without `fps` refuses it."""
+    fake = a_fake(20, 4)
+    with captured_stderr():
+        layer = bitwall.layer("localhost", run=fake.dir, place=0, take=True, data=True,
+                              codec="qoi", fps=25)
+        plain = bitwall.layer("localhost", run=fake.dir, data=True, codec="qoi")
+        try:
+            assert layer.offers("stream"), layer.caps()
+            when = int(time.time() * 1000) + 5000
+            assert layer.stream_start(when)
+            assert wait_for(lambda: fake.base is not None and fake.base.next_start == when, 3), \
+                fake.base and fake.base.next_start
+            try:
+                plain.stream_start(when)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("stream_start was taken without fps")
+        finally:
+            plain.close()
             layer.close()
             fake.remove()
 
@@ -6244,9 +6316,9 @@ class StreamingFake(fakewall.FakeWall):
     is made and a frame written to it every 1/fps, numbered and timed, its
     grey stepping each frame. A frame nobody is ready for is let go, its
     number spent, and so is every `skip`th, to look like a busy painter.
-    With `streams` it says `streams=<n>` in caps and runs that many at
+    With `streams` it says `feeds=<n>` in caps and runs that many at
     once, each by `name=` on `glass-<name>`, as the painter does; without,
-    one at a time, as a painter that says no `streams` does."""
+    `feeds=1`, one at a time."""
 
     def __init__(self, *a, skip=0, streams=0, **kw):
         self.glass_streams = {}
@@ -6256,8 +6328,7 @@ class StreamingFake(fakewall.FakeWall):
         super().__init__(*a, **kw)
 
     def caps_line(self):
-        more = f" streams={self.streams}" if self.streams else ""
-        return super().caps_line().replace("caps ", "caps stream ", 1) + more
+        return super().caps_line() + f" feeds={self.streams or 1}"
 
     def _cmd_mirror(self, s, m, tag, now):
         if m.args[:1] == ("glass",) and ("stream" in m.opts or m.args[1:2] == ("off",)):

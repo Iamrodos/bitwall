@@ -544,7 +544,11 @@ agree play one together. `place=0, take=True` makes the base itself a
 video base. A layer that loses its wall is opened again on its own, and
 its stream starts again from its first decoded frame; a sender that keeps
 its own clock is told by `when_lost(fn)` and says when with
-`start_at(ms)`.
+`start_at(ms)`. `start` times only the layer's first stream: one stream
+after another on the same layer, each in step with something else (its
+sound, another wall), is each given its time with `stream_start(ms)`
+before its first `data_write`, on a wall whose `caps` say
+`stream`.
 `senders/film` does all of this, on one wall or cut across several.
 
 A film fills the glass unless it is given a box, in the glass's pixels:

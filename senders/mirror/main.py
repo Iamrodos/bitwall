@@ -12,9 +12,9 @@ and the same bytes go to every destination on a video layer's `data`
 MIRROR.md is the design.
 
 **The painter's frames are read here, once a size.** A painter whose
-`caps` say `streams=<n>` runs several streams at once, so one is asked
+`caps` say `feeds=<n>` above 1 runs several streams at once, so one is asked
 for each size and rate destinations are sent, by name, and each encode
-takes its frames as they come; one that says `stream` alone runs one, so
+takes its frames as they come; one that says `feeds=1` runs one, so
 it is asked for one at the largest size and the highest rate any
 destination is sent, and an encode for less scales it down and leaves
 frames out. Each stream is read off its fifo by a thread of its own,
@@ -381,8 +381,8 @@ def _base(c):
 
 def ask(target):
     """What a wall says of itself on a controller session: a dict of its
-    caps' words, codecs, hw, how many glass streams it runs at once (0,
-    1 for a painter that says `stream` alone, or `streams=`), glass
+    caps' words, codecs, hw, how many glass streams it runs at once (its
+    `feeds=`, 0 where it says none), glass
     pixels, receiver, its decoder's threads where a hardware decoder does
     the work and where ffmpeg decodes in software (None where it does not
     say; a painter that says only `decoder=` runs as many for both), and
@@ -395,8 +395,8 @@ def ask(target):
             name = getattr(said, "name", None)
             if name == "caps":
                 got["words"] = set(said.args)
-                n = said.opts.get("streams") or ""
-                got["streams"] = int(n) if n.isdigit() else int("stream" in said.args)
+                n = said.opts.get("feeds") or ""
+                got["streams"] = int(n) if n.isdigit() else 0
                 if "data" in said.args:
                     got["codecs"] = [x for x in (said.opts.get("codecs") or "").split(",") if x]
                     got["hw"] = [x for x in (said.opts.get("hw") or "").split(",") if x]
@@ -2058,9 +2058,9 @@ def main():
     except Exception as e:                                      # noqa: BLE001
         log(f"{source}: cannot ask it what it is: {e}")
         return 1
-    if "stream" not in src["words"]:
+    if not src["streams"]:
         log(f"{source}: does not stream its glass ({src['receiver'] or 'its receiver'} "
-            f"does not say `stream` in caps); nothing to mirror")
+            f"does not say `feeds=` in caps); nothing to mirror")
         return 1
     if src["pixels"] is None:
         log(f"{source}: did not say its glass")

@@ -81,6 +81,7 @@ MAY = {
     "clear": frozenset({"video", "vbase", "layer"}),
     "align": frozenset({"video", "vbase"}),
     "box": frozenset({"video", "vbase"}),
+    "stream": frozenset({"video", "vbase"}),
     "presence": frozenset({"controller"}),
     "stats": frozenset({"controller"}),
     "picture": ALL,
@@ -92,7 +93,8 @@ MAY = {
 }
 
 CAPS = ("area font grid meta blank want presence repaint watching ping detach "
-        "close screen picture mirror stats sessions follow measures frame clear data align box")
+        "close screen picture mirror stats sessions follow measures frame clear data align box "
+        "stream")
 #: What a stream on a layer's `data` may be.
 CODECS = ("qoi", "hevc", "h264", "mjpeg")
 #: What a frame on a video layer's `in` may be.
@@ -282,6 +284,9 @@ class Session:
         self.codec = None
         self.fps = None
         self.start = None
+        #: The Unix ms `stream start` said for the next stream to be
+        #: timed, or None.
+        self.next_start = None
         #: Where the stream's frames sit on a glass of another shape, as
         #: `align` says: "top", "centre" or "bottom".
         self.align = "centre"
@@ -783,7 +788,10 @@ class FakeWall:
             s.streaming = True
             s.streams += 1
             s.dbuf, s.dnext, s.t0 = b"", 0, None
-            if s.streams == 1 and s.start is not None and s.fps:
+            if s.fps and s.next_start is not None:
+                s.t0 = now + (s.next_start / 1000 - time.time())
+                s.next_start = None
+            elif s.streams == 1 and s.start is not None and s.fps:
                 s.t0 = now + (s.start / 1000 - time.time())
         s.in_bytes += len(data)
         s.dbytes += len(data)
@@ -861,7 +869,10 @@ class FakeWall:
             while s.dqueue:
                 self._data_show(s, now, s.dqueue.popleft())
             return
-        if s.t0 is None:
+        if s.t0 is None and s.next_start is not None:
+            s.t0 = now + (s.next_start / 1000 - time.time())
+            s.next_start = None
+        elif s.t0 is None:
             s.t0 = now - s.dqueue[0][0] / s.fps
         while s.dqueue:
             i = s.dqueue[0][0]
@@ -1280,6 +1291,27 @@ class FakeWall:
             self._say(s, f"error box no size{tag}")
             return
         s.box = (x, y, *size) if size else None
+
+    def _cmd_stream(self, s, m, tag, now):
+        words = [w for w in m.raw.split()[1:] if not w.startswith("id=")]
+        start = None
+        for word in words:
+            if word.startswith("start="):
+                start = word
+            else:
+                self._say(s, f"error stream {word}: unknown option{tag}")
+                return
+        if start is None:
+            self._say(s, f"error stream no start{tag}")
+            return
+        value = start[6:]
+        if not (value.isascii() and value.isdigit() and len(value) <= 16):
+            self._say(s, f"error stream {start}: bad value{tag}")
+            return
+        if not (s.data and s.fps):
+            self._say(s, f"error stream {start}: only for data with fps{tag}")
+            return
+        s.next_start = int(value)
 
     def _cmd_close(self, s, m, tag, now):
         self._end(s, "asked")

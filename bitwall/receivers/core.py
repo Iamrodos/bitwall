@@ -97,6 +97,7 @@ MAY = {
     "clear": frozenset({"video", "layer"}),
     "align": frozenset({"video"}),
     "box": frozenset({"video"}),
+    "stream": frozenset({"video"}),
     "presence": frozenset({"controller"}),
     "stats": frozenset({"controller"}),
     "picture": ALL,
@@ -335,6 +336,9 @@ class Session:
         self.codec = None
         self.fps = None
         self.start = None
+        #: The Unix ms `stream start` said for the next stream to be
+        #: timed, taken when its frame 0's clock is set; None when not said.
+        self.next_start = None
         #: Where the stream's frames leave their box spare: -1 all below,
         #: 0 even, 1 all above, as `align` says.
         self.align = 0
@@ -972,7 +976,10 @@ class Wall:
             s.cut = streams.cutter(s.codec)
             s.dnext, s.t0, s.announced = 0, None, False
             s.gop, s.gop_bytes = [], 0
-            if s.streams == 1 and s.start is not None and s.fps:
+            if s.fps and s.next_start is not None:
+                s.t0 = now + (s.next_start / 1000 - time.time())
+                s.next_start = None
+            elif s.streams == 1 and s.start is not None and s.fps:
                 s.t0 = now + (s.start / 1000 - time.time())
         s.in_bytes += len(data)
         self._in_total += len(data)
@@ -1014,7 +1021,10 @@ class Wall:
         to decode them they are let go at their time."""
         if not s.streaming:
             return
-        if s.dqueue and s.fps and s.t0 is None:
+        if s.dqueue and s.fps and s.t0 is None and s.next_start is not None:
+            s.t0 = now + (s.next_start / 1000 - time.time())
+            s.next_start = None
+        elif s.dqueue and s.fps and s.t0 is None:
             i = s.dqueue[0][0]
             s.t0 = now + (LEAD if s.film else 0.0) - i / s.fps
         films = s.film and self._glass_films()
@@ -1358,7 +1368,7 @@ class Wall:
                   f" images={','.join(IMAGES)}" if "video" in self.types else "")
         words = CAPS if self.kitty_on else CAPS.replace(" kitty", "")
         if self.data_codecs:
-            words += " data align box"
+            words += " data align box stream"
         extra = "".join(" " + c for c in self.commands)
         above = f" above={','.join(self.above_types)}" if self.layers > 1 else ""
         return (f"caps {words}{extra} layers={self.layers} "
@@ -1728,6 +1738,31 @@ class Wall:
         s.align = ALIGN[word]
         if self.above.get(s.z) is s:
             self._lglass("valign", s.z, s.align)
+
+    def _cmd_stream(self, s, m, tag, now):
+        """`stream start=<ms>`: the Unix time in ms the next stream on
+        `data` shows its first frame at, for that stream alone. It is taken
+        when that stream's clock is set, as it begins or as its first frame
+        is cut, so it is said before the stream's first byte."""
+        words = [w for w in m.raw.split()[1:] if not w.startswith("id=")]
+        start = None
+        for word in words:
+            if word.startswith("start="):
+                start = word
+            else:
+                self._say(s, f"error stream {plain(word)}: unknown option{tag}")
+                return
+        if start is None:
+            self._say(s, f"error stream no start{tag}")
+            return
+        value = start[6:]
+        if not (value.isascii() and value.isdigit() and len(value) <= 16):
+            self._say(s, f"error stream {plain(start)}: bad value{tag}")
+            return
+        if not (s.data and s.fps):
+            self._say(s, f"error stream {plain(start)}: only for data with fps{tag}")
+            return
+        s.next_start = int(value)
 
     def _cmd_box(self, s, m, tag, now):
         """`box [at=<x>,<y>] size=<w>x<h>`: the box in the glass's pixels

@@ -3402,6 +3402,112 @@ static void a_timed_stream_waits_for_its_start_and_drops_what_is_late(void)
     close(o);
 }
 
+/* `stream start` times the next stream alone: its first frame waits for
+ * it, the stream after it plays as soon as it is ready, and a layer with
+ * no timed stream, or a word it does not take, is refused. */
+static void a_stream_start_times_the_next_stream_alone(void)
+{
+    Screen *s = gpu_screen(14);
+    Wall *w = wall_at(s, "0");
+    static const uint8_t blue[4] = {0, 0, 255, 255};
+    char cmd[120];
+    int o, in, d, i;
+    Session *v;
+    double start, up;
+    knock(w, "open v layer z=1 type=video data=1 codec=qoi fps=10");
+    o = sess_out(w, "v");
+    in = sess_in(w, "v");
+    put(in, "\x1b_bitwall ping\x1b\\");
+    pump(0.05);
+    v = w->above[1];
+
+    /* The first stream with no `stream start`: up as soon as it is ready. */
+    d = data_writer(w, "v");
+    put_qoi(d, 4, 4, blue);
+    CHECK(PUMP_UNTIL(s->pics[1].on, 1), "an untimed stream did not go up");
+    close(d);
+    CHECK(PUMP_UNTIL(!s->pics[1].on, 2), "the end did not clear the layer");
+
+    /* Said while nothing plays, for the next stream. */
+    start = unix_ms() + 400;
+    snprintf(cmd, sizeof cmd, "\x1b_bitwall stream start=%.0f\x1b\\", start);
+    put(in, cmd);
+    pump(0.05);
+    d = data_writer(w, "v");
+    for (i = 0; i < 3; i++)
+        put_qoi(d, 4, 4, blue);
+    pump(0.15);
+    CHECK(!s->pics[1].on && unix_ms() < start, "a frame went up before its stream start");
+    CHECK(PUMP_UNTIL(s->pics[1].on, 1), "the first frame did not go up at its stream start");
+    CHECK(unix_ms() >= start - 1, "up %.0f ms early", start - unix_ms());
+    CHECK(PUMP_UNTIL(v->n_frames == 4, 1), "the frames were not all shown: %ld", v->n_frames);
+    CHECK(v->n_dropped == 0, "a frame on time was dropped");
+
+    /* Said while a stream plays: that one plays on, the next waits. */
+    start = unix_ms() + 600;
+    snprintf(cmd, sizeof cmd, "\x1b_bitwall stream start=%.0f\x1b\\", start);
+    put(in, cmd);
+    close(d);
+    CHECK(PUMP_UNTIL(!s->pics[1].on, 2), "the end did not clear the layer");
+    CHECK(unix_ms() < start - 100, "the stream before it played into its start");
+    d = data_writer(w, "v");
+    put_qoi(d, 4, 4, blue);
+    pump(0.1);
+    CHECK(!s->pics[1].on, "a frame went up before its stream start");
+    CHECK(PUMP_UNTIL(s->pics[1].on, 1), "the frame did not go up at its stream start");
+    up = unix_ms();
+    CHECK(up >= start - 1, "up %.0f ms early", start - up);
+    close(d);
+    CHECK(PUMP_UNTIL(!s->pics[1].on, 2), "the end did not clear the layer");
+
+    /* Taken by one stream: the next plays as soon as it is ready. */
+    d = data_writer(w, "v");
+    put_qoi(d, 4, 4, blue);
+    up = unix_ms();
+    CHECK(PUMP_UNTIL(s->pics[1].on, 1), "a stream after a timed one did not go up");
+    CHECK(unix_ms() - up < 300, "it waited %.0f ms", unix_ms() - up);
+    close(d);
+    CHECK(PUMP_UNTIL(!s->pics[1].on, 2), "the end did not clear the layer");
+
+    put(in, "\x1b_bitwall stream\x1b\\");
+    put(in, "\x1b_bitwall stream start=soon\x1b\\");
+    put(in, "\x1b_bitwall stream start=\x1b\\");
+    put(in, "\x1b_bitwall stream at=5\x1b\\");
+    pump(0.05);
+    {
+        const char *said = out_text(o);
+        CHECK(strstr(said, "error stream no start"), "stream alone was not refused");
+        CHECK(strstr(said, "error stream start=soon: bad value"), "start=soon was not refused");
+        CHECK(strstr(said, "error stream start=: bad value"), "start= was not refused");
+        CHECK(strstr(said, "error stream at=5: unknown option"), "at=5 was not refused");
+    }
+    CHECK(v->ds->next == 0, "a refused stream start was kept");
+    put(in, "\x1b_bitwall close\x1b\\");
+    pump(0.05);
+    close(in);
+    close(o);
+
+    /* No fps, no clock to time it on; a layer without data, no stream. */
+    knock(w, "open u layer z=1 type=video data=1 codec=qoi");
+    knock(w, "open c layer z=2 type=video");
+    o = sess_out(w, "u");
+    in = sess_in(w, "u");
+    put(in, "\x1b_bitwall stream start=1790000000000\x1b\\");
+    pump(0.05);
+    CHECK(strstr(out_text(o), "error stream start=1790000000000: only for data with fps"),
+          "a layer without fps took it");
+    close(in);
+    close(o);
+    o = sess_out(w, "c");
+    in = sess_in(w, "c");
+    put(in, "\x1b_bitwall stream start=1790000000000\x1b\\");
+    pump(0.05);
+    CHECK(strstr(out_text(o), "error stream start=1790000000000: only for data with fps"),
+          "a layer without data took it");
+    close(in);
+    close(o);
+}
+
 static void a_stream_that_does_not_decode_is_said_once(void)
 {
     Screen *s = gpu_screen(14);
@@ -4235,7 +4341,7 @@ static void a_glass_stream_is_not_offered_in_software(void)
     CHECK(strstr(out_text(out), "error mirror glass stream=i420: not offered"),
           "software offered a stream");
     CHECK(!first_stream(s), "a stream was started in software");
-    CHECK(!strstr(caps_of(w), " stream "), "caps says stream in software: %s", caps_of(w));
+    CHECK(!strstr(caps_of(w), " feeds="), "caps says feeds in software: %s", caps_of(w));
     close(in);
     close(out);
 }
@@ -4746,7 +4852,7 @@ static void many_streams_run_at_once_each_at_its_own_size_and_rate(void)
     int count[3], fw[3], fh[3], i;
     char path[3][800], line[MAX_APC];
     static const char *const names[3] = {"glass-a", "glass-b", "glass"};
-    CHECK(strstr(caps_of(w), " streams=8"), "caps does not say streams: %s", caps_of(w));
+    CHECK(strstr(caps_of(w), " feeds=8"), "caps does not say feeds: %s", caps_of(w));
     ask(in, "mirror glass stream=i420 size=64x36 fps=20 name=a");
     ask(in, "mirror glass stream=i420 size=32x18 fps=10 name=b");
     ask(in2, "mirror glass stream=i420 size=48x28 fps=5");
@@ -4962,6 +5068,7 @@ static const Test TESTS[] = {
     T(data_is_refused_where_it_cannot_be_taken),
     T(a_qoi_stream_on_data_fills_the_glass_and_ends_clearing_the_layer),
     T(a_timed_stream_waits_for_its_start_and_drops_what_is_late),
+    T(a_stream_start_times_the_next_stream_alone),
     T(a_stream_that_does_not_decode_is_said_once),
     T(hevc_and_h264_on_data_go_up_as_yuv_through_the_gpu),
     T(hw_names_the_codecs_taken_that_the_board_decodes),

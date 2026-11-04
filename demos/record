@@ -17,7 +17,7 @@ so a frame missed is written again as the one before it: the file's
 clock is the wall's, and a scene recorded for ten seconds plays for ten.
 
 It records until `--seconds` have passed, or SIGINT or SIGTERM, then
-closes the file whole. Only a wall that says `stream` in its `caps` can
+closes the file whole. Only a wall that says `feeds=` in its `caps` can
 be recorded: the painter where it draws on a GPU, a headless one
 (`--driver none --glass 1920x1080`) among them.
 """

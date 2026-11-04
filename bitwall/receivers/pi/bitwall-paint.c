@@ -5388,6 +5388,7 @@ typedef struct DataStream {
     /* the loop's own */
     double taken;           /* bytes already counted into the session's */
     double t0;              /* Unix ms of this stream's frame 0; 0 until known */
+    double next;            /* `stream start` for the next stream to be timed; 0 when not said */
     int streams;            /* streams ended */
 } DataStream;
 
@@ -9029,6 +9030,38 @@ static void cmd_box(Session *from, char **words, int n)
     from->data_box[3] = bh;
 }
 
+/* `stream start=<ms>`: the Unix time in ms the next stream on the
+ * layer's `data` shows its first frame at, for that stream alone. It is
+ * taken when that stream's first frame is ready, so it is said before the
+ * stream's first byte, and a stream with none said plays as it would. */
+static void cmd_stream_start(Session *from, char **words, int n)
+{
+    char said[48];
+    int i;
+    const char *start = NULL;
+    for (i = 1; i < n; i++) {
+        if (!strncmp(words[i], "start=", 6)) {
+            start = words[i];
+        } else {
+            wsay(from, "error stream %s: unknown option", plain(words[i], said, sizeof said));
+            return;
+        }
+    }
+    if (!start) {
+        wsay(from, "error stream no start");
+        return;
+    }
+    if (!digits(start + 6, 16)) {
+        wsay(from, "error stream %s: bad value", plain(start, said, sizeof said));
+        return;
+    }
+    if (!from->ds || from->data_fps <= 0) {
+        wsay(from, "error stream %s: only for data with fps", plain(start, said, sizeof said));
+        return;
+    }
+    from->ds->next = strtod(start + 6, NULL);
+}
+
 /* When the painter started, in Unix seconds. */
 static time_t painter_started;
 
@@ -9048,13 +9081,13 @@ static void session_report(Session *from)
     if (hw[0])
         snprintf(hws, sizeof hws, " hw=%s", hw);
     if (w->s->gpu)
-        snprintf(streams, sizeof streams, " streams=%d", STREAMS);
+        snprintf(streams, sizeof streams, " feeds=%d", STREAMS);
     snprintf(caps, sizeof caps,
              "caps area font grid meta blank want presence repaint watching ping "
-             "detach close screen sessions follow measures stats picture mirror%s frame clear "
-             "data align box kitty%s layers=%d types=cells,video above=%s codecs=%s%s images=%s "
-             "controllers=%d%s",
-             w->s->gpu ? " stream" : "", glass_offered(w->s) ? " glass" : "", LAYERS,
+             "detach close screen sessions follow measures stats picture mirror frame clear "
+             "data align box stream kitty%s layers=%d types=cells,video above=%s "
+             "codecs=%s%s images=%s controllers=%d%s",
+             glass_offered(w->s) ? " glass" : "", LAYERS,
              w->s->gpu ? "video,cells" : "video", taken, hws, IMAGES_TAKEN, CONTROLLERS, streams);
     wsay(from, "%s", caps);
     measure_names(measures_offered(), names, sizeof names);
@@ -9235,6 +9268,9 @@ static void session_command(Wall *w, Session *from, char **words, int n, const c
     } else if (!strcmp(name, "box")) {
         NEEDROLE(from->is_video && !from->is_cells);
         cmd_box(from, words, n);
+    } else if (!strcmp(name, "stream")) {
+        NEEDROLE(from->is_video && !from->is_cells);
+        cmd_stream_start(from, words, n);
     } else if (!strcmp(name, "clear")) {
         NEEDROLE(from->is_video);
         if (w->above[from->z] == from && from->is_cells && w->s->cells[from->z]) {
@@ -9935,10 +9971,11 @@ static void video_base_frame(Wall *w)
 
 /* Play a video layer's stream on: its bytes counted, frames that are late
  * let go, the one that is due put up, and a stream that has ended taken
- * down. With `fps` frame i is due at t0 + i/fps, t0 being `start` for the
- * first stream and otherwise the moment its first frame was ready; a
- * frame is late once the next one is due. Without it each frame goes up
- * as it is ready, one a pass. */
+ * down. With `fps` frame i is due at t0 + i/fps. t0 is set when the
+ * stream's first frame is ready: the `stream start` said since the last
+ * stream was timed, else `start` for the first stream, else that moment.
+ * A frame is late once the next one is due. Without `fps` each frame goes
+ * up as it is ready, one a pass. */
 static void data_play(Session *s)
 {
     Wall *w = s->w;
@@ -9960,8 +9997,12 @@ static void data_play(Session *s)
         }
         if (d->fps > 0) {
             double per = 1e3 / d->fps, due;
-            if (!d->t0)
-                d->t0 = !d->streams && d->start > 0 ? d->start : now - f->index * per;
+            if (!d->t0) {
+                d->t0 = d->next > 0                   ? d->next
+                        : !d->streams && d->start > 0 ? d->start
+                                                      : now - f->index * per;
+                d->next = 0;
+            }
             due = d->t0 + f->index * per;
             if (now >= due + per) {
                 dframe_keep(d, dframe_pop(d));

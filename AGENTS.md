@@ -122,7 +122,7 @@ business; no receiver learns what a pane is.
 
 **One wall's glass shows on others as video** with `senders/mirror`
 (MIRROR.md), run on the source's host: the painter streams its glass raw
-(`stream` in its `caps`; it runs several at once, `streams=8`, one
+(`feeds=` in its `caps`; it runs several at once, `feeds=8`, one
 for each size and rate sent, each `--to wall@WxH/fps` if it says), ffmpeg
 there encodes it, H.264, HEVC or MJPEG as each destination decodes in
 hardware (`hw=`), and the same bytes go to every destination of an encode on its

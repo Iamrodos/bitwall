@@ -303,6 +303,7 @@ program.
     ESC _ bitwall follow in ESC \
     ESC _ bitwall picture glass size=480x270 ESC \
     ESC _ bitwall mirror sysinfo-4821 every=200 ESC \
+    ESC _ bitwall stream start=1790000000000 ESC \
 
 A command is at most 4096 bytes between `ESC _` and `ESC \`; a longer one
 is dropped. Commands are not paint: bytes that were only commands do not
@@ -317,7 +318,7 @@ wake a dozing wall or end its status page. The base's first paint does.
 | `want` | yes | yes | no |
 | `frame` | a video base | a video layer | no |
 | `clear` | a video base | a video or cells layer | no |
-| `align`, `box` | a video base | a video layer | no |
+| `align`, `box`, `stream` | a video base | a video layer | no |
 | `presence`, `stats`, `follow`, `measures`, `glass` | no | no | yes |
 | `report`, `sessions`, `ping`, `pong`, `picture`, `mirror` | yes | yes | yes |
 | `meta`, `detach`, `close` | its own session | its own session | its own session |
@@ -460,9 +461,9 @@ The words are the commands and announcements it knows: `area`, `font`,
 `grid`, `meta`, `blank`, `want`, `input`, `presence`, `repaint`,
 `watching`, `ping`, `detach`, `close`, `screen`, `picture`, `mirror`,
 `stats`, `sessions`, `follow`, `measures`, `frame`, `clear`, and `data`,
-`align` and `box` where it takes a data pipe; `kitty` where its grid carries kitty
-graphics (*A grid may carry kitty graphics*); `stream` where it
-streams its glass raw (*The glass as a raw stream*); and `glass` where a
+`align`, `box` and `stream` where it takes a data pipe, the last
+for `stream start=<ms>` (*Timed playback*); `kitty` where its grid carries kitty
+graphics (*A grid may carry kitty graphics*); and `glass` where a
 controller may ask its glass for a size (*`glass` asks for pixels*). A wall may take commands
 of its own beyond these, and says them here the same way: a pane of
 `senders/panes` says `split unsplit share layout` (PANES.md). A reader
@@ -481,10 +482,9 @@ takes:
                         `qoi`, `png`, `jpeg`; a wall that takes `video`
                         and says no `images` takes `qoi` alone
     controllers=<n>     how many controllers at once
-    streams=<n>         how many raw glass streams at once, every
-                        session's together, said by a wall that says
-                        `stream` and runs more than one; a wall that says
-                        `stream` alone runs one
+    feeds=<n>           how many feeds of its glass it runs at once,
+                        every session's together (*The glass as a feed*);
+                        left out by a wall that runs none
 
 Every wall takes `cells`; a Pi 5 says `layers=8 types=cells,video data
 codecs=qoi,hevc,h264`, the base and seven above it, and a Pi 3
@@ -1222,7 +1222,7 @@ taking and painting what its layers send, so its mirror moves while they
 do, and a glass mirror shows the glass as though it were lit; whether
 the glass is dark is `display`'s to say, not the mirror's.
 
-### The glass as a raw stream
+### The glass as a feed
 
     ESC _ bitwall mirror glass stream=i420 size=1280x720 fps=25 ESC \
 
@@ -1267,8 +1267,7 @@ frames again.
 **Who and how many.** A stream is a controller's: any other session is
 told `error mirror not-for-role`. Each costs the wall a pass over the
 glass and a read of it every frame, so a wall says in `caps` how many it
-runs at once, every session's together: `streams=<n>`, or `stream` alone
-for one at a time, where a second
+runs at once, every session's together, `feeds=<n>`; at `feeds=1` a second
 request is `error mirror busy` whoever asks. Past `n` a request is
 `error mirror glass: <n> streams already`. Nothing is said when one
 starts: the fifo is there, and the frames begin.
@@ -1322,8 +1321,8 @@ any other:
     error mirror name=a/b: bad name
     error mirror overlay=2: not 0 or 1
 
-A wall that streams says `stream` in `caps`, and `streams=8` where it
-runs several: the painter on its GPU, which while it streams draws the
+A wall that streams its glass says `feeds=<n>` in `caps`, `feeds=8`
+where it runs several: the painter on its GPU, which while it streams draws the
 glass once, into a picture of its own, copies that to the screen, and
 for each stream's frame shrinks it to the stream's size where that is
 smaller and turns it to the frame's planes, so a frame costs it a pass or
@@ -1736,9 +1735,37 @@ moment the first frame was decoded. A frame early waits; one whose
 successor is already due is late, and is dropped and counted in the
 session's `dropped`. Walls whose clocks agree show the same frame at the
 same refresh, which is how several walls play one film. `start` is the
-first stream's; a later stream starts when its first frame is decoded.
-Without `fps` each frame is shown as it is decoded, and the pipe paces
-it.
+first stream's; a later stream starts when its first frame is decoded,
+unless it is given its own start. Without `fps` each frame is shown as it
+is decoded, and the pipe paces it.
+
+**Several streams on one layer, each timed.** `start` on `open` times
+the layer's first stream only; each stream after it starts when its
+first frame is decoded, a moment the sender cannot know. A sender that
+plays anything else in step with a stream, its sound, captions or
+another wall, gives each stream its time before writing it:
+
+    ESC _ bitwall stream start=<ms> ESC \
+
+said on `in` before the stream's first byte on `data`: the Unix time in
+ms its first frame is shown at, for that stream alone. Commands and the
+stream travel on separate fifos, so the wall holds it until the next
+stream's first frame is decoded and takes it then; one said while a
+stream plays is the next stream's. A stream with none said before it
+plays at `start` where it is the layer's first, else as soon
+as it is decoded, which is right for a picture nothing else follows and
+wrong for one that something does, since it comes up early by however
+long it took to decode, a different amount each stream. It is for a
+layer opened with `data=1` and `fps`, and is a whole number of ms in
+ASCII digits; anything else is said, with the id if there was one:
+
+    error stream no start
+    error stream start=soon: bad value
+    error stream at=5: unknown option
+    error stream start=1790000000000: only for data with fps
+
+A wall whose `caps` do not say `stream` drops it as it drops any
+command it does not know, and plays the stream as soon as it is decoded.
 
 A data frame has no `hold`: it stays up until the next frame, `clear`,
 the end of its stream or of its session. A stream that does not decode

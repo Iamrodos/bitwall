@@ -540,7 +540,10 @@ class Layer:
         """Put `chunk` whole on the layer's `data`, waiting for room as long
         as it takes, or `timeout` seconds; how many bytes went, or None when
         there is no stream to write to: the layer has no `data`, or its
-        writer or the layer has gone."""
+        writer or the layer has gone. A stream that something else follows,
+        its sound or another wall, is given its time with `stream_start`
+        before its first chunk; without it the stream plays as soon as it
+        is decoded, or at `start` where it is the layer's first."""
         with self._dlock:
             if not (self.open_now and self.has_data):
                 return None
@@ -612,6 +615,17 @@ class Layer:
             raise ValueError("bitwall: start_at() is for a stream with fps")
         self._start_next = int(ms)
         return self
+
+    def stream_start(self, ms):
+        """The Unix time in ms the next stream on `data` shows its first
+        frame at, for that stream alone, said now on a layer with `fps`.
+        Said before the stream's first `data_write`, since the wall takes
+        it for the next stream whose first frame it has ready. A wall whose
+        `caps` do not say `stream` drops it, and plays the stream as
+        soon as it is decoded. Whether it was said."""
+        if "fps" not in self._opts:
+            raise ValueError("bitwall: stream_start() is for a stream with fps")
+        return self._write(protocol.command("stream", start=int(ms)).encode())
 
     def align(self, where):
         """Where the stream on `data` sits on a glass of another shape, from

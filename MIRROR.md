@@ -33,9 +33,9 @@ flowchart LR
   kept, padded black where the shapes differ, 1.4 MB at 720p and 3.1 MB
   at 1080p. A frame comes every 1/fps whether the glass changed or not;
   one the reader is not ready for is dropped, newest kept. `caps` says
-  `stream` where the wall offers it, and `streams=8` where it runs that
+  `feeds=<n>` where the wall offers it, `feeds=8` where it runs that
   many at once, each at its own size and rate (PROTOCOL.md, "The glass
-  as a raw stream"). The painter does; the web receiver and
+  as a feed"). The painter does; the web receiver and
   `receivers/mac` do not.
 - **ffmpeg encodes**, a separate process at nice 10. `senders/mirror`
   reads each glass fifo itself, takes each header off and hands the
@@ -75,7 +75,7 @@ flowchart LR
 On the **source host**, the Pi, the Mac or the Windows machine whose
 wall is mirrored:
 
-- the painter, saying `stream` in its `caps`
+- the painter, saying `feeds=` in its `caps`
   (`controllers/bitwall-ctl pi-a.local:0` shows them); on a Mac or
   Windows, the painter of README.md's *The painter on a Mac* or *The
   painter on Windows*;
@@ -170,10 +170,10 @@ destination scales each frame to the largest that fits its glass with
 its shape kept, centred (PROTOCOL.md, "The data pipe"), so a frame
 smaller than the glass is shown full size, softer.
 
-A source whose `caps` say `streams=<n>` is asked for one stream for each
+A source whose `caps` say `feeds=<n>` above 1 is asked for one stream for each
 size and rate sent, so each encode is given its frames at its own size
 and none is scaled twice; the log says which it asked for. A source that
-says `stream` alone runs one stream, so it is asked for one at the
+says `feeds=1` runs one stream, so it is asked for one at the
 largest size and the highest rate, and an encode for less scales it down
 and takes the frames it wants of it. Either way the destinations see the
 same thing.
@@ -240,7 +240,7 @@ the source puts the picture back about six seconds later.
 **Where it does not apply.** A source on this host (pull is for a source
 elsewhere) or on Windows (run the mirror there, which encodes on Quick
 Sync) is refused. Pulling, each encode reads a painter stream of its
-own, so a source that runs one stream at a time (`stream` alone in its
+own, so a source that runs one stream at a time (`feeds=1` in its
 `caps`) feeds one encode, and a destination wanting another is refused.
 
 ### Pi 5 destinations
@@ -432,7 +432,7 @@ done; wait
   ask it: ...`). Once it answers (`answered`) it is chosen for as at the
   start, its clock measured, and added: to the encode of its codec, size
   and rate where there is one, else a new encode, and a new painter
-  stream only where the source runs another (`streams=`); where the
+  stream only where the source runs another (`feeds=`); where the
   source's streams are all taken and none is at its size and rate or
   more, it is refused. It plays at the lead the others already play at,
   since timing them afresh would break every picture already up; where

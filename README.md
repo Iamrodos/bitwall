@@ -303,7 +303,7 @@ sources in `bitwall/receivers/pi/`: `make` on a Pi, `make PLATFORM=mac`
 on a Mac, `mingw32-make PLATFORM=windows` in MSYS2's UCRT64 (below); `OUT=` writes it
 elsewhere. Each wall it keeps composes once into its **glass**, which
 goes to a screen, a window, or nowhere, and to any raw streams a
-controller asks for (PROTOCOL.md, *The glass as a raw stream*), which
+controller asks for (PROTOCOL.md, *The glass as a feed*), which
 is what the mirror encodes (MIRROR.md). `bitwall-paint --help` says its
 options:
 
@@ -464,8 +464,8 @@ the first on the path. The painter stops on Ctrl+C in its console, or
 measured is in WINDOWS.md.
 
 A controller sizes a glass with no screen while it runs, and asks for
-its glass as raw streams, as on any painter (`caps` says `glass` and
-`streams=8`). From a Mac, with the Windows machine as `pc` in
+its glass as feeds, as on any painter (`caps` says `glass` and
+`feeds=8`). From a Mac, with the Windows machine as `pc` in
 `~/.ssh/config` (`Host pc` / `HostName 192.0.2.11`):
 
 ```sh
