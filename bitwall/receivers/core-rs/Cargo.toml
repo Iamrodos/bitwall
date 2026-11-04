@@ -1,6 +1,6 @@
 [package]
 name = "bitwall-receiver"
-version = "1.4.0"
+version = "1.4.1"
 edition = "2021"
 description = "a bitwall wall's door, sessions, grids and layers, for a receiver to give a glass"
 publish = false
