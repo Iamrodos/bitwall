@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --quiet --script
 # /// script
 # requires-python = ">=3.14"
-# dependencies = []
+# dependencies = ["gstreamer-bundle"]
 # ///
 """One film across several walls, each showing its piece, decoded on the wall.
 
@@ -69,6 +69,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, ROOT)
 import bitwall                                                   # noqa: E402
+import bitwall.sound                                             # noqa: E402
 
 MEDIA = os.path.join(ROOT, "media")
 #: What counts as a film there: ffmpeg reads any of them, so a film is
@@ -374,14 +375,10 @@ def walls_clock(flat):
 
 
 def sound(path, start, args, done, heard, ahead=0.0):
-    """The film's sound here, second t of it when the walls show second t.
-
-    Started when the walls start, by their clock, plus the delay; one
-    started late is started that much further in, so it is never behind
-    the picture by the time it took to begin. ffmpeg cuts the sound from
-    where it is asked, to the sample. On a Mac it plays it itself; elsewhere
-    ffplay does, as wav, whose header says the rate and channels ffplay
-    has no options for.
+    """The film's sound here, second t of it when the walls show second t,
+    by `bitwall.sound`: on this machine's realtime clock, each sample at
+    its own time, so it holds to the picture for the length of the film
+    and comes back into step by itself after a stall.
 
     With `--audio-tune`, the delay is read from that file while the film
     plays, and the sound started again at a new one when it changes, so
@@ -392,27 +389,26 @@ def sound(path, start, args, done, heard, ahead=0.0):
         # The walls show second t at start + t on their clock, which is
         # `ahead` of this one: here that is `ahead` sooner.
         at = start / 1000 - ahead + by
-        if done.wait(max(0.0, at - time.time())):
+        try:
+            player = bitwall.sound.play(path, args.seek or 0, at)
+        except bitwall.sound.SoundError as e:
+            log(f"no sound: {e}")
             return
-        into = (args.seek or 0) + max(0.0, time.time() - at)
-        procs = speak(path, into)
-        if procs is None:
-            return
-        heard[:] = procs
-        log(f"sound from {into:.2f}s, {by:+.3f}s against the picture")
+        heard[:] = [player]
+        log(f"sound from {(args.seek or 0) + max(0.0, time.time() - at):.2f}s, "
+            f"{by:+.3f}s against the picture")
         want = None
         while not done.wait(0.25):
+            why = player.failed()
+            if why:
+                log(f"sound stopped: {why}")
+                return
             want = tuned(args.audio_tune)
             if want is not None and abs(want - by) > 1e-4:
                 break
+        player.stop()
         if done.is_set():
-            hush(procs)
             return
-        # Moved: this sound is no longer wanted a moment longer, and one
-        # asked to finish politely plays on for most of a second.
-        for proc in procs:
-            proc.kill()
-            proc.wait()
         by = want
 
 
@@ -427,41 +423,10 @@ def tuned(path):
         return None
 
 
-def speak(path, into):
-    """Processes playing the film's sound from `into` seconds, or None."""
-    cut = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
-           "-ss", f"{into:.3f}", "-i", path, "-vn"]
-    try:
-        if sys.platform == "darwin":
-            # Straight to the speakers: it keeps to time from the first
-            # quarter second, a few milliseconds ahead of them, where
-            # ffplay behind a pipe takes its own while to start and to fill.
-            # At 48 kHz, the rate the Mac's output runs at: a 44.1 kHz film
-            # handed over as it is falls behind the picture as it plays.
-            return [subprocess.Popen(cut + ["-ar", "48000", "-f", "audiotoolbox", "-"],
-                                     stdin=subprocess.DEVNULL)]
-        first = subprocess.Popen(cut + ["-f", "wav", "-"], stdin=subprocess.DEVNULL,
-                                 stdout=subprocess.PIPE)
-        procs = [first, subprocess.Popen(
-            ["ffplay", "-nodisp", "-autoexit", "-loglevel", "error", "-i", "-"],
-            stdin=first.stdout)]
-        first.stdout.close()
-        return procs
-    except OSError as e:
-        log(f"no sound: {e}")
-        return None
-
-
-def hush(procs):
-    """Stop the sound: ffmpeg before ffplay, so it is not left writing to a
-    pipe with nobody reading and saying so."""
-    for proc in procs:
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(2)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+def hush(players):
+    """Stop the sound."""
+    for player in players:
+        player.stop()
 
 
 def main():
@@ -488,6 +453,8 @@ def main():
                     help="a file holding the delay in seconds, followed while the film plays")
     ap.add_argument("target", nargs="?", help="the wall, host:wall, when there is no layout")
     args = ap.parse_args()
+    if args.audio:
+        bitwall.sound.warm(log)
 
     stop = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):

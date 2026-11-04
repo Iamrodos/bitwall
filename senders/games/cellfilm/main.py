@@ -1,6 +1,6 @@
 #!/usr/bin/env -S uv run --quiet --script
 # /// script
-# dependencies = ["numpy"]
+# dependencies = ["numpy", "gstreamer-bundle"]
 # ///
 """Video on a wall.
 
@@ -46,6 +46,7 @@ sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.dirname(_HERE))))
 
 import bitwall                                                  # noqa: E402
+import bitwall.sound                                            # noqa: E402
 from player import OPTIONS, Player, parse_args                  # noqa: E402
 
 DEFAULT_FONT = 14        # small enough that a column of pixels is a column
@@ -127,6 +128,7 @@ def main():
     audio = "--audio" in args
     if audio:
         args.remove("--audio")
+        bitwall.sound.warm(say)
     lag = 0.0
     if "--audio-delay" in args:
         i = args.index("--audio-delay")
@@ -204,48 +206,22 @@ def main():
     if audio:
         # The picture is paced by the clock rather than by frames -- a
         # receiver too slow for the rate drops frames rather than
-        # playing slowly -- so sound started beside it stays with it,
-        # and neither waits on the other. Best effort by design:
-        # nothing here re-syncs them afterwards.
+        # playing slowly -- and the sound by the clock too, each sample
+        # at its time by `bitwall.sound`, so the two stay together and
+        # the sound comes back into step by itself after a stall.
         def sound(by):
-            """Play the film's sound, `by` seconds behind the picture.
-
-            ffmpeg does the seeking and ffplay plays what comes out of
-            it. ffplay's own seek does not land where it is asked: with
-            video in the stream it goes to the nearest key picture,
-            which at ordinary encoder settings is ten seconds wide, so a
-            delay smaller than that does nothing until it crosses a
-            boundary and the sound jumps whole seconds. ffmpeg decodes
-            and discards to the sample asked for.
-
+            """Play the film's sound, `by` seconds behind the picture:
+            the sample at where the picture is now, less `by`, heard now.
             Placed against where the picture has actually reached rather
-            than where the film was asked to begin: the decoder is
-            started by the first frame wanted rather than at launch, and
-            a long seek takes a while, during which the film has run on.
-            At the very beginning there is nothing behind to seek to, so
-            whatever the delay cannot take by seeking it takes by
-            waiting -- seeking alone would clamp at zero and the delay
-            would quietly vanish.
-            """
-            hold = max(0.0, by - player.position)
-            if hold > 0:
-                time.sleep(hold)
-            at = player.position
-            cut = subprocess.Popen(
-                ["ffmpeg", "-hide_banner", "-loglevel", "error",
-                 "-ss", "%.3f" % max(0.0, at - by), "-i", player.path,
-                 "-vn", "-f", "wav", "-"],
-                stdout=subprocess.PIPE)
-            play = subprocess.Popen(
-                # Carried as wav rather than bare samples: the header
-                # says the rate and the channels, which this ffplay has
-                # no options to be told.
-                ["ffplay", "-nodisp", "-autoexit", "-loglevel", "error",
-                 "-i", "-"],
-                stdin=cut.stdout)
-            cut.stdout.close()
+            than where the film was asked to begin, since the decoder is
+            started by the first frame wanted and a long seek takes a
+            while. Near the beginning, what the delay cannot take by
+            starting further back it takes by starting later."""
+            now, at = time.time(), player.position
+            frm = at - by
+            one = bitwall.sound.play(player.path, max(0.0, frm), now + max(0.0, -frm))
             say(f"video: picture at {at:.2f}s, sound {by:.2f}s behind it")
-            return cut, play
+            return [one]
 
         def begin():
             """Start the sound, and follow the tuning file if there is one."""
@@ -254,7 +230,7 @@ def main():
             while True:
                 try:
                     held["proc"] = sound(by)
-                except OSError as e:
+                except bitwall.sound.SoundError as e:
                     say(f"video: no sound: {e}")
                     return
                 if not tune:
@@ -270,7 +246,7 @@ def main():
                         break
                 by = want
                 for one in held["proc"]:
-                    one.terminate()
+                    one.stop()
 
         threading.Thread(target=begin, daemon=True).start()
 
@@ -329,7 +305,7 @@ def main():
             player.close()
         if held["proc"] is not None:
             for one in held["proc"]:
-                one.terminate()
+                one.stop()
         wall.detach()
     return 0
 

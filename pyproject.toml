@@ -18,7 +18,9 @@ dependencies = []
 arrays = ["numpy"]
 # The letters drawn as pictures: TILE and the outline fonts.
 letters = ["pillow"]
-all = ["numpy", "pillow"]
+# bitwall.sound: a film's sound on the wall clock.
+sound = ["gstreamer-bundle"]
+all = ["numpy", "pillow", "gstreamer-bundle"]
 
 [project.urls]
 Homepage = "https://github.com/iamrodos/bitwall"
