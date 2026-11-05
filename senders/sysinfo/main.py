@@ -6,7 +6,10 @@
 
 Runs on the receiver's own machine and describes it: what the machine is,
 what the bitwall painter on it is doing, and graphs of the last several
-minutes of CPU, load, temperature and memory.
+minutes of CPU, GPU, temperature and memory. The GPU graph is the share of
+each second the GPU spent drawing, from the v3d driver's gpu_stats (a Pi
+4 or 5), with the frames it drew; a machine without one graphs its load
+in that place instead.
 
 Everything is read from /proc, /sys and the wall's run directory with the
 standard library alone, since a Pi has a plain python3 and nothing else.
@@ -63,7 +66,10 @@ ACCENT = "5fafd7"
 GOOD = "5fd787"
 WARN = "ffaf00"
 BAD = "ff5f5f"
-SERIES = {"cpu": "5fafff", "load": "d787ff", "temp": "ff8f3f", "mem": "4fd7af"}
+SERIES = {"cpu": "5fafff", "gpu": "d787ff", "load": "d787ff", "temp": "ff8f3f",
+          "mem": "4fd7af"}
+#: The GPU queues that draw: binning a frame's triangles, then rendering it.
+GPU_QUEUES = ("bin", "render")
 
 BRAILLE_L = (0, 0x40, 0x44, 0x46, 0x47)      # left column, filled bottom up
 BRAILLE_R = (0, 0x80, 0xA0, 0xB0, 0xB8)      # right column, filled bottom up
@@ -200,6 +206,35 @@ def monitors():
         port = os.path.basename(c).split("-", 1)[1].replace("-A-", "-")
         out.append((port, " ".join(b for b in bits if b)))
     return out
+
+
+def gpu_stats_path():
+    """The v3d driver's gpu_stats file, or None where there is none."""
+    for pat in ("/sys/devices/platform/*.v3d/gpu_stats",
+                "/sys/devices/platform/*/*.v3d/gpu_stats"):
+        found = sorted(glob.glob(pat))
+        if found:
+            return found[0]
+    return None
+
+
+def gpu_times(path):
+    """(timestamp ns, busy ns, render jobs) from gpu_stats, summed over the
+    drawing queues, or None. Each line is: queue timestamp jobs runtime."""
+    stamp, busy, jobs = None, 0, 0
+    for line in read(path).splitlines():
+        f = line.split()
+        if len(f) != 4 or not f[1].isdigit():
+            continue
+        stamp = int(f[1])
+        if f[0] in GPU_QUEUES:
+            busy += int(f[3])
+        if f[0] == "render":
+            jobs = int(f[2])
+    return (stamp, busy, jobs) if stamp is not None else None
+
+
+GPU_STATS = gpu_stats_path()
 
 
 def meminfo():
@@ -340,7 +375,7 @@ class Gatherer:
 
     def run(self):
         tick = 0
-        prev_cpu = prev_paint = prev_self = None
+        prev_cpu = prev_paint = prev_self = prev_gpu = None
         paused_at = None
         static, procs = {}, {}
         painter_pid = None
@@ -363,7 +398,7 @@ class Gatherer:
                     d.extend([None] * min(gap, HISTORY))
                 self.end += gap
                 paused_at = None
-                prev_cpu = prev_paint = prev_self = None
+                prev_cpu = prev_paint = prev_self = prev_gpu = None
 
             if self.style is None:
                 self.style = self.choose_style()
@@ -402,6 +437,12 @@ class Gatherer:
                     now["load"] = now["loadavg"][0]
             except ValueError as e:
                 self.trouble("/proc/loadavg", e)
+            gpu = gpu_times(GPU_STATS) if GPU_STATS else None
+            if gpu and prev_gpu and gpu[0] > prev_gpu[0]:
+                dt = gpu[0] - prev_gpu[0]
+                now["gpu"] = min(100.0, 100.0 * (gpu[1] - prev_gpu[1]) / dt)
+                now["gpu_fps"] = (gpu[2] - prev_gpu[2]) * 1e9 / dt
+            prev_gpu = gpu
             t = read("/sys/class/thermal/thermal_zone0/temp").strip()
             if t.lstrip("-").isdigit():
                 now["temp"] = int(t) / 1000.0
@@ -608,7 +649,7 @@ def buckets(hist, end, npts, k):
 def scale(name, vals, ncpu):
     """The range a series is drawn against."""
     seen = [v for v in vals if v is not None]
-    if name in ("cpu", "mem"):
+    if name in ("cpu", "gpu", "mem"):
         return 0.0, 100.0
     if name == "load":
         return 0.0, max(float(ncpu), max(seen, default=0.0) * 1.15)
@@ -679,7 +720,8 @@ def chart(cv, x, y, w, h, vals, lo, hi, colour, style):
                     row[xx] = tables[r][steps if r < full else rest]
 
 
-GRAPHS = (("cpu", "CPU"), ("load", "load"), ("temp", "temp"), ("mem", "memory"))
+GRAPHS = (("cpu", "CPU"), ("gpu", "GPU") if GPU_STATS else ("load", "load"),
+          ("temp", "temp"), ("mem", "memory"))
 
 
 def reading(name, v, snap):
@@ -687,7 +729,7 @@ def reading(name, v, snap):
     ncpu = snap.get("ncpu", 1)
     if v is None:
         return "--", DIM
-    if name == "cpu":
+    if name in ("cpu", "gpu"):
         return f"{v:.0f}%", level(v, 50, 85)
     if name == "load":
         return f"{v:.2f}", level(v / ncpu, 0.7, 1.0)
@@ -708,6 +750,9 @@ def graph(cv, x, y, w, h, name, title, snap):
     colour = SERIES[name]
     now = hist[-1] if hist else None
     text, tone = reading(name, now, snap)
+    fps = snap["now"].get("gpu_fps") if name == "gpu" else None
+    if fps is not None:
+        text += f" {fps:.0f}fps"
     seen = [v for v in vals if v is not None]
     cv.fill(x, y, w, h, PANEL)
     at = cv.put(x + 1, y, title, colour, bold=True, width=w - 1)
@@ -1078,7 +1123,7 @@ def main():
         w.set_source(view)
     w.meta(name="sysinfo",
            description="This machine: host, receiver and walls, "
-                       "with graphs of CPU, load, temperature and memory")
+                       "with graphs of CPU, GPU, temperature and memory")
     cols, rows = w.area()
     log(f"attached to {args.target} ({w.run}), font {args.font}, "
         f"{cols}x{rows}, {View.layout_for(cols, rows)} layout, "
