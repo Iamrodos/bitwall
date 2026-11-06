@@ -40,7 +40,8 @@ another. The new size has to hold for a second first, so a window being
 dragged costs one restart, not one a step.
 
 With nothing named it plays the films in the repo's `media/` directory,
-in turn.
+or the folder `--dir` names, in turn, or with `--shuffle` in a random
+order.
 
 `--audio` plays the film's sound on the machine this runs on, on the
 walls' clock: second t of the film is heard when the walls' clock reaches
@@ -52,11 +53,22 @@ answer kept and half its round trip allowed for. `--audio-delay` holds
 the sound back, or with a negative number brings it forward, for what is
 left: what the sound takes to come out of the speakers, and the screens
 to show a frame. `--audio-tune FILE` moves it while the film plays.
+
+`--file` may be an address ffmpeg reads, a stream on the web, played as
+it arrives. `--sound FILE` takes the sound from a file of its own rather
+than the film's, and `--speed` plays the picture that much faster, its
+frames' times divided by it; the sound is then taken to be at that speed
+already, so `--speed` with `--audio` needs `--sound`. `--title` is what
+the film is called in the log and on the wall where its file name says
+nothing. `--fps` sends every film at one frame rate, so that a caller
+playing one film after another on the same layers (`main`'s `held`) has
+them all at the rate the layers were opened with.
 """
 import argparse
 import fractions
 import json
 import os
+import random
 import re
 import signal
 import socket
@@ -100,13 +112,14 @@ def slug(path):
     return re.sub(r"[^a-z0-9]+", "-", name).strip("-")
 
 
-def films():
-    """The films in the media directory, in name order."""
+def films(folder=MEDIA):
+    """The films in a folder, the media directory unless told, in name
+    order."""
     try:
-        names = sorted(os.listdir(MEDIA))
+        names = sorted(os.listdir(folder))
     except OSError:
         return []
-    return [os.path.join(MEDIA, n) for n in names
+    return [os.path.join(folder, n) for n in names
             if n.lower().endswith(FILMS) and not n.startswith((".", "sync-"))]
 
 
@@ -176,7 +189,7 @@ def ask(target):
         c.close()
 
 
-def graph(rows, glass, bezel, n_fps, fit="cover"):
+def graph(rows, glass, bezel, n_fps, fit="cover", speed=1.0):
     """The filter that makes one piece a wall from the film: scaled to
     the whole layout with the gaps -- to cover it and cropped, or to fit in
     it and letterboxed in black, in the middle or against the top with all
@@ -189,7 +202,8 @@ def graph(rows, glass, bezel, n_fps, fit="cover"):
              if fit == "cover" else
              f"scale={cw}:{ch}:force_original_aspect_ratio=decrease,"
              f"pad={cw}:{ch}:(ow-iw)/2:{'0' if fit == 'top' else '(oh-ih)/2'}:black")
-    parts = [f"[0:v]fps={n_fps},{shape},split={n}" + "".join(f"[s{k}]" for k in range(n))]
+    fast = f"setpts=PTS/{speed:.6g}," if speed != 1 else ""
+    parts = [f"[0:v]{fast}fps={n_fps},{shape},split={n}" + "".join(f"[s{k}]" for k in range(n))]
     k = 0
     for r in range(nrows):
         for c in range(ncols):
@@ -199,27 +213,48 @@ def graph(rows, glass, bezel, n_fps, fit="cover"):
     return ";".join(parts), (cw, ch)
 
 
-def play(path, rows, walls, args, stop, seek=None):
+def play(path, rows, walls, args, stop, seek=None, held=None):
     """One film on the layout, from a fresh start, `seek` seconds in where
     given: ('ended', 'stopped', 'lost' or 'resized', the seconds into the
-    film it had got to)."""
+    film it had got to).
+
+    `held`, where given, is the walls' layers kept from one film to the
+    next, {target: (layer, codec, fps)}: a layer still open at the same
+    codec and rate plays this film as its next stream, its start said with
+    `stream_start`, and is left open at the end, so the wall is never let
+    go between films. The caller closes them."""
     if seek is not None:
         args = argparse.Namespace(**dict(vars(args), seek=seek))
     w, h, rate, secs = probe(path)
+    secs /= args.speed
+    if args.fps:
+        rate = fractions.Fraction(args.fps).limit_denominator(1001)
     fps = round(float(rate), 6)
+    name = args.title or os.path.basename(path)
     glass = walls[rows[0][0]]["pixels"]
     flat = [t for row in rows for t in row]
-    filt, canvas = graph(rows, glass, args.bezel, rate, args.fit)
+    filt, canvas = graph(rows, glass, args.bezel, rate, args.fit, args.speed)
     # Measured before the start is chosen, since it takes a moment.
     ahead = walls_clock(flat) if args.audio else 0.0
     start = int(time.time() * 1000 + args.ahead * 1000)
-    log(f"{os.path.basename(path)}: {w}x{h} at {fps}fps, {secs:.0f}s, as a "
+    log(f"{name}: {w}x{h} at {fps}fps, {secs:.0f}s"
+        f"{f' at {args.speed:g}x' if args.speed != 1 else ''}, as a "
         f"{canvas[0]}x{canvas[1]} canvas of {len(rows[0])}x{len(rows)} walls of "
         f"{glass[0]}x{glass[1]}, bezel {args.bezel}; starting at {start}")
-    layers = {t: bitwall.video.Layer(t, place=0, take=True, data=True,
-                                     codec=walls[t]["codec"], fps=fps, start=start)
-              for t in flat}
-    threads = [threading.Thread(target=layers[t].open) for t in flat]
+    layers, fresh = {}, []
+    for t in flat:
+        kept = (held or {}).pop(t, None)
+        if kept and kept[1:] == (walls[t]["codec"], fps) and kept[0].open_now \
+                and kept[0].has_data:
+            layers[t] = kept[0]
+            layers[t].stream_start(start)
+            continue
+        if kept:
+            kept[0].close()
+        layers[t] = bitwall.video.Layer(t, place=0, take=True, data=True,
+                                        codec=walls[t]["codec"], fps=fps, start=start)
+        fresh.append(t)
+    threads = [threading.Thread(target=layers[t].open) for t in fresh]
     for th in threads:
         th.start()
     for th in threads:
@@ -232,8 +267,9 @@ def play(path, rows, walls, args, stop, seek=None):
             layer.close()
         return "lost", args.seek or 0
     for t in flat:
-        layers[t].meta(name="Film", description=f"{slug(path)}, a piece of it on each of "
-                       f"{len(flat)} walls" if len(flat) > 1 else f"{slug(path)}, decoded on the wall")
+        what = args.title or slug(path)
+        layers[t].meta(name="Film", description=f"{what}, a piece of it on each of "
+                       f"{len(flat)} walls" if len(flat) > 1 else f"{what}, decoded on the wall")
     # Each piece comes back on a socket of its own on the loopback address,
     # which ffmpeg connects to: a descriptor handed to a child is Unix's,
     # and a socket is the same on every machine.
@@ -245,8 +281,12 @@ def play(path, rows, walls, args, stop, seek=None):
         ls.settimeout(0.5)
         socks.append(ls)
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin"]
+    if "://" in path:
+        # A stream on the web that stalls or drops is asked for again.
+        cmd += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
     if args.seek:
-        cmd += ["-ss", str(args.seek)]
+        # The seek is in the film as played; the file is at its own speed.
+        cmd += ["-ss", str(args.seek * args.speed)]
     cmd += ["-i", path, "-an", "-filter_complex", filt]
     for k, t in enumerate(flat):
         codec = walls[t]["codec"]
@@ -321,14 +361,17 @@ def play(path, rows, walls, args, stop, seek=None):
     if enc.returncode not in (0, None) and how == "ended":
         log(f"ffmpeg ended with {enc.returncode}: {' / '.join(err[-3:]) or 'nothing said'}")
     log(f"{how}: " + ", ".join(f"{t} {sent[t] / 1e6:.1f} MB" for t in flat))
-    if how == "ended":
+    if how == "ended" and enc.returncode == 0:
         # The walls hold a few seconds of it still: wait for the last frame.
         end = start / 1000 + secs - (args.seek or 0) + 1
         stop.wait(max(0.0, end - time.time()))
     done.set()
     hush(heard)
-    for layer in layers.values():
-        layer.close()
+    if held is not None and how != "lost":
+        held.update({t: (layers[t], walls[t]["codec"], fps) for t in flat})
+    else:
+        for layer in layers.values():
+            layer.close()
     return how, into
 
 
@@ -390,7 +433,7 @@ def sound(path, start, args, done, heard, ahead=0.0):
         # `ahead` of this one: here that is `ahead` sooner.
         at = start / 1000 - ahead + by
         try:
-            player = bitwall.sound.play(path, args.seek or 0, at)
+            player = bitwall.sound.play(args.sound or path, args.seek or 0, at)
         except bitwall.sound.SoundError as e:
             log(f"no sound: {e}")
             return
@@ -429,11 +472,26 @@ def hush(players):
         player.stop()
 
 
-def main():
+def main(argv=None, stop=None, held=None):
+    """The sender, on `argv` (the command line's where None). A caller
+    playing films one after another passes its own `stop`, which this then
+    leaves to it rather than taking the signals, and may pass `held`, a
+    dict it keeps, to keep the walls from one call to the next (`play`);
+    it closes the layers in it when it is done."""
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--film", default="all",
                     help="a film from media/ by its slug, as tears-of-steel; all plays them in turn")
-    ap.add_argument("--file", help="a film file to play instead")
+    ap.add_argument("--dir", default=MEDIA,
+                    help="the folder the films are in (default the repo's media/)")
+    ap.add_argument("--shuffle", action="store_true",
+                    help="play them in a random order, shuffled again each time round")
+    ap.add_argument("--file", help="a film file, or an address ffmpeg reads, to play instead")
+    ap.add_argument("--sound", help="the sound from this file instead, at the speed played")
+    ap.add_argument("--speed", type=float, default=1.0,
+                    help="play the picture this much faster (default 1)")
+    ap.add_argument("--fps", type=float,
+                    help="send every film at this frame rate rather than its own")
+    ap.add_argument("--title", help="what the film is called, for the log and the wall")
     ap.add_argument("--layout", help="the walls as rows: 'a:0,a:1 / b:0,b:1' (default: the target)")
     ap.add_argument("--bezel", type=int, default=0,
                     help="the glass pixels hidden between neighbouring walls (default 0)")
@@ -452,13 +510,18 @@ def main():
     ap.add_argument("--audio-tune", default=os.environ.get("BITWALL_AUDIO_TUNE"),
                     help="a file holding the delay in seconds, followed while the film plays")
     ap.add_argument("target", nargs="?", help="the wall, host:wall, when there is no layout")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
+    if args.speed <= 0:
+        ap.error("--speed is more than 0")
+    if args.audio and args.speed != 1 and not args.sound:
+        ap.error("--speed with --audio needs --sound, the sound at that speed")
     if args.audio:
         bitwall.sound.warm(log)
 
-    stop = threading.Event()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(sig, lambda *_: stop.set())
+    if stop is None:
+        stop = threading.Event()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, lambda *_: stop.set())
 
     text = args.layout or args.target
     if not text:
@@ -473,9 +536,9 @@ def main():
     if args.file:
         queue = [args.file]
     else:
-        queue = [f for f in films() if args.film == "all" or slug(f) == args.film]
+        queue = [f for f in films(args.dir) if args.film == "all" or slug(f) == args.film]
         if not queue:
-            log(f"no film {args.film!r} in {MEDIA}")
+            log(f"no film {args.film!r} in {args.dir}")
             return 1
 
     walls = {}
@@ -498,8 +561,10 @@ def main():
 
     k, seek = 0, None
     while not stop.is_set():
+        if args.shuffle and k % len(queue) == 0 and seek is None:
+            random.shuffle(queue)
         path = queue[k % len(queue)]
-        how, into = play(path, rows, walls, args, stop, seek)
+        how, into = play(path, rows, walls, args, stop, seek, held)
         seek = None
         if how == "resized":
             seek = into
