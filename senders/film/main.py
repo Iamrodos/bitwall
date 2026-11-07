@@ -63,6 +63,21 @@ the film is called in the log and on the wall where its file name says
 nothing. `--fps` sends every film at one frame rate, so that a caller
 playing one film after another on the same layers (`main`'s `held`) has
 them all at the rate the layers were opened with.
+
+`--subs FILE` shows a film's subtitles, an `.srt`, or with `--subs auto`
+each film's own, the `.srt` of the same name beside it. They are a cells
+layer of their own over the film, on one wall: the middle one of the
+bottom row of the layout, or of the top row with `--subs-at top`. Each
+line goes up when the walls' clock reaches the second of the film it is
+for, by the same clock as the picture, and comes down at its end;
+`--subs-delay` moves them all later, or with a negative number sooner.
+`--subs-at bar`, the default, puts them in the middle of the black bar
+under a letterboxed film, and where there is no bar to put them in, at
+the bottom of the picture. `--subs-style` is `plain`, white on nothing,
+the default in the bar; `boxed`, white on a dark translucent ground, the
+default over the picture; or `yellow`. `--subs-font` gives the lines a
+font size of their own; otherwise they are in the wall's font as it
+stands.
 """
 import argparse
 import fractions
@@ -98,6 +113,9 @@ ENCODERS = {
 PREFER = ("hevc", "h264")
 #: What a piece of the film is read in.
 CHUNK = 1 << 16
+#: Seconds every wall must have said nobody is watching before the film
+#: pauses, so a passing blink of presence does not stop it.
+AWAY = 10
 
 
 def log(msg):
@@ -213,16 +231,39 @@ def graph(rows, glass, bezel, n_fps, fit="cover", speed=1.0):
     return ";".join(parts), (cw, ch)
 
 
-def play(path, rows, walls, args, stop, seek=None, held=None):
+def band(rows, target, glass, bezel, film, fit):
+    """The film's rows of glass on the wall `target`, (top, bottom) in its
+    pixels, or None where the film covers it."""
+    if fit == "cover":
+        return None
+    gw, gh = glass
+    nrows, ncols = len(rows), len(rows[0])
+    cw, ch = ncols * gw + (ncols - 1) * bezel, nrows * gh + (nrows - 1) * bezel
+    fh = film[1] * min(cw / film[0], ch / film[1])
+    y0 = 0 if fit == "top" else (ch - fh) / 2
+    r = next(i for i, row in enumerate(rows) if target in row)
+    off = r * (gh + bezel)
+    return max(0.0, y0 - off), min(float(gh), y0 + fh - off)
+
+
+def play(path, rows, walls, args, stop, seek=None, held=None, subs=None):
     """One film on the layout, from a fresh start, `seek` seconds in where
-    given: ('ended', 'stopped', 'lost' or 'resized', the seconds into the
-    film it had got to).
+    given: ('ended', 'stopped', 'lost', 'resized' or 'away', the seconds
+    into the film it had got to).
+
+    With nobody watching any of its walls for `AWAY` seconds, the film
+    stops being made: the encoder ends, the layers stay open, and play
+    returns 'away' once somebody is watching again, at the second the walls
+    went dark, for the film to go on from there.
 
     `held`, where given, is the walls' layers kept from one film to the
     next, {target: (layer, codec, fps)}: a layer still open at the same
     codec and rate plays this film as its next stream, its start said with
     `stream_start`, and is left open at the end, so the wall is never let
-    go between films. The caller closes them."""
+    go between films. The caller closes them.
+
+    `subs`, where given, is the subtitles' layer and its `Subs` source,
+    (layer, subs, target), handed this film's cues where it has them."""
     if seek is not None:
         args = argparse.Namespace(**dict(vars(args), seek=seek))
     w, h, rate, secs = probe(path)
@@ -235,7 +276,15 @@ def play(path, rows, walls, args, stop, seek=None, held=None):
     flat = [t for row in rows for t in row]
     filt, canvas = graph(rows, glass, args.bezel, rate, args.fit, args.speed)
     # Measured before the start is chosen, since it takes a moment.
-    ahead = walls_clock(flat) if args.audio else 0.0
+    cues = []
+    if subs:
+        own = subs_for(path, args.subs)
+        try:
+            cues = read_srt(own) if own else []
+        except OSError as e:
+            log(f"subtitles {own}: {e}")
+        log(f"subtitles: {len(cues)} lines from {own}" if cues else "subtitles: none for this film")
+    ahead = walls_clock(flat) if args.audio or cues else 0.0
     start = int(time.time() * 1000 + args.ahead * 1000)
     log(f"{name}: {w}x{h} at {fps}fps, {secs:.0f}s"
         f"{f' at {args.speed:g}x' if args.speed != 1 else ''}, as a "
@@ -266,6 +315,12 @@ def play(path, rows, walls, args, stop, seek=None, held=None):
         for layer in layers.values():
             layer.close()
         return "lost", args.seek or 0
+    if held is not None:
+        # Kept there while it plays too, for the caller to see who watches.
+        held.update({t: (layers[t], walls[t]["codec"], fps) for t in flat})
+    if cues:
+        subs[1].play(cues, start, args.seek or 0, ahead, args.speed,
+                     band(rows, subs[2], glass, args.bezel, (w, h), args.fit))
     for t in flat:
         what = args.title or slug(path)
         layers[t].meta(name="Film", description=f"{what}, a piece of it on each of "
@@ -332,18 +387,26 @@ def play(path, rows, walls, args, stop, seek=None, held=None):
     err = []
     threading.Thread(target=lambda: err.extend(enc.stderr.read().decode(
         "utf-8", "replace").splitlines()), daemon=True).start()
-    resized, since = None, None
+    resized, since, dark = None, None, None
     while enc.poll() is None and not stop.is_set() and not lost.is_set():
         time.sleep(0.2)
+        if all(layers[t].watching() == 0 for t in flat):
+            dark = dark or time.time()
+            if time.time() - dark >= AWAY:
+                break
+        else:
+            dark = None
         now = {t: layers[t].pixels() for t in flat}
         changed = {t: p for t, p in now.items() if p and p != walls[t]["pixels"]}
         if changed != resized:
             resized, since = changed, time.time()
         elif changed and time.time() - since >= 1.0:
             break
+    away = dark is not None and time.time() - dark >= AWAY
     how = "stopped" if stop.is_set() else "lost" if lost.is_set() else \
+        "away" if away and enc.poll() is None else \
         "resized" if resized and enc.poll() is None else "ended"
-    into = (args.seek or 0) + max(0.0, time.time() - start / 1000)
+    into = (args.seek or 0) + max(0.0, (dark if how == "away" else time.time()) - start / 1000)
     if how == "resized":
         for t, p in resized.items():
             log(f"{t}: its glass is now {p[0]}x{p[1]}; the film again from {into:.0f}s")
@@ -358,6 +421,13 @@ def play(path, rows, walls, args, stop, seek=None, held=None):
         th.join(timeout=10)
     if how != "ended":
         done.set()
+    if how == "away":
+        log(f"nobody watching; paused at {into:.0f}s")
+        while not stop.is_set() and all(
+                layers[t].open_now and layers[t].watching() == 0 for t in flat):
+            stop.wait(1)
+        if not stop.is_set():
+            log(f"watched again; on from {into:.0f}s")
     if enc.returncode not in (0, None) and how == "ended":
         log(f"ffmpeg ended with {enc.returncode}: {' / '.join(err[-3:]) or 'nothing said'}")
     log(f"{how}: " + ", ".join(f"{t} {sent[t] / 1e6:.1f} MB" for t in flat))
@@ -367,11 +437,15 @@ def play(path, rows, walls, args, stop, seek=None, held=None):
         stop.wait(max(0.0, end - time.time()))
     done.set()
     hush(heard)
+    if subs:
+        subs[1].idle()
     if held is not None and how != "lost":
         held.update({t: (layers[t], walls[t]["codec"], fps) for t in flat})
     else:
-        for layer in layers.values():
+        for t, layer in layers.items():
             layer.close()
+            if held is not None:
+                held.pop(t, None)
     return how, into
 
 
@@ -472,6 +546,142 @@ def hush(players):
         player.stop()
 
 
+_SRT_TIME = re.compile(r"(\d+):(\d+):(\d+)[,.](\d+)\s*-->\s*(\d+):(\d+):(\d+)[,.](\d+)")
+_TAG = re.compile(r"<[^>]*>|\{[^}]*\}")
+
+
+def read_srt(path):
+    """A SubRip file's cues, [(from, to, [(line, italic)])], in seconds
+    of the film, in order."""
+    raw = open(path, "rb").read()
+    text = raw.decode("utf-8-sig", "replace")
+    for enc in ("utf-8-sig", "cp1252"):
+        try:
+            text = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    cues = []
+    for block in re.split(r"\r?\n\s*\r?\n", text):
+        lines = block.strip().splitlines()
+        at = next((i for i, l in enumerate(lines) if _SRT_TIME.search(l)), None)
+        if at is None:
+            continue
+        g = [int(x) for x in _SRT_TIME.search(lines[at]).groups()]
+        t0 = g[0] * 3600 + g[1] * 60 + g[2] + g[3] / 1000
+        t1 = g[4] * 3600 + g[5] * 60 + g[6] + g[7] / 1000
+        said = [(_TAG.sub("", l).strip(), "<i>" in l.lower()) for l in lines[at + 1:]]
+        said = [s for s in said if s[0]]
+        if said and t1 > t0:
+            cues.append((t0, t1, said))
+    cues.sort(key=lambda c: c[0])
+    return cues
+
+
+def subs_for(path, given):
+    """The subtitle file for a film: the one given, or with `auto` the
+    film's own `.srt` beside it; None where there is none."""
+    if not given:
+        return None
+    if given != "auto":
+        return given
+    if "://" in path:
+        return None
+    own = os.path.splitext(path)[0] + ".srt"
+    return own if os.path.exists(own) else None
+
+
+class Subs:
+    """The subtitles, as a cells layer's source: `render(cols, rows)` is
+    the grid, transparent but for the line showing now.
+
+    `play` hands it a film's cues and when the film started on the walls'
+    clock; `idle` takes them away between films."""
+
+    STYLES = {"plain": ("ffffff", "default"), "boxed": ("ffffff", "101418c0"),
+              "yellow": ("ffd84a", "default")}
+
+    def __init__(self, at, style, delay, glass):
+        self.at, self.style, self.delay = at, style, delay
+        self.glass = glass
+        self.lock = threading.Lock()
+        self.cues, self.film = [], None
+        self.k = 0
+
+    def play(self, cues, start, seek, ahead, speed, band):
+        """A film's cues, from `start` (ms, walls' clock), `seek` seconds
+        in; `band` is the film's rows of glass on this wall, (top, bottom)
+        in pixels, or None where it fills the wall."""
+        with self.lock:
+            self.cues, self.k = cues, 0
+            self.film = (start / 1000 - ahead, seek, speed, band)
+
+    def idle(self):
+        with self.lock:
+            self.cues, self.film = [], None
+
+    def now(self):
+        """The lines to show now, or []."""
+        with self.lock:
+            cues, film = self.cues, self.film
+            if not cues or film is None:
+                return []
+            t0, seek, speed, _ = film
+            t = (seek + (time.time() - t0)) * speed - self.delay
+            k = self.k
+            if k >= len(cues) or cues[k][0] > t:
+                k = 0
+            while k + 1 < len(cues) and cues[k + 1][0] <= t:
+                k += 1
+            self.k = k
+        c = cues[k]
+        return c[2] if c[0] <= t < c[1] else []
+
+    def where(self, rows):
+        """Where the lines go: the rows they may use, (first, last), how
+        they sit in them (`top`, `bottom` or `middle`), and the style."""
+        with self.lock:
+            band = self.film[3] if self.film else None
+        if self.at == "bar" and band:
+            # The first row wholly under the picture, to the wall's foot.
+            below = -(-int(band[1]) * rows // self.glass[1])
+            if below < rows:
+                return (below, rows - 1), "middle", self.style or "plain"
+        if self.at == "top":
+            return (1, rows - 2), "top", self.style or "boxed"
+        return (1, rows - 2), "bottom", self.style or "boxed"
+
+    def render(self, cols, rows):
+        clear = bitwall.cell(" ")
+        grid = [[clear] * cols for _ in range(rows)]
+        said = self.now()
+        if not said or cols < 8 or rows < 3:
+            return grid
+        (first, last), sit, style = self.where(rows)
+        fg, bg = self.STYLES[style]
+        room = cols - 4
+        lines = []
+        for text, italic in said:
+            while len(text) > room:
+                cut = text.rfind(" ", 0, room + 1)
+                cut = cut if cut > 0 else room
+                lines.append((text[:cut].rstrip(), italic))
+                text = text[cut:].lstrip()
+            lines.append((text, italic))
+        space = last - first + 1
+        lines = lines[-space:]
+        top = first if sit == "top" else last - len(lines) + 1 if sit == "bottom" \
+            else first + (space - len(lines)) // 2
+        pad = 1 if bg != "default" else 0
+        for i, (text, italic) in enumerate(lines):
+            text = " " * pad + text + " " * pad
+            left = max(0, (cols - len(text)) // 2)
+            row = grid[top + i]
+            for j, ch in enumerate(text[:cols - left]):
+                row[left + j] = bitwall.cell(ch, fg, bg, bold=True, italics=italic)
+        return grid
+
+
 def main(argv=None, stop=None, held=None):
     """The sender, on `argv` (the command line's where None). A caller
     playing films one after another passes its own `stop`, which this then
@@ -509,6 +719,15 @@ def main(argv=None, stop=None, held=None):
                     help="seconds to hold the sound back; negative brings it forward")
     ap.add_argument("--audio-tune", default=os.environ.get("BITWALL_AUDIO_TUNE"),
                     help="a file holding the delay in seconds, followed while the film plays")
+    ap.add_argument("--subs", help="an .srt to show, or auto for each film's own beside it")
+    ap.add_argument("--subs-at", choices=("bar", "bottom", "top"), default="bar",
+                    help="in the black bar under the picture, else at its bottom; at the "
+                         "bottom; or at the top (default bar)")
+    ap.add_argument("--subs-style", choices=tuple(Subs.STYLES),
+                    help="plain, boxed or yellow (default plain in the bar, boxed over the picture)")
+    ap.add_argument("--subs-font", type=int, help="the subtitles' font size (default the wall's)")
+    ap.add_argument("--subs-delay", type=float, default=0.0,
+                    help="seconds to show them later; negative sooner")
     ap.add_argument("target", nargs="?", help="the wall, host:wall, when there is no layout")
     args = ap.parse_args(argv)
     if args.speed <= 0:
@@ -559,14 +778,33 @@ def main(argv=None, stop=None, held=None):
         if walls[t]["pixels"] != first:
             log(f"{t}: its glass is {walls[t]['pixels']}, not {first}; each piece is {first}")
 
+    subs = None
+    if args.subs:
+        row = rows[0] if args.subs_at == "top" else rows[-1]
+        where = row[len(row) // 2]
+        source = Subs(args.subs_at, args.subs_style, args.subs_delay, walls[where]["pixels"])
+        layer = bitwall.CellsLayer(where, place="above", min_frame=0.1).attach()
+        if layer.z is None:
+            log(f"{where}: no cells layer for the subtitles: "
+                f"{getattr(layer, '_refused', None) or 'the wall did not open one'}")
+            layer.detach()
+        else:
+            layer.meta(name="Subtitles", description="the film's subtitles")
+            if args.subs_font:
+                layer.set_font_size(args.subs_font)
+            layer.set_source(source.render)
+            cols, nrows = layer.area()
+            log(f"subtitles -> {where} layer {layer.z}, {cols}x{nrows}, at {args.subs_at}")
+            subs = (layer, source, where)
+
     k, seek = 0, None
     while not stop.is_set():
         if args.shuffle and k % len(queue) == 0 and seek is None:
             random.shuffle(queue)
         path = queue[k % len(queue)]
-        how, into = play(path, rows, walls, args, stop, seek, held)
+        how, into = play(path, rows, walls, args, stop, seek, held, subs)
         seek = None
-        if how == "resized":
+        if how in ("resized", "away"):
             seek = into
             continue
         if how == "lost":
@@ -576,6 +814,8 @@ def main(argv=None, stop=None, held=None):
         k += 1
         if args.once and k >= len(queue):
             break
+    if subs:
+        subs[0].detach()
     log("stopped")
     return 0
 
